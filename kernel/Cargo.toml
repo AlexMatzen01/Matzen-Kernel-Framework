@@ -1,0 +1,23 @@
+[package]
+name = "mfk-kernel"
+version = "0.1.0"
+edition = "2021"
+authors = ["Matzen Kernel Authors <kernel@matzen.dev>"]
+description = "Matzen Kernel Framework - experimental micro-kernel"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "mfk-kernel"
+path = "src/lib.rs"
+
+[dependencies]
+bootloader = { version = "0.9.23" }
+spin = { version = "0.9", features = ["mutex", "spin_mutex"] }
+x86_64 = "0.15"
+volatile = "0.4"
+log = { version = "0.4", default-features = false }
+
+[package.metadata.bootimage]
+build-command = ["cargo", "build", "-p", "mfk-kernel", "--target", "targets/x86_64-mfk.json"]
+runtime-binary = "target/x86_64-mfk/debug/bootimage-mfk-kernel.bin"

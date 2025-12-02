@@ -1,0 +1,24 @@
+[machine]
+type = "q35"
+accelerator = "kvm"
+
+[cpu]
+cores = 2
+threads = 1
+sockets = 1
+model = "qemu64"
+
+[memory]
+size = "256M"
+
+[display]
+backend = "none"
+
+[serial]
+device = "stdio"
+
+[boot]
+menu = "off"
+
+[debug]
+flags = ["int"]

@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<VirtualBox xmlns="http://www.virtualbox.org/" version="1.16-windows">
+  <Machine uuid="{11111111-0000-4000-8000-000000000001}" name="MFK-Kernel" OSType="Other_64" snapshotFolder="Snapshots" lastStateChange="2024-11-01T00:00:00Z">
+    <MediaRegistry>
+      <HardDisks>
+        <HardDisk uuid="{22222222-0000-4000-8000-000000000002}" location="target/x86_64-mfk/debug/bootimage-mfk-kernel.bin" format="RAW"/>
+      </HardDisks>
+    </MediaRegistry>
+    <Hardware>
+      <CPU count="2">
+        <HardwareVirtEx enabled="true"/>
+      </CPU>
+      <Memory RAMSize="256"/>
+      <Boot order="1" device="HardDisk"/>
+      <Display VRAMSize="32"/>
+      <StorageControllers>
+        <StorageController name="IDE" type="PIIX4" useHostIOCache="true">
+          <AttachedDevice type="HardDisk" port="0" device="0">
+            <Image uuid="{22222222-0000-4000-8000-000000000002}"/>
+          </AttachedDevice>
+        </StorageController>
+      </StorageControllers>
+      <UART>
+        <Port slot="0" enabled="true" IOBase="0x3f8" IRQ="4"/>
+      </UART>
+    </Hardware>
+  </Machine>
+</VirtualBox>

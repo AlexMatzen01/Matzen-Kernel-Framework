@@ -6,3 +6,6 @@
 
 # ignore locks
 /*.lock/
+
+# ignore cargo hidden directory
+/.cargo/
