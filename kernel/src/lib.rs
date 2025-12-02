@@ -15,8 +15,8 @@ mod panic;
 #[cfg(test)]
 mod tests;
 
-use bootloader::{entry_point, BootInfo};
 use ::core::sync::atomic::{AtomicBool, Ordering};
+use bootloader::{entry_point, BootInfo};
 
 static KERNEL_READY: AtomicBool = AtomicBool::new(false);
 

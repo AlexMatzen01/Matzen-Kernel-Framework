@@ -23,11 +23,17 @@ static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
     let mut gdt = GlobalDescriptorTable::new();
     let code_selector = gdt.append(Descriptor::kernel_code_segment());
     let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
-    (gdt, Selectors { code_selector, tss_selector })
+    (
+        gdt,
+        Selectors {
+            code_selector,
+            tss_selector,
+        },
+    )
 });
 
 pub fn init() {
-    use x86_64::instructions::segmentation::{CS, Segment};
+    use x86_64::instructions::segmentation::{Segment, CS};
     use x86_64::instructions::tables::load_tss;
 
     GDT.0.load();
