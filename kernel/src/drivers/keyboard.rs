@@ -78,11 +78,14 @@ impl Keyboard {
 
     /// Map a scan code to a character
     fn map_scancode(&self, scancode: u8) -> Option<char> {
-        let use_shift = self.shift_pressed ^ self.caps_lock;
+        // Caps lock only affects alphabetic characters. For letters, we XOR
+        // shift_pressed with caps_lock to determine case. For numbers and symbols,
+        // only shift_pressed is used (caps_lock has no effect on them).
+        let caps_adjusted = self.shift_pressed ^ self.caps_lock;
         
         // Standard US QWERTY keyboard layout (Set 1 scan codes)
         let ch = match scancode {
-            // Number row
+            // Number row - caps lock has no effect, only shift
             0x02 => if self.shift_pressed { '!' } else { '1' },
             0x03 => if self.shift_pressed { '@' } else { '2' },
             0x04 => if self.shift_pressed { '#' } else { '3' },
@@ -96,43 +99,43 @@ impl Keyboard {
             0x0C => if self.shift_pressed { '_' } else { '-' },
             0x0D => if self.shift_pressed { '+' } else { '=' },
             
-            // Top row (QWERTY)
-            0x10 => if use_shift { 'Q' } else { 'q' },
-            0x11 => if use_shift { 'W' } else { 'w' },
-            0x12 => if use_shift { 'E' } else { 'e' },
-            0x13 => if use_shift { 'R' } else { 'r' },
-            0x14 => if use_shift { 'T' } else { 't' },
-            0x15 => if use_shift { 'Y' } else { 'y' },
-            0x16 => if use_shift { 'U' } else { 'u' },
-            0x17 => if use_shift { 'I' } else { 'i' },
-            0x18 => if use_shift { 'O' } else { 'o' },
-            0x19 => if use_shift { 'P' } else { 'p' },
+            // Top row (QWERTY) - alphabetic, caps lock affects case
+            0x10 => if caps_adjusted { 'Q' } else { 'q' },
+            0x11 => if caps_adjusted { 'W' } else { 'w' },
+            0x12 => if caps_adjusted { 'E' } else { 'e' },
+            0x13 => if caps_adjusted { 'R' } else { 'r' },
+            0x14 => if caps_adjusted { 'T' } else { 't' },
+            0x15 => if caps_adjusted { 'Y' } else { 'y' },
+            0x16 => if caps_adjusted { 'U' } else { 'u' },
+            0x17 => if caps_adjusted { 'I' } else { 'i' },
+            0x18 => if caps_adjusted { 'O' } else { 'o' },
+            0x19 => if caps_adjusted { 'P' } else { 'p' },
             0x1A => if self.shift_pressed { '{' } else { '[' },
             0x1B => if self.shift_pressed { '}' } else { ']' },
             
-            // Home row (ASDF)
-            0x1E => if use_shift { 'A' } else { 'a' },
-            0x1F => if use_shift { 'S' } else { 's' },
-            0x20 => if use_shift { 'D' } else { 'd' },
-            0x21 => if use_shift { 'F' } else { 'f' },
-            0x22 => if use_shift { 'G' } else { 'g' },
-            0x23 => if use_shift { 'H' } else { 'h' },
-            0x24 => if use_shift { 'J' } else { 'j' },
-            0x25 => if use_shift { 'K' } else { 'k' },
-            0x26 => if use_shift { 'L' } else { 'l' },
+            // Home row (ASDF) - alphabetic, caps lock affects case
+            0x1E => if caps_adjusted { 'A' } else { 'a' },
+            0x1F => if caps_adjusted { 'S' } else { 's' },
+            0x20 => if caps_adjusted { 'D' } else { 'd' },
+            0x21 => if caps_adjusted { 'F' } else { 'f' },
+            0x22 => if caps_adjusted { 'G' } else { 'g' },
+            0x23 => if caps_adjusted { 'H' } else { 'h' },
+            0x24 => if caps_adjusted { 'J' } else { 'j' },
+            0x25 => if caps_adjusted { 'K' } else { 'k' },
+            0x26 => if caps_adjusted { 'L' } else { 'l' },
             0x27 => if self.shift_pressed { ':' } else { ';' },
             0x28 => if self.shift_pressed { '"' } else { '\'' },
             0x29 => if self.shift_pressed { '~' } else { '`' },
             0x2B => if self.shift_pressed { '|' } else { '\\' },
             
-            // Bottom row (ZXCV)
-            0x2C => if use_shift { 'Z' } else { 'z' },
-            0x2D => if use_shift { 'X' } else { 'x' },
-            0x2E => if use_shift { 'C' } else { 'c' },
-            0x2F => if use_shift { 'V' } else { 'v' },
-            0x30 => if use_shift { 'B' } else { 'b' },
-            0x31 => if use_shift { 'N' } else { 'n' },
-            0x32 => if use_shift { 'M' } else { 'm' },
+            // Bottom row (ZXCV) - alphabetic, caps lock affects case
+            0x2C => if caps_adjusted { 'Z' } else { 'z' },
+            0x2D => if caps_adjusted { 'X' } else { 'x' },
+            0x2E => if caps_adjusted { 'C' } else { 'c' },
+            0x2F => if caps_adjusted { 'V' } else { 'v' },
+            0x30 => if caps_adjusted { 'B' } else { 'b' },
+            0x31 => if caps_adjusted { 'N' } else { 'n' },
+            0x32 => if caps_adjusted { 'M' } else { 'm' },
             0x33 => if self.shift_pressed { '<' } else { ',' },
             0x34 => if self.shift_pressed { '>' } else { '.' },
             0x35 => if self.shift_pressed { '?' } else { '/' },

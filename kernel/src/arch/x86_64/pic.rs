@@ -29,6 +29,9 @@ pub const PIC1_OFFSET: u8 = 32;
 /// Offset for slave PIC interrupts
 pub const PIC2_OFFSET: u8 = 40;
 
+/// IRQ line numbers (relative to PIC1)
+const IRQ_KEYBOARD: u8 = 1;
+
 /// Hardware interrupt numbers
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
@@ -166,8 +169,8 @@ pub fn init() {
         let mut pics = PICS.lock();
         pics.disable_all();
         pics.initialize();
-        // Enable keyboard interrupt (IRQ1)
-        pics.enable_irq(1);
+        // Enable keyboard interrupt
+        pics.enable_irq(IRQ_KEYBOARD);
     }
     log::info!("PIC initialized");
 }

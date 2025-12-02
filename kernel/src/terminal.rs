@@ -11,6 +11,12 @@ use spin::Mutex;
 /// Maximum command line buffer size
 const MAX_COMMAND_LEN: usize = 256;
 
+/// PS/2 controller command port for system reset
+const PS2_COMMAND_PORT: u16 = 0x64;
+
+/// Command to pulse CPU reset line via PS/2 controller
+const PS2_RESET_COMMAND: u8 = 0xFE;
+
 /// Terminal state
 pub struct Terminal {
     buffer: [u8; MAX_COMMAND_LEN],
@@ -28,8 +34,10 @@ impl Terminal {
         }
     }
 
-    /// Print a string to the terminal
+    /// Print a string to the terminal (ignores formatting errors in kernel context)
     pub fn print(&self, s: &str) {
+        // In a bare-metal kernel, we cannot propagate formatting errors meaningfully
+        // as there's no higher-level error handling. We silently ignore any errors.
         let _ = self.writer.lock().write_str(s);
     }
 
@@ -171,11 +179,11 @@ impl Terminal {
 
     fn cmd_reboot(&self) {
         self.println("Rebooting system...");
-        // Triple fault to reboot (simple method)
         unsafe {
             // Write to PS/2 controller to pulse CPU reset line
-            let mut port: x86_64::instructions::port::Port<u8> = x86_64::instructions::port::Port::new(0x64);
-            port.write(0xFE);
+            let mut port: x86_64::instructions::port::Port<u8> = 
+                x86_64::instructions::port::Port::new(PS2_COMMAND_PORT);
+            port.write(PS2_RESET_COMMAND);
         }
         // If that didn't work, halt
         loop {
