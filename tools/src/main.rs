@@ -1,5 +1,6 @@
 //! MFK Runner - Creates bootable disk images and runs them in QEMU
 
+use std::path::Path;
 use std::process::Command;
 
 fn main() {
@@ -12,24 +13,24 @@ fn main() {
         std::process::exit(1);
     }
     
-    let kernel_path = &args[1];
+    let kernel_path = Path::new(&args[1]);
     
-    // Create a UEFI disk image
-    let uefi_path = format!("{}-uefi.img", kernel_path);
-    let bios_path = format!("{}-bios.img", kernel_path);
+    // Create disk image paths
+    let uefi_path = format!("{}-uefi.img", args[1]);
+    let bios_path = format!("{}-bios.img", args[1]);
     
     // Create the disk images
-    let uefi_builder = bootloader::UefiBoot::new(kernel_path.as_ref());
-    let bios_builder = bootloader::BiosBoot::new(kernel_path.as_ref());
+    let uefi_builder = bootloader::UefiBoot::new(kernel_path);
+    let bios_builder = bootloader::BiosBoot::new(kernel_path);
     
-    match uefi_builder.create_disk_image(&uefi_path.as_ref()) {
+    match uefi_builder.create_disk_image(Path::new(&uefi_path)) {
         Ok(_) => println!("Created UEFI disk image: {}", uefi_path),
         Err(e) => {
             eprintln!("Failed to create UEFI disk image: {}", e);
         }
     }
     
-    match bios_builder.create_disk_image(&bios_path.as_ref()) {
+    match bios_builder.create_disk_image(Path::new(&bios_path)) {
         Ok(_) => println!("Created BIOS disk image: {}", bios_path),
         Err(e) => {
             eprintln!("Failed to create BIOS disk image: {}", e);

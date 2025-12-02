@@ -7,10 +7,12 @@ use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 
-/// PS/2 data port
+/// PS/2 data port - reads scancode data
 const KEYBOARD_DATA_PORT: u16 = 0x60;
-/// PS/2 status port  
+/// PS/2 status/command port - reads status, writes commands
 const KEYBOARD_STATUS_PORT: u16 = 0x64;
+/// Status register bit indicating data is available to read
+const STATUS_OUTPUT_BUFFER_FULL: u8 = 0x01;
 
 lazy_static! {
     /// Keyboard decoder
@@ -32,9 +34,9 @@ pub fn read_key() -> Option<DecodedKey> {
     let mut data_port: Port<u8> = Port::new(KEYBOARD_DATA_PORT);
     let mut status_port: Port<u8> = Port::new(KEYBOARD_STATUS_PORT);
     
-    // Check if data is available
+    // Check if data is available (output buffer full bit)
     let status = unsafe { status_port.read() };
-    if status & 0x01 == 0 {
+    if status & STATUS_OUTPUT_BUFFER_FULL == 0 {
         return None;
     }
     

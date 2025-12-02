@@ -134,10 +134,12 @@ fn cmd_memory() {
 /// Reboots the system
 fn cmd_reboot() {
     println!("Rebooting...");
-    // Triple fault to reboot
+    // PS/2 controller reset command
+    const KEYBOARD_COMMAND_PORT: u16 = 0x64;
+    const KEYBOARD_RESET_COMMAND: u8 = 0xFE;
     unsafe {
-        let mut port: x86_64::instructions::port::Port<u8> = x86_64::instructions::port::Port::new(0x64);
-        port.write(0xFE);
+        let mut port: x86_64::instructions::port::Port<u8> = x86_64::instructions::port::Port::new(KEYBOARD_COMMAND_PORT);
+        port.write(KEYBOARD_RESET_COMMAND);
     }
 }
 

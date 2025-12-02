@@ -89,6 +89,15 @@ Once the kernel boots, you'll see a terminal prompt. Available commands:
     └── x86_64-mfk.json
 ```
 
+## Target Specification
+
+The custom target (`targets/x86_64-mfk.json`) disables MMX, SSE, and SSE2 CPU features.
+This is necessary for bare-metal kernel development because:
+
+- **No SIMD state management**: The kernel doesn't save/restore SIMD registers on context switches
+- **Interrupt safety**: SSE operations require proper alignment and can cause exceptions
+- **Smaller kernel footprint**: Avoids floating-point code generation overhead
+
 ## Architecture
 
 The kernel uses the `bootloader` crate for booting and provides:

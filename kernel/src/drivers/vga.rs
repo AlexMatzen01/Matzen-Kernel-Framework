@@ -186,12 +186,17 @@ pub fn init() {
     WRITER.lock().clear_screen();
 }
 
-/// Prints a formatted string to the VGA buffer
+/// Prints a formatted string to the VGA buffer.
+/// 
+/// Disables interrupts while writing to prevent race conditions with concurrent
+/// access from interrupt handlers. This ensures the VGA buffer stays consistent.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
     use x86_64::instructions::interrupts;
 
+    // Disable interrupts to prevent deadlock if an interrupt handler tries to print
+    // while we're holding the WRITER lock
     interrupts::without_interrupts(|| {
         WRITER.lock().write_fmt(args).unwrap();
     });
@@ -210,7 +215,9 @@ macro_rules! println {
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
 
-/// Clears the screen
+/// Clears the screen.
+/// 
+/// Disables interrupts to prevent race conditions with concurrent access.
 pub fn clear_screen() {
     use x86_64::instructions::interrupts;
     
@@ -219,7 +226,9 @@ pub fn clear_screen() {
     });
 }
 
-/// Handles backspace
+/// Handles backspace.
+/// 
+/// Disables interrupts to prevent race conditions with concurrent access.
 pub fn backspace() {
     use x86_64::instructions::interrupts;
     
