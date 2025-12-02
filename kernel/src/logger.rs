@@ -1,4 +1,3 @@
-use core::fmt;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use spin::Once;
 

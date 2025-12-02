@@ -19,5 +19,5 @@ volatile = "0.4"
 log = { version = "0.4", default-features = false }
 
 [package.metadata.bootimage]
-build-command = ["cargo", "build", "-p", "mfk-kernel", "--target", "targets/x86_64-mfk.json"]
+build-command = ["build", "-p", "mfk-kernel"]
 runtime-binary = "target/x86_64-mfk/debug/bootimage-mfk-kernel.bin"

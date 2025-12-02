@@ -12,6 +12,7 @@ mod intrinsics;
 mod logger;
 mod memory;
 mod panic;
+mod terminal;
 #[cfg(test)]
 mod tests;
 
@@ -34,8 +35,10 @@ fn kernel_entry(boot_info: &'static BootInfo) -> ! {
     test_main();
 
     KERNEL_READY.store(true, Ordering::Release);
-    log::info!("Kernel is now idling; ready for next subsystems.");
-    core::runtime::idle_loop();
+    log::info!("Kernel initialization complete. Starting terminal...");
+    
+    // Run the terminal OS
+    terminal::run();
 }
 
 pub fn ready() -> bool {

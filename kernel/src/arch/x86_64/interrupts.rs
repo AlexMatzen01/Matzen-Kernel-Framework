@@ -1,12 +1,19 @@
 use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
+use super::pic::{self, InterruptIndex};
+
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.divide_error.set_handler_fn(divide_by_zero_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
     idt.double_fault.set_handler_fn(double_fault_handler);
     idt.breakpoint.set_handler_fn(breakpoint_handler);
+    
+    // Hardware interrupts
+    idt[InterruptIndex::Timer.as_usize()].set_handler_fn(timer_interrupt_handler);
+    idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
+    
     idt
 });
 
@@ -44,4 +51,15 @@ extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFrame, e
         stack_frame
     );
     crate::core::runtime::halt();
+}
+
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Timer tick - currently unused but required for PIC
+    pic::end_of_interrupt(InterruptIndex::Timer.as_u8());
+}
+
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Keyboard input is handled by polling in the main loop
+    // Just acknowledge the interrupt here
+    pic::end_of_interrupt(InterruptIndex::Keyboard.as_u8());
 }
