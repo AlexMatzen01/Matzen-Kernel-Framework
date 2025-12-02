@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 bootloader = { version = "0.9.23" }
 spin = { version = "0.9", features = ["mutex", "spin_mutex"] }
-x86_64 = "0.15"
+x86_64 = "0.14.10"
 volatile = "0.4"
 log = { version = "0.4", default-features = false }
 

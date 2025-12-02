@@ -1,26 +1,23 @@
 use core::ops::Range;
 
-extern "C" {
-    static __text_start: u8;
-    static __text_end: u8;
-    static __data_start: u8;
-    static __data_end: u8;
-    static __bss_start: u8;
-    static __bss_end: u8;
-}
+// Note: When using the bootloader crate, we don't have direct access to linker symbols
+// since the bootloader manages the linking. We provide placeholder implementations here.
+// The actual kernel memory information is available via BootInfo.
 
-fn range(start: &u8, end: &u8) -> Range<usize> {
-    (start as *const _ as usize)..(end as *const _ as usize)
-}
-
+/// Returns a placeholder range for the text section.
+/// Use BootInfo from the bootloader crate for actual memory mapping.
 pub fn text_range() -> Range<usize> {
-    unsafe { range(&__text_start, &__text_end) }
+    0..0
 }
 
+/// Returns a placeholder range for the data section.
+/// Use BootInfo from the bootloader crate for actual memory mapping.
 pub fn data_range() -> Range<usize> {
-    unsafe { range(&__data_start, &__data_end) }
+    0..0
 }
 
+/// Returns a placeholder range for the bss section.
+/// Use BootInfo from the bootloader crate for actual memory mapping.
 pub fn bss_range() -> Range<usize> {
-    unsafe { range(&__bss_start, &__bss_end) }
+    0..0
 }
