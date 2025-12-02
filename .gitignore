@@ -1,0 +1,8 @@
+# ignore target
+/target/
+
+# ignore vs code
+/.vscode/
+
+# ignore locks
+/*.lock/
