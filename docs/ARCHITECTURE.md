@@ -9,16 +9,19 @@ kernel
 ├── arch
 │   └── x86_64
 │       ├── gdt.rs          # CPU privilege levels and task state
-│       ├── interrupts.rs   # IDT, ISR stubs, and PIC/PIT wiring
+│       ├── interrupts.rs   # IDT, ISR stubs, and hardware interrupt handlers
+│       ├── pic.rs          # Programmable Interrupt Controller driver
 │       └── mod.rs          # Architecture facade + init entry
 ├── core
 │   ├── boot.rs             # Cold-boot sequencing + health checks
 │   └── runtime.rs          # Idle loop + future scheduler hooks
 ├── drivers
+│   ├── keyboard.rs         # PS/2 keyboard driver with US QWERTY layout
 │   └── vga.rs              # VGA text mode writer
+├── terminal.rs             # Interactive shell with command parsing
 ├── logger.rs               # Simple logging facade backed by drivers
 ├── memory
-│   ├── layout.rs           # Symbols exposed by linker + region aliases
+│   ├── layout.rs           # Memory region placeholders (bootloader-managed)
 │   └── mod.rs              # Init hooks + future paging/alloc placeholder
 └── panic.rs                # Panic handler + fail-fast shutdown path
 ```
@@ -29,10 +32,26 @@ kernel
 2. **Custom entry point**: `_start` invokes `kernel_entry` (see `kernel/src/lib.rs`) with a `BootInfo` pointer.
 3. **Early services**:
    - VGA writer initialized for deterministic logging.
-   - GDT + IDT configured, including basic exception vectors and a stub timer interrupt.
-   - Programmable interrupt controller (PIC) masked until handlers are registered.
-4. **Memory layout validation**: `memory::layout` inspects linker-provided symbols to ensure the kernel resides inside the intended region.
-5. **Runtime phase**: Control passes into `core::runtime::idle_loop`, which halts the CPU until the next interrupt, providing a clean site for future schedulers.
+   - GDT + IDT configured, including basic exception vectors and hardware interrupt handlers.
+   - PIC initialized with keyboard interrupt (IRQ1) enabled.
+4. **Memory layout validation**: `memory::init` reports boot info and memory regions.
+5. **Terminal phase**: Control passes to `terminal::run`, which displays a welcome banner and enters an interactive command loop.
+
+## Terminal OS
+
+The kernel boots into an interactive terminal shell that supports:
+
+- **Keyboard input**: PS/2 keyboard driver with US QWERTY layout, supporting shift, caps lock, and special keys (backspace, enter).
+- **Built-in commands**:
+  - `help` - List available commands
+  - `clear` - Clear the screen
+  - `echo <text>` - Print text to screen
+  - `about` - Show kernel information
+  - `version` - Show version info
+  - `uptime` - System uptime (placeholder)
+  - `mem` - Memory information
+  - `reboot` - Reboot via keyboard controller reset
+  - `halt` - Halt the CPU
 
 ## Memory map
 
@@ -44,6 +63,7 @@ kernel
 
 - **Architectures**: Add a new module under `kernel/src/arch/<arch>` and register it in `arch/mod.rs`. Each arch module exposes `fn init(boot_info: &BootInfo)` for symmetry.
 - **Drivers**: Place hardware-specific implementations under `kernel/src/drivers`. The `logger` module already abstracts the console, so new backends (UART, framebuffer) can plug in without touching call sites.
+- **Terminal commands**: Add new commands in `terminal.rs` by extending the `execute_command` match statement.
 - **Memory management**: `memory::layout` centralizes all symbols exported by the linker. Higher-level allocators, paging structures, and mapping policies can be layered on top without changing the entry flow.
 - **Virtualization**: Launch scripts live in `scripts/` so CI/CD pipelines or custom dashboards can wrap them easily. QEMU and VirtualBox templates reside under `virtualization/`.
 

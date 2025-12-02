@@ -5,11 +5,28 @@ The Matzen Kernel Framework is a forward-looking Rust micro-kernel playground de
 ## Highlights
 
 - **Rust-first** `no_std`, `no_main` kernel that boots via the [`bootloader`](https://github.com/rust-osdev/bootloader) crate.
+- **Terminal-based OS** with a simple interactive shell and keyboard input support.
 - **Enterprise-grade layout**: clearly separated `arch`, `core`, `memory`, and `drivers` modules with extensive inline documentation.
 - **Custom entry point** with predictable memory map, linker script, and early exception/interrupt scaffolding.
 - **Deterministic builds**: nightly Rust toolchain pinning, workspace-level `Cargo.toml`, and reproducible target specification via `targets/x86_64-mfk.json`.
 - **Early logging** through a lightweight VGA text writer and composable logger API for future framebuffer work.
 - **Turn-key virtualization**: QEMU launch scripts (bash + PowerShell) and VirtualBox configuration templates for rapid iteration without host reboots.
+
+## Terminal OS Features
+
+The kernel boots into an interactive terminal with the following built-in commands:
+
+| Command   | Description                        |
+|-----------|-----------------------------------|
+| `help`    | Show available commands           |
+| `clear`   | Clear the screen                  |
+| `echo`    | Print text to the screen          |
+| `about`   | Show information about MFK        |
+| `version` | Show kernel version               |
+| `uptime`  | Show system uptime (placeholder)  |
+| `mem`     | Show memory information           |
+| `reboot`  | Reboot the system                 |
+| `halt`    | Halt the system                   |
 
 ## Quick Start
 
@@ -33,12 +50,20 @@ make run          # Linux/macOS/WSL
 
 ```
 ├── Cargo.toml                # Workspace definition
+├── .cargo/config.toml        # Build configuration (target, build-std)
 ├── kernel/                   # Primary kernel crate (lib + entrypoint)
 │   ├── linker.ld             # Memory layout script
 │   └── src/
 │       ├── arch/             # Architecture-specific boot + interrupt code
+│       │   └── x86_64/
+│       │       ├── gdt.rs    # Global Descriptor Table
+│       │       ├── interrupts.rs # IDT and interrupt handlers
+│       │       └── pic.rs    # Programmable Interrupt Controller
 │       ├── core/             # Scheduler/runtime glue
-│       ├── drivers/          # Early drivers (VGA, timers, etc.)
+│       ├── drivers/          # Early drivers
+│       │   ├── vga.rs        # VGA text mode display
+│       │   └── keyboard.rs   # PS/2 keyboard input
+│       ├── terminal.rs       # Interactive shell
 │       ├── logger.rs         # Logger facade + macros
 │       ├── memory/           # Memory map + allocator placeholders
 │       └── panic.rs          # Panic + shutdown handling

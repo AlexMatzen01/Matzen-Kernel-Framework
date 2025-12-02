@@ -4,8 +4,8 @@
 # ignore vs code
 /.vscode/
 
-# ignore cargo lock
+# ignore cargo lock (except at root)
 /Cargo.lock/
 
-# ignore cargo hidden directory
-/.cargo/
+# ignore cargo credentials only
+/.cargo/credentials.toml
