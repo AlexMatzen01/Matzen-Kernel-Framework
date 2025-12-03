@@ -10,8 +10,8 @@ description = "Matzen Kernel Framework (MFK) workspace"
 [workspace.metadata]
 # Central place to keep versions aligned if more crates are added later.
 spin-version = "0.9"
-x86_64-version = "0.15"
-bootloader-version = "0.11"
+x86_64-version = "0.14"
+bootloader-version = "0.9"
 
 [profile.dev]
 panic = "abort"
