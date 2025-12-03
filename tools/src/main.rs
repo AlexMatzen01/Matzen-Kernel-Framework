@@ -48,7 +48,8 @@ fn main() {
             .args([
                 "-drive", &format!("format=raw,file={}", bios_path),
                 "-serial", "stdio",
-                "-display", "sdl",
+                "-display", "none",
+                "-no-reboot",
             ])
             .spawn()
             .expect("Failed to start QEMU");

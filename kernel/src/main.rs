@@ -20,8 +20,13 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 /// Main entry point for the kernel
 fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
+    // Initialize serial port first for early debugging
+    drivers::serial::init();
+    serial_println!("Serial port initialized");
+    
     // Initialize VGA text mode
     drivers::vga::init();
+    serial_println!("VGA initialized");
     
     // Print welcome message
     println!("======================================");
@@ -32,10 +37,14 @@ fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
     println!("Type 'help' for available commands.");
     println!();
     
+    serial_println!("Welcome message printed");
+    
     // Initialize keyboard
     drivers::keyboard::init();
+    serial_println!("Keyboard initialized");
     
     // Start the shell
+    serial_println!("Starting shell...");
     shell::run();
 }
 
