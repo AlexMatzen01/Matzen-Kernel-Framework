@@ -5,7 +5,8 @@
 /.vscode/
 
 # ignore cargo lock
-/Cargo.lock/
+/Cargo.lock
 
 # ignore cargo hidden directory
+
 /.cargo/
