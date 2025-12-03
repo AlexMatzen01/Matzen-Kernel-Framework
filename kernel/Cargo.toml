@@ -6,18 +6,15 @@ authors = ["Matzen Kernel Authors <kernel@matzen.dev>"]
 description = "Matzen Kernel Framework - experimental micro-kernel"
 license = "MIT OR Apache-2.0"
 publish = false
-
-[[bin]]
-name = "mfk-kernel"
-path = "src/lib.rs"
+autobins = false
 
 [dependencies]
-bootloader = { version = "0.9.23" }
+bootloader = { version = "0.11" }
 spin = { version = "0.9", features = ["mutex", "spin_mutex"] }
-x86_64 = "0.15"
+x86_64 = { path = "../vendor/x86_64", default-features = false, features = ["instructions", "abi_x86_interrupt", "asm_const"] }
 volatile = "0.4"
 log = { version = "0.4", default-features = false }
 
 [package.metadata.bootimage]
-build-command = ["cargo", "build", "-p", "mfk-kernel", "--target", "targets/x86_64-mfk.json"]
-runtime-binary = "target/x86_64-mfk/debug/bootimage-mfk-kernel.bin"
+build-command = ["cargo", "build", "-p", "mfk-kernel", "--lib", "--target", "targets/x86_64-mfk.json", "-Zbuild-std=core,alloc", "-Zbuild-std-features=compiler-builtins-mem"]
+target = "targets/x86_64-mfk.json"

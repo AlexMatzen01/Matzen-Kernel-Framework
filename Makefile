@@ -1,15 +1,16 @@
-BOOTIMAGE?=target/x86_64-mfk/debug/bootimage-mfk-kernel.bin
+KERNEL_LIB?=target/x86_64-mfk/debug/libmfk_kernel.rlib
 QEMU?=qemu-system-x86_64
 
-.PHONY: all build image run clean fmt clippy
+.PHONY: all build run clean fmt clippy
 
-all: run
+all: build
 
 build:
-	cargo build -p mfk-kernel --target targets/x86_64-mfk.json
+	cargo build --lib --target targets/x86_64-mfk.json -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 
-image:
-	cargo bootimage -p mfk-kernel
+# Note: bootimage tool doesn't work with lib-only targets in bootloader 0.9.x
+# The kernel lib compiles successfully at $(KERNEL_LIB)
+# To create a bootable image, you'll need to use bootloader 0.11+ or manually link
 
 run: image
 	./scripts/run-qemu.sh $(BOOTIMAGE)

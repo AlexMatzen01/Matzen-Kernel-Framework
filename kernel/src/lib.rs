@@ -4,6 +4,7 @@
 #![feature(abi_x86_interrupt)]
 #![test_runner(crate::tests::run)]
 #![reexport_test_harness_main = "test_main"]
+#![feature(const_mut_refs)]
 
 mod arch;
 mod core;
