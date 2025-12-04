@@ -1,3 +1,8 @@
+#! Copyright (c) Alexander Matzen. All rights reserved.
+#! Author: Alexander Matzen
+#! Licensed under the MIT license.
+
+
 [package]
 name = "mfk-runner"
 version = "0.1.0"

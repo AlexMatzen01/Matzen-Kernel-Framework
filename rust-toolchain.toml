@@ -1,3 +1,8 @@
+#! Copyright (c) Alexander Matzen. All rights reserved.
+#! Author: Alexander Matzen
+#! Licensed under the MIT license.
+
+
 [toolchain]
 channel = "nightly"
 components = ["rust-src", "llvm-tools-preview"]
