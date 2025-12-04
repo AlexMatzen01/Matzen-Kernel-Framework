@@ -96,12 +96,6 @@ impl Writer {
         self.buffer = Some(unsafe { &mut *(buffer_addr as *mut Buffer) });
     }
 
-    /// Returns true if the writer is initialized
-    #[allow(dead_code)]
-    fn is_initialized(&self) -> bool {
-        self.buffer.is_some()
-    }
-
     /// Writes a byte to the VGA buffer
     pub fn write_byte(&mut self, byte: u8) {
         match byte {
@@ -122,6 +116,8 @@ impl Writer {
                     });
                     self.column_position += 1;
                 }
+                // Note: If buffer is None, we silently skip writing.
+                // This is intentional to avoid panics before VGA is initialized.
             }
         }
     }
@@ -210,17 +206,6 @@ pub fn init_with_offset(physical_memory_offset: u64) {
     let vga_buffer_virt = physical_memory_offset + VGA_BUFFER_PHYS;
     let mut writer = WRITER.lock();
     writer.initialize(vga_buffer_virt);
-    writer.clear_screen();
-}
-
-/// Initializes the VGA text buffer (legacy, assumes identity mapping)
-#[allow(dead_code)]
-pub fn init() {
-    let mut writer = WRITER.lock();
-    if !writer.is_initialized() {
-        // Fall back to identity mapping if not initialized with offset
-        writer.initialize(VGA_BUFFER_PHYS);
-    }
     writer.clear_screen();
 }
 
