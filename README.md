@@ -26,7 +26,7 @@ rustup component add rust-src llvm-tools-preview --toolchain nightly
 Build the kernel:
 
 ```bash
-cargo build -p mfk-kernel --target x86_64-unknown-none -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
+cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 ```
 
 Build the runner tool:
@@ -40,13 +40,13 @@ cargo build -p mfk-runner --release
 Create a bootable disk image and run in QEMU:
 
 ```bash
-cargo run -p mfk-runner --release -- target/x86_64-unknown-none/debug/mfk-kernel
+cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel
 ```
 
 Or create only the disk image (without running QEMU):
 
 ```bash
-cargo run -p mfk-runner --release -- target/x86_64-unknown-none/debug/mfk-kernel --no-run
+cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel --no-run
 ```
 
 ## Available Shell Commands
