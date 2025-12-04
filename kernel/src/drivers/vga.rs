@@ -1,3 +1,8 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
+
 //! VGA Text Buffer Driver
 //!
 //! Provides text output to the VGA text buffer at 0xb8000.

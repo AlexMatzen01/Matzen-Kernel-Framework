@@ -1,3 +1,8 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
+
 //! MFK Runner - Creates bootable disk images and runs them in QEMU
 
 use std::path::Path;

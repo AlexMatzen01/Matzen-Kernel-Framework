@@ -1,3 +1,8 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
+
 //! Serial Port Driver (COM1)
 //!
 //! Provides output to the first serial port for debugging.

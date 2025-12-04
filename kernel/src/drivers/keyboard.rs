@@ -1,3 +1,8 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
+
 //! PS/2 Keyboard Driver
 //!
 //! Provides keyboard input support via PS/2 port polling.

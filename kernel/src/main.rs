@@ -1,3 +1,8 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
+
 //! Matzen Kernel Framework - A simple terminal OS
 //!
 //! This kernel provides a basic terminal interface that runs on bare metal x86_64.

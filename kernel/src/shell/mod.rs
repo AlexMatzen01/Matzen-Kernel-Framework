@@ -1,3 +1,8 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
+
 //! Terminal Shell
 //!
 //! A simple command-line shell for the Matzen Kernel Framework.
