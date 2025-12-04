@@ -9,23 +9,31 @@ mod drivers;
 mod shell;
 
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
+use bootloader_api::config::Mapping;
 use core::panic::PanicInfo;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
-    let config = BootloaderConfig::new_default();
+    let mut config = BootloaderConfig::new_default();
+    // Map all physical memory so we can access VGA buffer at 0xb8000
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
     config
 };
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 /// Main entry point for the kernel
-fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Initialize serial port first for early debugging
     drivers::serial::init();
     serial_println!("Serial port initialized");
     
-    // Initialize VGA text mode
-    drivers::vga::init();
+    // Get physical memory offset for VGA buffer access
+    let phys_mem_offset = boot_info.physical_memory_offset.into_option()
+        .expect("Physical memory offset not available");
+    serial_println!("Physical memory offset: {:#x}", phys_mem_offset);
+    
+    // Initialize VGA text mode with proper memory mapping
+    drivers::vga::init_with_offset(phys_mem_offset);
     serial_println!("VGA initialized");
     
     // Print welcome message
@@ -51,9 +59,16 @@ fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
 /// Panic handler - prints error message and halts
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // Try to print to serial first (always works)
+    serial_println!();
+    serial_println!("KERNEL PANIC!");
+    serial_println!("{}", info);
+    
+    // Also try VGA (may not work if panic is early)
     println!();
     println!("KERNEL PANIC!");
     println!("{}", info);
+    
     loop {
         x86_64::instructions::hlt();
     }
