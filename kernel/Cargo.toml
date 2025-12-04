@@ -21,9 +21,3 @@ pc-keyboard = "0.7"
 [dependencies.lazy_static]
 version = "1.5"
 features = ["spin_no_std"]
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
