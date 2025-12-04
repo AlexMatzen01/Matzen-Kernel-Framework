@@ -9,11 +9,23 @@ fn main() {
     
     if args.len() < 2 {
         eprintln!("Usage: {} <kernel-binary-path>", args[0]);
-        eprintln!("Example: {} target/x86_64-unknown-none/debug/mfk-kernel", args[0]);
+        eprintln!("Example: {} target/x86_64-mfk/debug/mfk-kernel", args[0]);
         std::process::exit(1);
     }
     
     let kernel_path = Path::new(&args[1]);
+    
+    // Check if kernel binary exists
+    if !kernel_path.exists() {
+        eprintln!("Error: Kernel binary not found at: {}", args[1]);
+        eprintln!();
+        eprintln!("Make sure you've built the kernel first:");
+        eprintln!("  cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem");
+        eprintln!();
+        eprintln!("Then run with the correct path:");
+        eprintln!("  cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel");
+        std::process::exit(1);
+    }
     
     // Create disk image paths
     let uefi_path = format!("{}-uefi.img", args[1]);
