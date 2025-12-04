@@ -4,13 +4,15 @@
 
 use core::fmt;
 use core::ptr;
-use lazy_static::lazy_static;
 use spin::Mutex;
 
 /// VGA text buffer width
 const BUFFER_WIDTH: usize = 80;
 /// VGA text buffer height
 const BUFFER_HEIGHT: usize = 25;
+
+/// VGA text buffer physical address
+const VGA_BUFFER_PHYS: u64 = 0xb8000;
 
 /// VGA color codes
 #[allow(dead_code)]
@@ -41,7 +43,7 @@ pub enum Color {
 struct ColorCode(u8);
 
 impl ColorCode {
-    fn new(foreground: Color, background: Color) -> ColorCode {
+    const fn new(foreground: Color, background: Color) -> ColorCode {
         ColorCode((background as u8) << 4 | (foreground as u8))
     }
 }
@@ -76,10 +78,24 @@ impl Buffer {
 pub struct Writer {
     column_position: usize,
     color_code: ColorCode,
-    buffer: &'static mut Buffer,
+    buffer: Option<&'static mut Buffer>,
 }
 
 impl Writer {
+    /// Creates a new uninitialized writer
+    const fn new_uninit() -> Writer {
+        Writer {
+            column_position: 0,
+            color_code: ColorCode::new(Color::LightGreen, Color::Black),
+            buffer: None,
+        }
+    }
+
+    /// Initializes the writer with the buffer address
+    fn initialize(&mut self, buffer_addr: u64) {
+        self.buffer = Some(unsafe { &mut *(buffer_addr as *mut Buffer) });
+    }
+
     /// Writes a byte to the VGA buffer
     pub fn write_byte(&mut self, byte: u8) {
         match byte {
@@ -89,15 +105,19 @@ impl Writer {
                     self.new_line();
                 }
 
-                let row = BUFFER_HEIGHT - 1;
-                let col = self.column_position;
+                if let Some(buffer) = &mut self.buffer {
+                    let row = BUFFER_HEIGHT - 1;
+                    let col = self.column_position;
 
-                let color_code = self.color_code;
-                self.buffer.write(row, col, ScreenChar {
-                    ascii_character: byte,
-                    color_code,
-                });
-                self.column_position += 1;
+                    let color_code = self.color_code;
+                    buffer.write(row, col, ScreenChar {
+                        ascii_character: byte,
+                        color_code,
+                    });
+                    self.column_position += 1;
+                }
+                // Note: If buffer is None, we silently skip writing.
+                // This is intentional to avoid panics before VGA is initialized.
             }
         }
     }
@@ -116,24 +136,28 @@ impl Writer {
 
     /// Moves all lines up by one and clears the last row
     fn new_line(&mut self) {
-        for row in 1..BUFFER_HEIGHT {
-            for col in 0..BUFFER_WIDTH {
-                let character = self.buffer.read(row, col);
-                self.buffer.write(row - 1, col, character);
+        if let Some(buffer) = &mut self.buffer {
+            for row in 1..BUFFER_HEIGHT {
+                for col in 0..BUFFER_WIDTH {
+                    let character = buffer.read(row, col);
+                    buffer.write(row - 1, col, character);
+                }
             }
+            self.clear_row(BUFFER_HEIGHT - 1);
+            self.column_position = 0;
         }
-        self.clear_row(BUFFER_HEIGHT - 1);
-        self.column_position = 0;
     }
 
     /// Clears a row by filling it with blank characters
     fn clear_row(&mut self, row: usize) {
-        let blank = ScreenChar {
-            ascii_character: b' ',
-            color_code: self.color_code,
-        };
-        for col in 0..BUFFER_WIDTH {
-            self.buffer.write(row, col, blank);
+        if let Some(buffer) = &mut self.buffer {
+            let blank = ScreenChar {
+                ascii_character: b' ',
+                color_code: self.color_code,
+            };
+            for col in 0..BUFFER_WIDTH {
+                buffer.write(row, col, blank);
+            }
         }
     }
 
@@ -153,14 +177,16 @@ impl Writer {
 
     /// Deletes the last character (backspace)
     pub fn backspace(&mut self) {
-        if self.column_position > 0 {
-            self.column_position -= 1;
-            let row = BUFFER_HEIGHT - 1;
-            let col = self.column_position;
-            self.buffer.write(row, col, ScreenChar {
-                ascii_character: b' ',
-                color_code: self.color_code,
-            });
+        if let Some(buffer) = &mut self.buffer {
+            if self.column_position > 0 {
+                self.column_position -= 1;
+                let row = BUFFER_HEIGHT - 1;
+                let col = self.column_position;
+                buffer.write(row, col, ScreenChar {
+                    ascii_character: b' ',
+                    color_code: self.color_code,
+                });
+            }
         }
     }
 }
@@ -172,18 +198,15 @@ impl fmt::Write for Writer {
     }
 }
 
-lazy_static! {
-    /// Global writer instance
-    pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
-        column_position: 0,
-        color_code: ColorCode::new(Color::LightGreen, Color::Black),
-        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
-    });
-}
+/// Global writer instance
+pub static WRITER: Mutex<Writer> = Mutex::new(Writer::new_uninit());
 
-/// Initializes the VGA text buffer
-pub fn init() {
-    WRITER.lock().clear_screen();
+/// Initializes the VGA text buffer with the physical memory offset
+pub fn init_with_offset(physical_memory_offset: u64) {
+    let vga_buffer_virt = physical_memory_offset + VGA_BUFFER_PHYS;
+    let mut writer = WRITER.lock();
+    writer.initialize(vga_buffer_virt);
+    writer.clear_screen();
 }
 
 /// Prints a formatted string to the VGA buffer.
