@@ -4,5 +4,5 @@
 # ignore vs code
 /.vscode/
 
-# ignore locks
-/*.lock/
+# ignore cargo lock
+/Cargo.lock

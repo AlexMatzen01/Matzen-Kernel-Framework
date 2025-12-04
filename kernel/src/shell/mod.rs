@@ -13,10 +13,15 @@ const PROMPT: &str = "mfk> ";
 
 /// Runs the shell loop
 pub fn run() -> ! {
+    use crate::serial_println;
+    serial_println!("Shell run() function started");
+    
     let mut cmd_buffer: [u8; MAX_CMD_LENGTH] = [0; MAX_CMD_LENGTH];
     let mut cmd_len: usize = 0;
 
+    serial_println!("About to print prompt...");
     print!("{}", PROMPT);
+    serial_println!("Prompt printed, entering main loop");
 
     loop {
         if let Some(c) = keyboard::read_char() {
@@ -49,7 +54,8 @@ pub fn run() -> ! {
                 _ => {}
             }
         }
-        x86_64::instructions::hlt();
+        // Don't use hlt() here - it sleeps the CPU waiting for interrupts,
+        // but interrupts aren't enabled yet, causing the kernel to hang
     }
 }
 
