@@ -1,3 +1,8 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
+
 //! Real-Time Clock (RTC) Driver
 //!
 //! Reads date and time from the CMOS RTC hardware.
