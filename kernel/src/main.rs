@@ -9,9 +9,12 @@
 
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 mod drivers;
 mod shell;
+mod interrupts;
+mod pic;
 
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use bootloader_api::config::Mapping;
@@ -52,9 +55,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     
     serial_println!("Welcome message printed");
     
-    // Initialize keyboard
+    // Initialize interrupt handling
+    interrupts::init_idt();
+    serial_println!("IDT initialized");
+    
+    // Initialize and configure PIC
+    unsafe {
+        pic::PICS.lock().initialize();
+        // Unmask keyboard interrupt (IRQ1)
+        pic::PICS.lock().set_mask(1, false);
+    }
+    serial_println!("PIC initialized and configured");
+    
+    // Initialize keyboard driver
     drivers::keyboard::init();
     serial_println!("Keyboard initialized");
+    
+    // Enable interrupts
+    x86_64::instructions::interrupts::enable();
+    serial_println!("Interrupts enabled");
     
     // Start the shell
     serial_println!("Starting shell...");

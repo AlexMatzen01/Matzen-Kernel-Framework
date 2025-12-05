@@ -214,7 +214,7 @@ pub fn init_with_offset(physical_memory_offset: u64) {
     writer.clear_screen();
 }
 
-/// Prints a formatted string to the VGA buffer.
+/// Prints a formatted string to the VGA buffer and serial port.
 /// 
 /// Disables interrupts while writing to prevent race conditions with concurrent
 /// access from interrupt handlers. This ensures the VGA buffer stays consistent.
@@ -227,6 +227,8 @@ pub fn _print(args: fmt::Arguments) {
     // while we're holding the WRITER lock
     interrupts::without_interrupts(|| {
         WRITER.lock().write_fmt(args).unwrap();
+        // Also write to serial for console access
+        crate::drivers::serial::_print(args);
     });
 }
 

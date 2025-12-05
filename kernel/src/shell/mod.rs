@@ -22,15 +22,10 @@ static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Runs the shell loop
 pub fn run() -> ! {
-    use crate::serial_println;
-    serial_println!("Shell run() function started");
-    
     let mut cmd_buffer: [u8; MAX_CMD_LENGTH] = [0; MAX_CMD_LENGTH];
     let mut cmd_len: usize = 0;
 
-    serial_println!("About to print prompt...");
     print!("{}", PROMPT);
-    serial_println!("Prompt printed, entering main loop");
 
     loop {
         // Increment tick counter for basic timing
@@ -38,7 +33,7 @@ pub fn run() -> ! {
         
         if let Some(c) = keyboard::read_char() {
             match c {
-                '\n' => {
+                '\n' | '\r' => {
                     println!();
                     if cmd_len > 0 {
                         let cmd = core::str::from_utf8(&cmd_buffer[..cmd_len]).unwrap_or("");
@@ -65,9 +60,11 @@ pub fn run() -> ! {
                 }
                 _ => {}
             }
+        } else {
+            // No input available, halt CPU until next interrupt
+            // This saves power and is safe now that interrupts are enabled
+            x86_64::instructions::hlt();
         }
-        // Don't use hlt() here - it sleeps the CPU waiting for interrupts,
-        // but interrupts aren't enabled yet, causing the kernel to hang
     }
 }
 
