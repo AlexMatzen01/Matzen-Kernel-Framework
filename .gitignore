@@ -1,11 +1,4 @@
-# ignore target
 /target/
-
-# ignore vs code
 /.vscode/
-
-# ignore cargo lock
 /Cargo.lock
-
-# ignore prepend copyright script
 /.prependcopyright.sh
