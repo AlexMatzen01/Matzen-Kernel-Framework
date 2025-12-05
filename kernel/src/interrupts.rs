@@ -21,6 +21,8 @@ lazy_static! {
             .set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()]
             .set_handler_fn(keyboard_interrupt_handler);
+        idt[InterruptIndex::Com1.as_u8()]
+            .set_handler_fn(serial_interrupt_handler);
         
         idt
     };
@@ -35,8 +37,9 @@ pub fn init_idt() {
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum InterruptIndex {
-    Timer = 32,      // PIC1 base + 0
-    Keyboard = 33,   // PIC1 base + 1
+    Timer = 32,      // PIC1 base + 0 (IRQ0)
+    Keyboard = 33,   // PIC1 base + 1 (IRQ1)
+    Com1 = 36,       // PIC1 base + 4 (IRQ4)
 }
 
 impl InterruptIndex {
@@ -101,5 +104,16 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     unsafe {
         super::pic::PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+}
+
+extern "x86-interrupt" fn serial_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Handle serial port interrupt - read data from COM1
+    crate::drivers::serial::handle_interrupt();
+
+    // Send End of Interrupt to PIC
+    unsafe {
+        super::pic::PICS.lock()
+            .notify_end_of_interrupt(InterruptIndex::Com1.as_u8());
     }
 }

@@ -3,20 +3,15 @@
 //! Licensed under the MIT license.
 
 
-//! PS/2 Keyboard Driver
+//! Keyboard Input Driver
 //!
-//! Provides keyboard input support via interrupt-driven PS/2 interface.
-//! Uses a circular buffer to store scancodes from the keyboard interrupt handler.
+//! Provides keyboard input from multiple sources:
+//! - Serial port (for QEMU console mode with -serial stdio)
+//! - PS/2 keyboard (for graphical mode)
 
 use lazy_static::lazy_static;
 use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
 use spin::Mutex;
-use x86_64::instructions::port::Port;
-
-/// PS/2 data port - reads scancode data
-const KEYBOARD_DATA_PORT: u16 = 0x60;
-/// PS/2 command port
-const KEYBOARD_COMMAND_PORT: u16 = 0x64;
 
 /// Size of the keyboard buffer (must be power of 2)
 const BUFFER_SIZE: usize = 128;
@@ -41,7 +36,7 @@ impl KeyboardBuffer {
 
     fn push(&mut self, c: char) -> bool {
         if self.count >= BUFFER_SIZE {
-            return false; // Buffer full
+            return false;
         }
         
         self.buffer[self.write_pos] = Some(c);
@@ -52,7 +47,7 @@ impl KeyboardBuffer {
 
     fn pop(&mut self) -> Option<char> {
         if self.count == 0 {
-            return None; // Buffer empty
+            return None;
         }
         
         let c = self.buffer[self.read_pos];
@@ -67,7 +62,7 @@ impl KeyboardBuffer {
 }
 
 lazy_static! {
-    /// Keyboard decoder
+    /// Keyboard decoder for PS/2 scancodes
     static ref KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> = 
         Mutex::new(Keyboard::new(
             ScancodeSet1::new(),
@@ -75,24 +70,28 @@ lazy_static! {
             HandleControl::Ignore
         ));
     
-    /// Keyboard input buffer
+    /// Keyboard input buffer (for PS/2 interrupt-driven input)
     static ref BUFFER: Mutex<KeyboardBuffer> = Mutex::new(KeyboardBuffer::new());
 }
 
 /// Initializes the keyboard driver
 pub fn init() {
     use crate::serial_println;
+    use x86_64::instructions::port::Port;
     
-    // Clear the keyboard buffer
-    let mut port: Port<u8> = Port::new(KEYBOARD_DATA_PORT);
-    while unsafe { Port::<u8>::new(0x64).read() } & 0x01 != 0 {
-        unsafe { port.read() };
+    // Clear any pending data in the PS/2 keyboard buffer
+    let mut data_port: Port<u8> = Port::new(0x60);
+    let mut status_port: Port<u8> = Port::new(0x64);
+    
+    // Flush keyboard buffer
+    while unsafe { status_port.read() } & 0x01 != 0 {
+        unsafe { data_port.read() };
     }
     
-    serial_println!("Keyboard buffer cleared");
+    serial_println!("Keyboard driver initialized (serial + PS/2)");
 }
 
-/// Called by interrupt handler when a scancode arrives
+/// Called by PS/2 keyboard interrupt handler when a scancode arrives
 pub fn handle_interrupt(scancode: u8) {
     let mut keyboard = KEYBOARD.lock();
     
@@ -101,11 +100,7 @@ pub fn handle_interrupt(scancode: u8) {
             match key {
                 DecodedKey::Unicode(character) => {
                     let mut buffer = BUFFER.lock();
-                    if !buffer.push(character) {
-                        // Buffer overflow - drop the character
-                        use crate::serial_println;
-                        serial_println!("Warning: Keyboard buffer overflow!");
-                    }
+                    let _ = buffer.push(character);
                 }
                 DecodedKey::RawKey(_key) => {
                     // Handle special keys if needed
@@ -115,8 +110,17 @@ pub fn handle_interrupt(scancode: u8) {
     }
 }
 
-/// Reads a character from keyboard buffer (non-blocking)
+/// Reads a character from keyboard/serial (non-blocking)
+/// 
+/// This checks both serial input (for QEMU console mode) and
+/// the PS/2 keyboard buffer (for graphical mode).
 pub fn read_char() -> Option<char> {
+    // First, check serial port (primary input for console mode)
+    if let Some(c) = crate::drivers::serial::read_char() {
+        return Some(c);
+    }
+    
+    // Then check PS/2 keyboard buffer
     let mut buffer = BUFFER.lock();
     buffer.pop()
 }
@@ -132,8 +136,14 @@ pub fn wait_for_char() -> char {
     }
 }
 
-/// Checks if there are characters available in the buffer
+/// Checks if there are characters available
 pub fn has_char() -> bool {
+    // Check serial first
+    if crate::drivers::serial::has_input() {
+        return true;
+    }
+    
+    // Then check PS/2 buffer
     let buffer = BUFFER.lock();
     !buffer.is_empty()
 }

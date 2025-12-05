@@ -64,6 +64,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         pic::PICS.lock().initialize();
         // Unmask keyboard interrupt (IRQ1)
         pic::PICS.lock().set_mask(1, false);
+        // Unmask COM1 serial interrupt (IRQ4)
+        pic::PICS.lock().set_mask(4, false);
     }
     serial_println!("PIC initialized and configured");
     

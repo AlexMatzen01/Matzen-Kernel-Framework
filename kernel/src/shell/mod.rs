@@ -60,11 +60,10 @@ pub fn run() -> ! {
                 }
                 _ => {}
             }
-        } else {
-            // No input available, halt CPU until next interrupt
-            // This saves power and is safe now that interrupts are enabled
-            x86_64::instructions::hlt();
         }
+        // Small yield to prevent busy loop from hogging CPU
+        // We use a spin hint instead of hlt() to ensure we poll frequently
+        core::hint::spin_loop();
     }
 }
 
@@ -188,10 +187,21 @@ fn cmd_halt() {
     }
 }
 
-/// Displays the date
+/// Displays the current date and time from the RTC
 fn cmd_date() {
-    println!("Date/time functionality not yet implemented.");
-    println!("(RTC driver required)");
+    let dt = crate::drivers::rtc::read_rtc();
+    
+    println!("{}, {} {}, {}", 
+        dt.day_name(),
+        dt.month_name(),
+        dt.day,
+        dt.year
+    );
+    println!("{:02}:{:02}:{:02} UTC",
+        dt.hour,
+        dt.minute,
+        dt.second
+    );
 }
 
 /// Displays current user
