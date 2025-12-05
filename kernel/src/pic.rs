@@ -1,3 +1,8 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
+
 //! Programmable Interrupt Controller (PIC) Driver
 //!
 //! Manages the 8259 PIC chips to route hardware interrupts to the CPU.

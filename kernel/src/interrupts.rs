@@ -1,3 +1,8 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
+
 //! Interrupt Handling
 //!
 //! This module sets up the Interrupt Descriptor Table (IDT) and handles
