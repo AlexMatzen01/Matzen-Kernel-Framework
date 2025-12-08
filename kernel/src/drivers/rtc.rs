@@ -2,7 +2,6 @@
 //! Author: Alexander Matzen
 //! Licensed under the MIT license.
 
-
 //! Real-Time Clock (RTC) Driver
 //!
 //! Reads date and time from the CMOS RTC hardware.
@@ -43,22 +42,22 @@ impl DateTime {
         // Zeller's formula for Gregorian calendar
         let mut y = self.year as i32;
         let mut m = self.month as i32;
-        
+
         if m < 3 {
             m += 12;
             y -= 1;
         }
-        
+
         let q = self.day as i32;
         let k = y % 100;
         let j = y / 100;
-        
+
         let h = (q + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 - 2 * j) % 7;
-        
+
         // Convert from Zeller (0=Sat) to standard (0=Sun)
         ((h + 6) % 7) as u8
     }
-    
+
     /// Returns the name of the day of week
     pub fn day_name(&self) -> &'static str {
         match self.day_of_week() {
@@ -72,7 +71,7 @@ impl DateTime {
             _ => "Unknown",
         }
     }
-    
+
     /// Returns the name of the month
     pub fn month_name(&self) -> &'static str {
         match self.month {
@@ -97,7 +96,7 @@ impl DateTime {
 fn read_cmos(register: u8) -> u8 {
     let mut address_port: Port<u8> = Port::new(CMOS_ADDRESS);
     let mut data_port: Port<u8> = Port::new(CMOS_DATA);
-    
+
     unsafe {
         // Disable NMI (bit 7) and select register
         address_port.write(register | 0x80);
@@ -119,7 +118,7 @@ fn bcd_to_binary(bcd: u8) -> u8 {
 pub fn read_rtc() -> DateTime {
     // Wait for any update to complete
     while is_updating() {}
-    
+
     // Read initial values
     let mut second = read_cmos(RTC_SECONDS);
     let mut minute = read_cmos(RTC_MINUTES);
@@ -128,7 +127,7 @@ pub fn read_rtc() -> DateTime {
     let mut month = read_cmos(RTC_MONTH);
     let mut year = read_cmos(RTC_YEAR);
     let century = read_cmos(RTC_CENTURY);
-    
+
     // Read values again to ensure consistency (RTC may update between reads)
     loop {
         let last_second = second;
@@ -137,28 +136,32 @@ pub fn read_rtc() -> DateTime {
         let last_day = day;
         let last_month = month;
         let last_year = year;
-        
+
         while is_updating() {}
-        
+
         second = read_cmos(RTC_SECONDS);
         minute = read_cmos(RTC_MINUTES);
         hour = read_cmos(RTC_HOURS);
         day = read_cmos(RTC_DAY);
         month = read_cmos(RTC_MONTH);
         year = read_cmos(RTC_YEAR);
-        
-        if second == last_second && minute == last_minute && hour == last_hour
-            && day == last_day && month == last_month && year == last_year
+
+        if second == last_second
+            && minute == last_minute
+            && hour == last_hour
+            && day == last_day
+            && month == last_month
+            && year == last_year
         {
             break;
         }
     }
-    
+
     // Check if values are in BCD format
     let status_b = read_cmos(RTC_STATUS_B);
     let is_binary = status_b & 0x04 != 0;
     let is_24h = status_b & 0x02 != 0;
-    
+
     // Convert from BCD if necessary
     if !is_binary {
         second = bcd_to_binary(second);
@@ -168,21 +171,25 @@ pub fn read_rtc() -> DateTime {
         month = bcd_to_binary(month);
         year = bcd_to_binary(year);
     }
-    
+
     // Convert 12-hour to 24-hour if necessary
     if !is_24h && (hour & 0x80) != 0 {
         hour = ((hour & 0x7F) + 12) % 24;
     }
-    
+
     // Calculate full year
     let full_year = if century != 0 && century != 0xFF {
-        let cent = if !is_binary { bcd_to_binary(century) } else { century };
+        let cent = if !is_binary {
+            bcd_to_binary(century)
+        } else {
+            century
+        };
         (cent as u16) * 100 + (year as u16)
     } else {
         // Assume 2000s if century register not available
         2000 + (year as u16)
     };
-    
+
     DateTime {
         year: full_year,
         month,

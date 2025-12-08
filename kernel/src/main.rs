@@ -2,7 +2,6 @@
 //! Author: Alexander Matzen
 //! Licensed under the MIT license.
 
-
 //! Matzen Kernel Framework - A simple terminal OS
 //!
 //! This kernel provides a basic terminal interface that runs on bare metal x86_64.
@@ -13,15 +12,15 @@
 
 extern crate alloc;
 
+mod allocator;
 mod drivers;
-mod shell;
+mod fs;
 mod interrupts;
 mod pic;
-mod fs;
-mod allocator;
+mod shell;
 
-use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use bootloader_api::config::Mapping;
+use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -38,20 +37,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Initialize serial port first for early debugging
     drivers::serial::init();
     serial_println!("Serial port initialized");
-    
+
     // Get physical memory offset for VGA buffer access
-    let phys_mem_offset = boot_info.physical_memory_offset.into_option()
+    let phys_mem_offset = boot_info
+        .physical_memory_offset
+        .into_option()
         .expect("Physical memory offset not available");
     serial_println!("Physical memory offset: {:#x}", phys_mem_offset);
-    
+
     // Initialize VGA text mode with proper memory mapping
     drivers::vga::init_with_offset(phys_mem_offset);
     serial_println!("VGA initialized");
-    
+
     // Initialize heap allocator
     allocator::init();
     serial_println!("Heap allocator initialized");
-    
+
     // Print welcome message
     println!("======================================");
     println!("  Matzen Kernel Framework v0.1.0");
@@ -60,13 +61,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!();
     println!("Type 'help' for available commands.");
     println!();
-    
+
     serial_println!("Welcome message printed");
-    
+
     // Initialize interrupt handling
     interrupts::init_idt();
     serial_println!("IDT initialized");
-    
+
     // Initialize and configure PIC
     unsafe {
         pic::PICS.lock().initialize();
@@ -76,18 +77,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         pic::PICS.lock().set_mask(4, false);
     }
     serial_println!("PIC initialized and configured");
-    
+
     // Initialize keyboard driver
     drivers::keyboard::init();
     serial_println!("Keyboard initialized");
-    
+
     // Initialize ATA disk driver
     drivers::ata::init();
-    
+
     // Enable interrupts
     x86_64::instructions::interrupts::enable();
     serial_println!("Interrupts enabled");
-    
+
     // Start the shell
     serial_println!("Starting shell...");
     shell::run();
@@ -100,12 +101,12 @@ fn panic(info: &PanicInfo) -> ! {
     serial_println!();
     serial_println!("KERNEL PANIC!");
     serial_println!("{}", info);
-    
+
     // Also try VGA (may not work if panic is early)
     println!();
     println!("KERNEL PANIC!");
     println!("{}", info);
-    
+
     loop {
         x86_64::instructions::hlt();
     }

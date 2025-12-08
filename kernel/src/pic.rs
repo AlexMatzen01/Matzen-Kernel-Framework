@@ -2,7 +2,6 @@
 //! Author: Alexander Matzen
 //! Licensed under the MIT license.
 
-
 //! Programmable Interrupt Controller (PIC) Driver
 //!
 //! Manages the 8259 PIC chips to route hardware interrupts to the CPU.
@@ -29,9 +28,7 @@ const ICW1_ICW4: u8 = 0x01;
 const ICW4_8086: u8 = 0x01;
 
 lazy_static! {
-    pub static ref PICS: Mutex<ChainedPics> = {
-        Mutex::new(unsafe { ChainedPics::new(32, 40) })
-    };
+    pub static ref PICS: Mutex<ChainedPics> = { Mutex::new(unsafe { ChainedPics::new(32, 40) }) };
 }
 
 /// A pair of chained PICs

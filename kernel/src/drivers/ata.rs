@@ -30,14 +30,14 @@ pub enum AtaBus {
 /// ATA status register flags
 #[allow(dead_code)]
 mod status {
-    pub const ERR: u8 = 0x01;  // Error
-    pub const IDX: u8 = 0x02;  // Index
+    pub const ERR: u8 = 0x01; // Error
+    pub const IDX: u8 = 0x02; // Index
     pub const CORR: u8 = 0x04; // Corrected data
-    pub const DRQ: u8 = 0x08;  // Data request ready
-    pub const DSC: u8 = 0x10;  // Drive seek complete
-    pub const DF: u8 = 0x20;   // Drive fault
+    pub const DRQ: u8 = 0x08; // Data request ready
+    pub const DSC: u8 = 0x10; // Drive seek complete
+    pub const DF: u8 = 0x20; // Drive fault
     pub const DRDY: u8 = 0x40; // Drive ready
-    pub const BSY: u8 = 0x80;  // Busy
+    pub const BSY: u8 = 0x80; // Busy
 }
 
 /// ATA command codes
@@ -152,7 +152,12 @@ impl AtaDrive {
     }
 
     /// Read sectors from the disk
-    pub fn read_sectors(&mut self, lba: u64, count: u8, buffer: &mut [u8]) -> Result<(), &'static str> {
+    pub fn read_sectors(
+        &mut self,
+        lba: u64,
+        count: u8,
+        buffer: &mut [u8],
+    ) -> Result<(), &'static str> {
         if !self.exists {
             return Err("Drive not initialized");
         }
@@ -171,7 +176,7 @@ impl AtaDrive {
                 DriveType::Master => 0xE0,
                 DriveType::Slave => 0xF0,
             } | ((lba >> 24) & 0x0F) as u8;
-            
+
             self.drive_port.write(drive_select);
             self.wait_400ns();
 
@@ -208,7 +213,12 @@ impl AtaDrive {
     }
 
     /// Write sectors to the disk
-    pub fn write_sectors(&mut self, lba: u64, count: u8, buffer: &[u8]) -> Result<(), &'static str> {
+    pub fn write_sectors(
+        &mut self,
+        lba: u64,
+        count: u8,
+        buffer: &[u8],
+    ) -> Result<(), &'static str> {
         if !self.exists {
             return Err("Drive not initialized");
         }
@@ -227,7 +237,7 @@ impl AtaDrive {
                 DriveType::Master => 0xE0,
                 DriveType::Slave => 0xF0,
             } | ((lba >> 24) & 0x0F) as u8;
-            
+
             self.drive_port.write(drive_select);
             self.wait_400ns();
 

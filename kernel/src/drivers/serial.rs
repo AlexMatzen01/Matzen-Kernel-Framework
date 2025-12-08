@@ -2,7 +2,6 @@
 //! Author: Alexander Matzen
 //! Licensed under the MIT license.
 
-
 //! Serial Port Driver (COM1)
 //!
 //! Provides input/output to the first serial port for debugging and console access.
@@ -40,7 +39,7 @@ impl InputBuffer {
         if self.count >= BUFFER_SIZE {
             return false;
         }
-        
+
         self.buffer[self.write_pos] = c;
         self.write_pos = (self.write_pos + 1) % BUFFER_SIZE;
         self.count += 1;
@@ -51,7 +50,7 @@ impl InputBuffer {
         if self.count == 0 {
             return None;
         }
-        
+
         let c = self.buffer[self.read_pos];
         self.read_pos = (self.read_pos + 1) % BUFFER_SIZE;
         self.count -= 1;
@@ -87,24 +86,24 @@ impl SerialPort {
         unsafe {
             // Disable all interrupts during setup
             self.int_enable.write(0x00u8);
-            
+
             // Enable DLAB (set baud rate divisor)
             self.line_ctrl.write(0x80u8);
-            
+
             // Set divisor to 3 (lo byte) = 38400 baud
             self.data.write(0x03u8);
             // (hi byte)
             self.int_enable.write(0x00u8);
-            
+
             // 8 bits, no parity, one stop bit, disable DLAB
             self.line_ctrl.write(0x03u8);
-            
+
             // Enable FIFO, clear them, with 14-byte threshold
             self.fifo_ctrl.write(0xC7u8);
-            
+
             // IRQs enabled, RTS/DSR set, enable aux output 2 (required for interrupts)
             self.modem_ctrl.write(0x0Bu8);
-            
+
             // Enable received data available interrupt
             self.int_enable.write(0x01u8);
         }
@@ -155,7 +154,7 @@ lazy_static! {
         serial.init();
         Mutex::new(serial)
     };
-    
+
     /// Input buffer for serial port
     static ref INPUT_BUFFER: Mutex<InputBuffer> = Mutex::new(InputBuffer::new());
 }
@@ -184,7 +183,7 @@ pub fn read_char() -> Option<char> {
             return Some(byte as char);
         }
     }
-    
+
     // Also poll directly in case interrupts aren't working
     {
         let mut serial = SERIAL.lock();
@@ -192,7 +191,7 @@ pub fn read_char() -> Option<char> {
             return Some(byte as char);
         }
     }
-    
+
     None
 }
 
@@ -202,7 +201,7 @@ pub fn has_input() -> bool {
     if buffer.count > 0 {
         return true;
     }
-    
+
     let mut serial = SERIAL.lock();
     serial.data_available()
 }

@@ -2,7 +2,6 @@
 //! Author: Alexander Matzen
 //! Licensed under the MIT license.
 
-
 //! VGA Text Buffer Driver
 //!
 //! Provides text output to the VGA text buffer at 0xb8000.
@@ -121,10 +120,14 @@ impl Writer {
                     let col = self.column_position;
 
                     let color_code = self.color_code;
-                    buffer.write(row, col, ScreenChar {
-                        ascii_character: byte,
-                        color_code,
-                    });
+                    buffer.write(
+                        row,
+                        col,
+                        ScreenChar {
+                            ascii_character: byte,
+                            color_code,
+                        },
+                    );
                     self.column_position += 1;
                 }
                 // Note: If buffer is None, we silently skip writing.
@@ -225,7 +228,7 @@ pub fn init_with_offset(physical_memory_offset: u64) {
 }
 
 /// Prints a formatted string to the VGA buffer and serial port.
-/// 
+///
 /// Disables interrupts while writing to prevent race conditions with concurrent
 /// access from interrupt handlers. This ensures the VGA buffer stays consistent.
 #[doc(hidden)]
@@ -256,22 +259,22 @@ macro_rules! println {
 }
 
 /// Clears the screen.
-/// 
+///
 /// Disables interrupts to prevent race conditions with concurrent access.
 pub fn clear_screen() {
     use x86_64::instructions::interrupts;
-    
+
     interrupts::without_interrupts(|| {
         WRITER.lock().clear_screen();
     });
 }
 
 /// Handles backspace.
-/// 
+///
 /// Disables interrupts to prevent race conditions with concurrent access.
 pub fn backspace() {
     use x86_64::instructions::interrupts;
-    
+
     interrupts::without_interrupts(|| {
         WRITER.lock().backspace();
     });

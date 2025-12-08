@@ -2,16 +2,15 @@
 //! Author: Alexander Matzen
 //! Licensed under the MIT license.
 
-
 //! Terminal Shell
 //!
 //! A simple command-line shell for the Matzen Kernel Framework.
 
 use crate::drivers::{keyboard, vga};
 use crate::{print, println};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
-use alloc::vec::Vec;
 
 /// Maximum length of a command line
 const MAX_CMD_LENGTH: usize = 256;
@@ -35,7 +34,7 @@ pub fn run() -> ! {
     loop {
         // Increment tick counter for basic timing
         TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
-        
+
         if let Some(c) = keyboard::read_char() {
             match c {
                 '\n' | '\r' => {
@@ -107,7 +106,10 @@ fn execute_command(cmd: &str) {
         "rm" => cmd_rm(parts.1),
         "" => {}
         _ => {
-            println!("Unknown command: '{}'. Type 'help' for available commands.", parts.0);
+            println!(
+                "Unknown command: '{}'. Type 'help' for available commands.",
+                parts.0
+            );
         }
     }
 }
@@ -174,7 +176,7 @@ fn cmd_about() {
 /// Displays uptime
 fn cmd_uptime() {
     let ticks = TICK_COUNTER.load(Ordering::Relaxed);
-    // Rough estimate: each loop iteration is very fast, 
+    // Rough estimate: each loop iteration is very fast,
     // we estimate ~1000 ticks per second in idle
     let approx_seconds = ticks / 1000;
     let minutes = approx_seconds / 60;
@@ -203,7 +205,8 @@ fn cmd_reboot() {
     const KEYBOARD_COMMAND_PORT: u16 = 0x64;
     const KEYBOARD_RESET_COMMAND: u8 = 0xFE;
     unsafe {
-        let mut port: x86_64::instructions::port::Port<u8> = x86_64::instructions::port::Port::new(KEYBOARD_COMMAND_PORT);
+        let mut port: x86_64::instructions::port::Port<u8> =
+            x86_64::instructions::port::Port::new(KEYBOARD_COMMAND_PORT);
         port.write(KEYBOARD_RESET_COMMAND);
     }
 }
@@ -219,18 +222,15 @@ fn cmd_halt() {
 /// Displays the current date and time from the RTC
 fn cmd_date() {
     let dt = crate::drivers::rtc::read_rtc();
-    
-    println!("{}, {} {}, {}", 
+
+    println!(
+        "{}, {} {}, {}",
         dt.day_name(),
         dt.month_name(),
         dt.day,
         dt.year
     );
-    println!("{:02}:{:02}:{:02} UTC",
-        dt.hour,
-        dt.minute,
-        dt.second
-    );
+    println!("{:02}:{:02}:{:02} UTC", dt.hour, dt.minute, dt.second);
 }
 
 /// Displays current user
@@ -250,15 +250,18 @@ fn cmd_version() {
 /// Displays CPU information using CPUID
 fn cmd_cpuinfo() {
     println!("CPU Information:");
-    
+
     // Get vendor string using CPUID leaf 0
     let vendor = get_cpu_vendor();
     println!("  Vendor: {}", vendor);
-    
+
     // Get CPU features using CPUID leaf 1
     let (family, model, stepping) = get_cpu_signature();
-    println!("  Family: {}, Model: {}, Stepping: {}", family, model, stepping);
-    
+    println!(
+        "  Family: {}, Model: {}, Stepping: {}",
+        family, model, stepping
+    );
+
     // Check for some common features
     let features = get_cpu_features();
     println!("  Features: {}", features);
@@ -269,7 +272,7 @@ fn get_cpu_vendor() -> &'static str {
     let ebx: u32;
     let ecx: u32;
     let edx: u32;
-    
+
     unsafe {
         core::arch::asm!(
             "push rbx",
@@ -282,7 +285,7 @@ fn get_cpu_vendor() -> &'static str {
             out("edx") edx,
         );
     }
-    
+
     // Vendor string is in EBX, EDX, ECX (in that order)
     // Check for common vendors
     if ebx == 0x756e6547 && edx == 0x49656e69 && ecx == 0x6c65746e {
@@ -297,7 +300,7 @@ fn get_cpu_vendor() -> &'static str {
 /// Gets CPU signature (family, model, stepping)
 fn get_cpu_signature() -> (u32, u32, u32) {
     let eax: u32;
-    
+
     unsafe {
         core::arch::asm!(
             "push rbx",
@@ -308,11 +311,11 @@ fn get_cpu_signature() -> (u32, u32, u32) {
             out("edx") _,
         );
     }
-    
+
     let stepping = eax & 0xF;
     let model = (eax >> 4) & 0xF;
     let family = (eax >> 8) & 0xF;
-    
+
     (family, model, stepping)
 }
 
@@ -320,7 +323,7 @@ fn get_cpu_signature() -> (u32, u32, u32) {
 fn get_cpu_features() -> &'static str {
     let ecx: u32;
     let edx: u32;
-    
+
     unsafe {
         core::arch::asm!(
             "push rbx",
@@ -331,13 +334,13 @@ fn get_cpu_features() -> &'static str {
             out("edx") edx,
         );
     }
-    
+
     // Check for SSE2 (bit 26 of EDX)
     let has_sse2 = (edx & (1 << 26)) != 0;
     // Check for SSE3 (bit 0 of ECX)
     let has_sse3 = (ecx & 1) != 0;
     // Check for 64-bit (bit 29 of EDX via extended CPUID, but we know we're x86_64)
-    
+
     if has_sse3 && has_sse2 {
         "SSE2 SSE3 x86_64"
     } else if has_sse2 {
@@ -355,13 +358,13 @@ fn cmd_calc(expr: &str) {
         println!("  Example: calc 10 + 5");
         return;
     }
-    
+
     // Parse the expression manually: "num1 op num2"
     let mut parts: [&str; 3] = [""; 3];
     let mut part_idx = 0;
     let mut start = 0;
     let mut in_word = false;
-    
+
     for (i, c) in expr.char_indices() {
         if c.is_whitespace() {
             if in_word && part_idx < 3 {
@@ -381,12 +384,12 @@ fn cmd_calc(expr: &str) {
         parts[part_idx] = &expr[start..];
         part_idx += 1;
     }
-    
+
     if part_idx != 3 {
         println!("Error: Expected format 'num1 op num2'");
         return;
     }
-    
+
     let num1: i64 = match parse_i64(parts[0]) {
         Some(n) => n,
         None => {
@@ -394,7 +397,7 @@ fn cmd_calc(expr: &str) {
             return;
         }
     };
-    
+
     let num2: i64 = match parse_i64(parts[2]) {
         Some(n) => n,
         None => {
@@ -402,7 +405,7 @@ fn cmd_calc(expr: &str) {
             return;
         }
     };
-    
+
     let result = match parts[1] {
         "+" => Some(num1.wrapping_add(num2)),
         "-" => Some(num1.wrapping_sub(num2)),
@@ -420,7 +423,7 @@ fn cmd_calc(expr: &str) {
             None
         }
     };
-    
+
     if let Some(r) = result {
         println!("{} {} {} = {}", num1, parts[1], num2, r);
     }
@@ -431,11 +434,11 @@ fn parse_i64(s: &str) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    
+
     let mut chars = s.chars();
     let mut negative = false;
     let first = chars.next()?;
-    
+
     let mut result: i64 = if first == '-' {
         negative = true;
         0
@@ -444,7 +447,7 @@ fn parse_i64(s: &str) -> Option<i64> {
     } else {
         return None;
     };
-    
+
     for c in chars {
         if !c.is_ascii_digit() {
             return None;
@@ -452,7 +455,7 @@ fn parse_i64(s: &str) -> Option<i64> {
         result = result.checked_mul(10)?;
         result = result.checked_add((c as u8 - b'0') as i64)?;
     }
-    
+
     if negative {
         Some(-result)
     } else {
@@ -464,7 +467,7 @@ fn parse_i64(s: &str) -> Option<i64> {
 fn cmd_color(color_name: &str) {
     use crate::drivers::vga::{Color, WRITER};
     use x86_64::instructions::interrupts;
-    
+
     // Convert to lowercase for comparison
     let color_lower = to_lowercase_fixed(color_name);
     let color = match color_lower.as_str() {
@@ -480,16 +483,22 @@ fn cmd_color(color_name: &str) {
             None
         }
         _ => {
-            println!("Unknown color '{}'. Available: green, white, cyan, yellow, red, blue, pink", color_name);
+            println!(
+                "Unknown color '{}'. Available: green, white, cyan, yellow, red, blue, pink",
+                color_name
+            );
             None
         }
     };
-    
+
     if let Some(c) = color {
         interrupts::without_interrupts(|| {
             WRITER.lock().set_color(c, Color::Black);
         });
-        println!("Color changed to {} - this text should appear in the new color", color_name);
+        println!(
+            "Color changed to {} - this text should appear in the new color",
+            color_name
+        );
         println!("(Previous text will keep its original color)");
     }
 }
@@ -504,11 +513,7 @@ fn to_lowercase_fixed(s: &str) -> LowercaseString {
         if i >= 32 {
             break;
         }
-        result.bytes[i] = if b >= b'A' && b <= b'Z' {
-            b + 32
-        } else {
-            b
-        };
+        result.bytes[i] = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
         result.len = i + 1;
     }
     result
@@ -530,15 +535,15 @@ impl LowercaseString {
 fn cmd_test() {
     println!("Running system tests...");
     println!();
-    
+
     // Test 1: VGA output
     print!("  [TEST] VGA output:      ");
     println!("PASS");
-    
+
     // Test 2: Keyboard polling
     print!("  [TEST] Keyboard driver: ");
     println!("PASS (if you typed this command)");
-    
+
     // Test 3: CPUID
     print!("  [TEST] CPUID:           ");
     let vendor = get_cpu_vendor();
@@ -547,7 +552,7 @@ fn cmd_test() {
     } else {
         println!("WARN (unknown vendor)");
     }
-    
+
     // Test 4: Calculator
     print!("  [TEST] Calculator:      ");
     let result = 42i64.wrapping_add(58);
@@ -556,11 +561,11 @@ fn cmd_test() {
     } else {
         println!("FAIL");
     }
-    
+
     // Test 5: Memory access
     print!("  [TEST] Memory access:   ");
     println!("PASS");
-    
+
     println!();
     println!("All tests completed!");
 }
@@ -578,7 +583,7 @@ fn cmd_diskinfo() {
 /// Format the disk with SimplFS
 fn cmd_mkfs() {
     println!("Formatting disk with SimplFS...");
-    
+
     let mut device = crate::drivers::block::AtaBlockDevice::new();
     match crate::fs::SimpleFilesystem::format(&mut device) {
         Ok(()) => {
@@ -594,7 +599,7 @@ fn cmd_mkfs() {
 /// Mount the filesystem
 fn cmd_mount() {
     println!("Mounting filesystem...");
-    
+
     let mut device = crate::drivers::block::AtaBlockDevice::new();
     match crate::fs::SimpleFilesystem::mount(&mut device) {
         Ok(fs) => {
@@ -612,14 +617,14 @@ fn cmd_mount() {
 /// List files in current directory
 fn cmd_ls() {
     let fs_guard = FILESYSTEM.lock();
-    
+
     if let Some(ref fs) = *fs_guard {
         let current_dir = fs.current_directory();
         drop(fs_guard); // Release lock before device access
-        
+
         let mut device = crate::drivers::block::AtaBlockDevice::new();
         let fs_guard = FILESYSTEM.lock();
-        
+
         if let Some(ref fs) = *fs_guard {
             match fs.list_directory(&mut device, current_dir) {
                 Ok(files) => {
@@ -648,15 +653,15 @@ fn cmd_touch(filename: &str) {
         println!("Usage: touch <filename>");
         return;
     }
-    
+
     let mut fs_guard = FILESYSTEM.lock();
     if fs_guard.is_none() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    
+
     let mut device = crate::drivers::block::AtaBlockDevice::new();
-    
+
     if let Some(ref mut fs) = *fs_guard {
         match fs.create_file(&mut device, filename) {
             Ok(inode_num) => {
@@ -675,15 +680,15 @@ fn cmd_cat(filename: &str) {
         println!("Usage: cat <filename>");
         return;
     }
-    
+
     let fs_guard = FILESYSTEM.lock();
     if fs_guard.is_none() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    
+
     let mut device = crate::drivers::block::AtaBlockDevice::new();
-    
+
     if let Some(ref fs) = *fs_guard {
         match fs.read_file(&mut device, filename) {
             Ok(data) => {
@@ -724,23 +729,23 @@ fn cmd_cat(filename: &str) {
 /// Write text to a file
 fn cmd_write(args: &str) {
     let parts: Vec<&str> = args.splitn(2, ' ').collect();
-    
+
     if parts.len() < 2 {
         println!("Usage: write <filename> <text>");
         return;
     }
-    
+
     let filename = parts[0];
     let content = parts[1];
-    
+
     let mut fs_guard = FILESYSTEM.lock();
     if fs_guard.is_none() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    
+
     let mut device = crate::drivers::block::AtaBlockDevice::new();
-    
+
     if let Some(ref mut fs) = *fs_guard {
         // Check if file exists, create if it doesn't
         let files = match fs.list_directory(&mut device, fs.current_directory()) {
@@ -750,9 +755,9 @@ fn cmd_write(args: &str) {
                 return;
             }
         };
-        
+
         let file_exists = files.iter().any(|f| f.name == filename && !f.is_directory);
-        
+
         if !file_exists {
             match fs.create_file(&mut device, filename) {
                 Ok(_) => println!("Created new file '{}'", filename),
@@ -762,7 +767,7 @@ fn cmd_write(args: &str) {
                 }
             }
         }
-        
+
         // Write data to file
         match fs.write_file(&mut device, filename, content.as_bytes()) {
             Ok(()) => {
@@ -781,15 +786,15 @@ fn cmd_rm(filename: &str) {
         println!("Usage: rm <filename>");
         return;
     }
-    
+
     let mut fs_guard = FILESYSTEM.lock();
     if fs_guard.is_none() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    
+
     let mut device = crate::drivers::block::AtaBlockDevice::new();
-    
+
     if let Some(ref mut fs) = *fs_guard {
         match fs.delete_file(&mut device, filename) {
             Ok(()) => {
