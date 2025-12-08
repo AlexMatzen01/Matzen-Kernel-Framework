@@ -11,10 +11,14 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
 mod drivers;
 mod shell;
 mod interrupts;
 mod pic;
+mod fs;
+mod allocator;
 
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use bootloader_api::config::Mapping;
@@ -44,6 +48,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     drivers::vga::init_with_offset(phys_mem_offset);
     serial_println!("VGA initialized");
     
+    // Initialize heap allocator
+    allocator::init();
+    serial_println!("Heap allocator initialized");
+    
     // Print welcome message
     println!("======================================");
     println!("  Matzen Kernel Framework v0.1.0");
@@ -72,6 +80,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Initialize keyboard driver
     drivers::keyboard::init();
     serial_println!("Keyboard initialized");
+    
+    // Initialize ATA disk driver
+    drivers::ata::init();
     
     // Enable interrupts
     x86_64::instructions::interrupts::enable();

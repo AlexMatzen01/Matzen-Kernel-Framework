@@ -10,6 +10,8 @@
 use crate::drivers::{keyboard, vga};
 use crate::{print, println};
 use core::sync::atomic::{AtomicU64, Ordering};
+use spin::Mutex;
+use alloc::vec::Vec;
 
 /// Maximum length of a command line
 const MAX_CMD_LENGTH: usize = 256;
@@ -19,6 +21,9 @@ const PROMPT: &str = "mfk> ";
 
 /// Simple tick counter for uptime tracking
 static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Global filesystem state
+static FILESYSTEM: Mutex<Option<crate::fs::SimpleFilesystem>> = Mutex::new(None);
 
 /// Runs the shell loop
 pub fn run() -> ! {
@@ -92,6 +97,14 @@ fn execute_command(cmd: &str) {
         "calc" => cmd_calc(parts.1),
         "color" => cmd_color(parts.1),
         "test" => cmd_test(),
+        "diskinfo" => cmd_diskinfo(),
+        "mkfs" => cmd_mkfs(),
+        "mount" => cmd_mount(),
+        "ls" | "dir" => cmd_ls(),
+        "touch" => cmd_touch(parts.1),
+        "cat" => cmd_cat(parts.1),
+        "write" => cmd_write(parts.1),
+        "rm" => cmd_rm(parts.1),
         "" => {}
         _ => {
             println!("Unknown command: '{}'. Type 'help' for available commands.", parts.0);
@@ -117,6 +130,16 @@ fn cmd_help() {
     println!("  halt      - Halt the system");
     println!("  date      - Display current date (simulated)");
     println!("  whoami    - Display current user");
+    println!();
+    println!("File System Commands:");
+    println!("  diskinfo  - Display disk information");
+    println!("  mkfs      - Format the disk with SimplFS");
+    println!("  mount     - Mount the filesystem");
+    println!("  ls/dir    - List files in current directory");
+    println!("  touch     - Create a new file (e.g., 'touch test.txt')");
+    println!("  cat       - Display file contents (e.g., 'cat test.txt')");
+    println!("  write     - Write text to file (e.g., 'write test.txt Hello World')");
+    println!("  rm        - Delete a file (e.g., 'rm test.txt')");
 }
 
 /// Clears the screen
@@ -540,4 +563,241 @@ fn cmd_test() {
     
     println!();
     println!("All tests completed!");
+}
+
+/// Display disk information
+fn cmd_diskinfo() {
+    println!("Disk Information:");
+    println!("  Primary Master: ATA PIO Mode");
+    println!("  Sector size: 512 bytes");
+    println!("  Block device layer: Active");
+    println!();
+    println!("Use 'mkfs' to format disk, then 'mount' to access filesystem");
+}
+
+/// Format the disk with SimplFS
+fn cmd_mkfs() {
+    println!("Formatting disk with SimplFS...");
+    
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    match crate::fs::SimpleFilesystem::format(&mut device) {
+        Ok(()) => {
+            println!("Filesystem formatted successfully!");
+            println!("Use 'mount' to mount the filesystem.");
+        }
+        Err(e) => {
+            println!("Failed to format filesystem: {}", e);
+        }
+    }
+}
+
+/// Mount the filesystem
+fn cmd_mount() {
+    println!("Mounting filesystem...");
+    
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    match crate::fs::SimpleFilesystem::mount(&mut device) {
+        Ok(fs) => {
+            *FILESYSTEM.lock() = Some(fs);
+            println!("Filesystem mounted successfully!");
+            println!("Root directory ready. Use 'ls' to list files.");
+        }
+        Err(e) => {
+            println!("Failed to mount filesystem: {}", e);
+            println!("You may need to run 'mkfs' first to format the disk.");
+        }
+    }
+}
+
+/// List files in current directory
+fn cmd_ls() {
+    let fs_guard = FILESYSTEM.lock();
+    
+    if let Some(ref fs) = *fs_guard {
+        let current_dir = fs.current_directory();
+        drop(fs_guard); // Release lock before device access
+        
+        let mut device = crate::drivers::block::AtaBlockDevice::new();
+        let fs_guard = FILESYSTEM.lock();
+        
+        if let Some(ref fs) = *fs_guard {
+            match fs.list_directory(&mut device, current_dir) {
+                Ok(files) => {
+                    if files.is_empty() {
+                        println!("(empty directory)");
+                    } else {
+                        println!("Files:");
+                        for file in files {
+                            println!("  {}", file);
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("Failed to list directory: {}", e);
+                }
+            }
+        }
+    } else {
+        println!("Filesystem not mounted. Use 'mount' first.");
+    }
+}
+
+/// Create a new file
+fn cmd_touch(filename: &str) {
+    if filename.is_empty() {
+        println!("Usage: touch <filename>");
+        return;
+    }
+    
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    
+    if let Some(ref mut fs) = *fs_guard {
+        match fs.create_file(&mut device, filename) {
+            Ok(inode_num) => {
+                println!("Created file '{}' (inode {})", filename, inode_num);
+            }
+            Err(e) => {
+                println!("Failed to create file: {}", e);
+            }
+        }
+    }
+}
+
+/// Display file contents
+fn cmd_cat(filename: &str) {
+    if filename.is_empty() {
+        println!("Usage: cat <filename>");
+        return;
+    }
+    
+    let fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    
+    if let Some(ref fs) = *fs_guard {
+        match fs.read_file(&mut device, filename) {
+            Ok(data) => {
+                if data.is_empty() {
+                    println!("(empty file)");
+                } else {
+                    // Try to display as text
+                    match core::str::from_utf8(&data) {
+                        Ok(text) => println!("{}", text),
+                        Err(_) => {
+                            println!("(binary file, {} bytes)", data.len());
+                            // Show first 256 bytes in hex
+                            let display_len = core::cmp::min(data.len(), 256);
+                            for (i, byte) in data[..display_len].iter().enumerate() {
+                                if i % 16 == 0 {
+                                    if i > 0 {
+                                        println!();
+                                    }
+                                    print!("{:04x}: ", i);
+                                }
+                                print!("{:02x} ", byte);
+                            }
+                            println!();
+                            if data.len() > display_len {
+                                println!("... ({} more bytes)", data.len() - display_len);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Failed to read file: {}", e);
+            }
+        }
+    }
+}
+
+/// Write text to a file
+fn cmd_write(args: &str) {
+    let parts: Vec<&str> = args.splitn(2, ' ').collect();
+    
+    if parts.len() < 2 {
+        println!("Usage: write <filename> <text>");
+        return;
+    }
+    
+    let filename = parts[0];
+    let content = parts[1];
+    
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    
+    if let Some(ref mut fs) = *fs_guard {
+        // Check if file exists, create if it doesn't
+        let files = match fs.list_directory(&mut device, fs.current_directory()) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("Failed to list directory: {}", e);
+                return;
+            }
+        };
+        
+        let file_exists = files.iter().any(|f| f.name == filename && !f.is_directory);
+        
+        if !file_exists {
+            match fs.create_file(&mut device, filename) {
+                Ok(_) => println!("Created new file '{}'", filename),
+                Err(e) => {
+                    println!("Failed to create file: {}", e);
+                    return;
+                }
+            }
+        }
+        
+        // Write data to file
+        match fs.write_file(&mut device, filename, content.as_bytes()) {
+            Ok(()) => {
+                println!("Wrote {} bytes to '{}'", content.len(), filename);
+            }
+            Err(e) => {
+                println!("Failed to write file: {}", e);
+            }
+        }
+    }
+}
+
+/// Delete a file
+fn cmd_rm(filename: &str) {
+    if filename.is_empty() {
+        println!("Usage: rm <filename>");
+        return;
+    }
+    
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    
+    if let Some(ref mut fs) = *fs_guard {
+        match fs.delete_file(&mut device, filename) {
+            Ok(()) => {
+                println!("Deleted file '{}'", filename);
+            }
+            Err(e) => {
+                println!("Failed to delete file: {}", e);
+            }
+        }
+    }
 }

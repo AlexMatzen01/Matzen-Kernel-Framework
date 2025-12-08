@@ -11,3 +11,5 @@ pub mod vga;
 pub mod keyboard;
 pub mod serial;
 pub mod rtc;
+pub mod ata;
+pub mod block;
