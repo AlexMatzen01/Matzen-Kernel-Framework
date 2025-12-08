@@ -105,6 +105,12 @@ impl Writer {
     pub fn write_byte(&mut self, byte: u8) {
         match byte {
             b'\n' => self.new_line(),
+            b'\x08' => {
+                // Backspace: move cursor back one position
+                if self.column_position > 0 {
+                    self.column_position -= 1;
+                }
+            }
             byte => {
                 if self.column_position >= BUFFER_WIDTH {
                     self.new_line();
@@ -131,8 +137,8 @@ impl Writer {
     pub fn write_string(&mut self, s: &str) {
         for byte in s.bytes() {
             match byte {
-                // Printable ASCII or newline
-                0x20..=0x7e | b'\n' => self.write_byte(byte),
+                // Printable ASCII, newline, or backspace
+                0x20..=0x7e | b'\n' | b'\x08' => self.write_byte(byte),
                 // Not part of printable ASCII range, print placeholder
                 _ => self.write_byte(0xfe),
             }
@@ -172,10 +178,11 @@ impl Writer {
             self.clear_row(row);
         }
         self.column_position = 0;
+        // After clearing, we're ready to write at the bottom row
+        // The screen is now blank and ready for new content
     }
 
     /// Sets the text color
-    #[allow(dead_code)]
     pub fn set_color(&mut self, foreground: Color, background: Color) {
         self.color_code = ColorCode::new(foreground, background);
     }
@@ -187,10 +194,13 @@ impl Writer {
                 self.column_position -= 1;
                 let row = BUFFER_HEIGHT - 1;
                 let col = self.column_position;
-                buffer.write(row, col, ScreenChar {
+                let blank = ScreenChar {
                     ascii_character: b' ',
                     color_code: self.color_code,
-                });
+                };
+                buffer.write(row, col, blank);
+                // Ensure the write is visible by reading it back
+                let _ = buffer.read(row, col);
             }
         }
     }

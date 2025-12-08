@@ -44,11 +44,12 @@ pub fn run() -> ! {
                     print!("{}", PROMPT);
                 }
                 '\x08' | '\x7f' => {
-                    // Backspace
+                    // Backspace: move back, clear character, move back again for visual feedback
                     if cmd_len > 0 {
                         cmd_len -= 1;
                         cmd_buffer[cmd_len] = 0;
-                        vga::backspace();
+                        // Standard backspace sequence: \x08 (backspace), space, \x08 (backspace)
+                        print!("\x08 \x08");
                     }
                 }
                 c if c.is_ascii() && !c.is_control() => {
@@ -121,6 +122,11 @@ fn cmd_help() {
 /// Clears the screen
 fn cmd_clear() {
     vga::clear_screen();
+    // Print several newlines to scroll content up so the next prompt
+    // appears in a more visible position (near middle of screen)
+    for _ in 0..10 {
+        println!();
+    }
 }
 
 /// Echoes text back to the screen
@@ -460,7 +466,8 @@ fn cmd_color(color_name: &str) {
         interrupts::without_interrupts(|| {
             WRITER.lock().set_color(c, Color::Black);
         });
-        println!("Color changed to {}", color_name);
+        println!("Color changed to {} - this text should appear in the new color", color_name);
+        println!("(Previous text will keep its original color)");
     }
 }
 
