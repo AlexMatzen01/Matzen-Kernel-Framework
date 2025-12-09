@@ -119,14 +119,25 @@ impl AtaDrive {
                 return Err("Drive does not exist");
             }
 
-            // Wait for drive to be ready
-            self.wait_not_busy()?;
+            // Wait for drive to be ready or check for error
+            if let Err(e) = self.wait_not_busy() {
+                return Err(e);
+            }
 
-            // Check if this is an ATA device (not ATAPI)
+            // Check if this is an ATAPI device (we only want ATA hard disks)
             let lba_mid = self.lba_mid_port.read();
             let lba_high = self.lba_high_port.read();
-            if lba_mid != 0 || lba_high != 0 {
-                return Err("Not an ATA device");
+            
+            // ATAPI signature is 0x14, 0xEB or 0x69, 0x96
+            if (lba_mid == 0x14 && lba_high == 0xEB) || (lba_mid == 0x69 && lba_high == 0x96) {
+                return Err("ATAPI device (not ATA)");
+            }
+            
+            // For ATA devices, these should be 0, but be lenient for QEMU
+            // If status shows errors, abort
+            let status = self.status_port.read();
+            if status & status::ERR != 0 {
+                return Err("Device error during IDENTIFY");
             }
 
             // Wait for data to be ready
@@ -340,21 +351,23 @@ pub fn init() {
     let mut found_count = 0;
 
     for (i, drive) in drives.iter_mut().enumerate() {
+        let bus_name = match drive.bus {
+            AtaBus::Primary => "Primary",
+            AtaBus::Secondary => "Secondary",
+        };
+        let drive_name = match drive.drive_type {
+            DriveType::Master => "Master",
+            DriveType::Slave => "Slave",
+        };
+        
+        serial_println!("  Probing ATA {}/{}...", bus_name, drive_name);
         match drive.init() {
             Ok(()) => {
-                let bus_name = match drive.bus {
-                    AtaBus::Primary => "Primary",
-                    AtaBus::Secondary => "Secondary",
-                };
-                let drive_name = match drive.drive_type {
-                    DriveType::Master => "Master",
-                    DriveType::Slave => "Slave",
-                };
-                serial_println!("  ATA {}/{}: Detected", bus_name, drive_name);
+                serial_println!("    -> Detected and initialized");
                 found_count += 1;
             }
-            Err(_) => {
-                // Drive doesn't exist or initialization failed
+            Err(e) => {
+                serial_println!("    -> {}", e);
             }
         }
     }
