@@ -681,7 +681,7 @@ fn cmd_cat(filename: &str) {
         return;
     }
 
-    let fs_guard = FILESYSTEM.lock();
+    let mut fs_guard = FILESYSTEM.lock();
     if fs_guard.is_none() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
@@ -689,7 +689,7 @@ fn cmd_cat(filename: &str) {
 
     let mut device = crate::drivers::block::AtaBlockDevice::new();
 
-    if let Some(ref fs) = *fs_guard {
+    if let Some(ref mut fs) = *fs_guard {
         match fs.read_file(&mut device, filename) {
             Ok(data) => {
                 if data.is_empty() {

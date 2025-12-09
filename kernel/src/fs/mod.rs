@@ -446,6 +446,32 @@ impl SimpleFilesystem {
         }
     }
 
+    /// Reload inode table from disk
+    fn reload_inodes(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+    ) -> Result<(), &'static str> {
+        let inode_blocks = unsafe { core::ptr::addr_of!(self.superblock.inode_blocks).read_unaligned() };
+        let inode_table_size = (inode_blocks as usize) * FS_BLOCK_SIZE;
+        let mut inode_buffer = alloc::vec![0u8; inode_table_size];
+
+        for i in 0..inode_blocks {
+            let block_buffer =
+                &mut inode_buffer[(i as usize * FS_BLOCK_SIZE)..((i as usize + 1) * FS_BLOCK_SIZE)];
+            device.read_blocks(1 + i as u64, 1, block_buffer)?;
+        }
+
+        // Update in-memory inode table
+        unsafe {
+            let ptr = inode_buffer.as_ptr() as *const Inode;
+            for i in 0..MAX_INODES {
+                self.inodes[i] = *ptr.add(i);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Write inode table back to disk
     fn write_inodes(
         &self,
@@ -640,10 +666,13 @@ impl SimpleFilesystem {
 
     /// Read data from a file
     pub fn read_file(
-        &self,
+        &mut self,
         device: &mut dyn crate::drivers::block::BlockDevice,
         filename: &str,
     ) -> Result<Vec<u8>, &'static str> {
+        // Reload inodes from disk to get latest state
+        self.reload_inodes(device)?;
+        
         // Find the file
         let files = self.list_directory(device, self.current_dir_inode)?;
         let file_inode_num = files
