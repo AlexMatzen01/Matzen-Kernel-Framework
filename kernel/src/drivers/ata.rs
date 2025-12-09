@@ -368,21 +368,23 @@ pub fn init() {
     }
 }
 
-/// Read sectors from the primary master drive
+/// Read sectors from the primary slave drive
 pub fn read_sectors(lba: u64, count: u8, buffer: &mut [u8]) -> Result<(), &'static str> {
     let mut drives = DRIVES.lock();
     if let Some(drives_array) = drives.as_mut() {
-        drives_array[0].read_sectors(lba, count, buffer)
+        // Use Primary Slave (index 1) as the data disk
+        drives_array[1].read_sectors(lba, count, buffer)
     } else {
         Err("ATA not initialized")
     }
 }
 
-/// Write sectors to the primary master drive
+/// Write sectors to the primary slave drive
 pub fn write_sectors(lba: u64, count: u8, buffer: &[u8]) -> Result<(), &'static str> {
     let mut drives = DRIVES.lock();
     if let Some(drives_array) = drives.as_mut() {
-        drives_array[0].write_sectors(lba, count, buffer)
+        // Use Primary Slave (index 1) as the data disk
+        drives_array[1].write_sectors(lba, count, buffer)
     } else {
         Err("ATA not initialized")
     }

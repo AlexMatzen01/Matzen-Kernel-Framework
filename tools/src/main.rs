@@ -58,12 +58,24 @@ fn main() {
     let no_run = args.iter().any(|a| a == "--no-run");
 
     if !no_run {
+        // Create a virtual disk image for testing (10MB)
+        let disk_path = "target/disk.img";
+        if !Path::new(disk_path).exists() {
+            println!("Creating virtual disk image: {}", disk_path);
+            let _ = Command::new("qemu-img")
+                .args(["create", "-f", "raw", disk_path, "10M"])
+                .output();
+        }
+
         // Run in QEMU
+        // Boot disk on default (primary master), data disk on primary slave
         println!("Running in QEMU...");
         let mut qemu = Command::new("qemu-system-x86_64")
             .args([
                 "-drive",
-                &format!("format=raw,file={}", bios_path),
+                &format!("file={},format=raw", bios_path),
+                "-drive",
+                &format!("file={},format=raw,if=ide,index=1", disk_path),
                 "-serial",
                 "stdio",
                 "-display",
