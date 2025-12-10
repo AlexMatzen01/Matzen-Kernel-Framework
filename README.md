@@ -1,111 +1,102 @@
 # Matzen Kernel Framework (MFK)
 
-A simple terminal OS written in Rust for the x86_64 architecture.
-````markdown
-# Matzen Kernel Framework (MFK)
+A small educational terminal OS written in Rust for x86_64. MFK contains a tiny kernel (`mfk-kernel`) with a basic VGA driver, PS/2 keyboard support, a built-in shell, and a small `mfk-runner` tool that builds bootable disk images and runs them in QEMU.
 
-A small educational x86_64 hobby OS written in Rust. MFK demonstrates a bare-metal kernel with a simple shell, VGA text-mode output, PS/2 keyboard support, and a small set of drivers useful for experimentation and teaching.
+**Status:** active development — use for experimentation and learning.
 
-**Status**: Experimental — actively developed, suitable for learning and demos.
+**Repository layout (important files):**
 
-**Repository**: `alexmatzen01/Matzen-Kernel-Framework`
+- `Cargo.toml`           : Workspace configuration (members: `kernel`, `tools`)
+- `kernel/`              : Kernel crate (`mfk-kernel`)
+- `tools/`               : Runner tool (`mfk-runner`) — creates disk images and runs QEMU
+- `targets/x86_64-mfk.json` : Custom target specification used for building the kernel
+- `build.sh`             : Convenience script to build kernel + runner
+- `run.sh`               : Convenience script to run `mfk-runner` with a kernel path
+- `install.sh`           : Convenience script to install Rust/nightly components
+- `test_commands.txt`    : Example shell commands to exercise the kernel's filesystem/shell
 
-**Top-level crates**:
-- `mfk-kernel` (kernel crate, located in `kernel/`)
-- `mfk-runner` (tooling for creating bootable images and running QEMU, located in `tools/`)
+Prerequisites
+- Linux or macOS (QEMU required for running the image)
+- Rust (we use nightly for building the kernel)
+- `qemu-system-x86_64` and `qemu-img` available in `PATH`
 
-**Test commands**: See `test_commands.txt` for example shell interactions.
-
-**Requirements**
-- **Rust**: nightly toolchain (see `rust-toolchain.toml`).
-- **Components**: `rust-src`, `llvm-tools-preview` (used by `cargo` when building `core`/`alloc`).
-- **QEMU**: for running and testing the image locally.
-
-**Quickstart**
-
-1. Install the toolchain and components (recommended to follow `rust-toolchain.toml`):
+Quick setup
+1. Install the nightly toolchain and required components (or run the helper):
 
 ```bash
-rustup toolchain install nightly
-rustup component add rust-src llvm-tools-preview --toolchain nightly
+./install.sh
 ```
 
-2. Build the kernel (uses a custom target spec in `targets/x86_64-mfk.json`):
+2. Build everything (kernel + runner):
+
+```bash
+./build.sh
+```
+
+Manual build steps
+
+- Build the kernel (required flags for no-std build):
 
 ```bash
 cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 ```
 
-3. Build the runner tool (creates disk images and can run QEMU):
+- Build the runner tool (release recommended):
 
 ```bash
 cargo build -p mfk-runner --release
 ```
 
-4. Create a disk image and run in QEMU (runner will locate the kernel artifact):
+Using the runner (`mfk-runner`)
+
+The runner creates both UEFI and BIOS bootable disk images from a kernel binary and — by default — will launch QEMU to run the BIOS image. The runner usage is:
 
 ```bash
+cargo run -p mfk-runner --release -- <path-to-kernel-binary> [--no-run]
+```
+
+Examples (after building the kernel):
+
+```bash
+# Run and boot the kernel in QEMU (uses target/x86_64-mfk/debug/mfk-kernel by default path shown in examples)
 cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel
-```
 
-5. To create the disk image without launching QEMU:
-
-```bash
+# Only create disk images, don't start QEMU:
 cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel --no-run
+
+# Helper script (runs the above):
+./run.sh target/x86_64-mfk/debug/mfk-kernel
 ```
 
-Notes:
-- The `-Zbuild-std` flags are required because the kernel builds `core`/`alloc` for the custom target.
-- Paths shown (e.g. `target/x86_64-mfk/debug/mfk-kernel`) reflect the workspace layout when building in debug mode.
+What `mfk-runner` does
+- Creates UEFI and BIOS disk images named like `<kernel-path>-uefi.img` and `<kernel-path>-bios.img`.
+- Creates/uses a small `target/disk.img` (10MB) for data; if the file doesn't exist the runner will attempt to create it using `qemu-img`.
+- When not passed `--no-run`, `mfk-runner` launches QEMU with the BIOS disk image attached as the primary drive and the `disk.img` attached as a secondary disk. QEMU is invoked with serial redirected to stdio.
 
-**Available Shell Commands**
-- **help**: Display available commands.
-- **clear/cls**: Clear the screen.
-- **echo <text>**: Print text to the screen.
-- **about**: Display information about MFK.
-- **uptime**: Show system uptime (simulated).
-- **memory/mem**: Display memory information.
-- **reboot**: Reboot the system (simulated by runner/QEMU).
-- **halt/shutdown**: Halt the system.
-- **whoami**: Display current user.
+Running and testing the kernel
+- Boot the image in QEMU (see example above). The kernel prints to the serial/VGA and exposes a simple shell.
+- Use `test_commands.txt` for quick filesystem/shell smoke tests (examples: `mkfs`, `mount`, `write`, `cat`, `ls`).
 
-Some commands may be placeholders or partially implemented; consult `kernel/src/shell` for the current implementation and to add new commands.
+Shell commands (common)
+- `help`       : Show available shell commands
+- `clear`/`cls`: Clear the screen
+- `echo <x>`   : Print text
+- `about`      : Show project info
+- `uptime`     : Simulated uptime
+- `mem`/`memory`: Show memory info
+- `reboot`, `halt`, `shutdown`: System control commands
 
-**Project Layout (high level)**
+Development notes
+- The `kernel` crate (`mfk-kernel`) depends on `bootloader_api`, and is configured as the binary named `mfk-kernel` (see `kernel/Cargo.toml`).
+- The `tools` crate (`mfk-runner`) depends on `bootloader` and implements helpers to create UEFI/BIOS disk images and launch QEMU.
 
-```
-`Cargo.toml`            # Workspace config
-`kernel/`               # Kernel crate (`mfk-kernel`)
-    `Cargo.toml`
-    `src/`                # Kernel sources (entry: `src/main.rs`)
-        `drivers/`          # Drivers (VGA, keyboard, serial, ATA, RTC...)
-        `fs/`               # Filesystem code
-        `shell/`            # Shell implementation
-`tools/`                # Runner / image creation (`mfk-runner`)
-    `Cargo.toml`
-    `src/main.rs`         # Disk image creator and QEMU runner
-`targets/x86_64-mfk.json`  # Custom target spec used for building kernel
-`test_commands.txt`     # Example shell commands to exercise basic features
-```
+Contributing
+- Fork the repository, create a branch, and open a pull request. Keep changes small and focused.
 
-**Development notes**
-- The repository uses a workspace with `kernel` and `tools` members — build either crate individually using `-p <name>` or build the whole workspace with `cargo build`.
-- Kernel development targets bare metal; expect to use QEMU for emulation rather than running on real hardware.
-- To add drivers or shell commands, modify the code under `kernel/src/drivers` and `kernel/src/shell`.
-- Use `rustfmt` and `cargo clippy` (on supported parts) to keep code consistent.
+License
+- MIT License — see `LICENSE` for details.
 
-**Testing**
-- Use `tools` runner to run images in QEMU for manual testing.
-- Example interaction scripts are in `test_commands.txt`.
+Contact / author
+- Alexander Matzen — repository owner
 
-**Troubleshooting**
-- If builds fail with missing components, ensure `rust-src` and `llvm-tools-preview` are installed for the nightly toolchain.
-- If `cargo` flags change across nightly versions, consult `rust-toolchain.toml` and update components accordingly.
-
-**Contributing**
-- Fork, create a branch, and open a PR. Keep changes focused and add tests where applicable.
-
-**License**
-- MIT License (see `LICENSE`)
-
-````
+If anything in this README is out of date, please open an issue or send a PR with suggested corrections.
