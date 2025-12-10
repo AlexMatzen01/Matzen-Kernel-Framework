@@ -586,6 +586,12 @@ impl SimpleFilesystem {
             if !entry.is_used() {
                 // Found empty slot, add entry
                 let new_entry = DirectoryEntry::new_with_name(filename, inode_num);
+                
+                // Debug: log what we're writing
+                use crate::serial_println;
+                let inode_copy = new_entry.inode_number;
+                serial_println!("Creating directory entry: inode={}, name={}", inode_copy, filename);
+                
                 unsafe {
                     let ptr = dir_buffer.as_mut_ptr().add(offset) as *mut DirectoryEntry;
                     core::ptr::write_unaligned(ptr, new_entry);

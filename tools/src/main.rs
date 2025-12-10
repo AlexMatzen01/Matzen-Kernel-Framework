@@ -58,27 +58,35 @@ fn main() {
     let no_run = args.iter().any(|a| a == "--no-run");
 
     if !no_run {
-        // Create a virtual disk image for testing (10MB)
+        // Create a virtual disk image for testing (10MB) - only if it doesn't exist
         let disk_path = "target/disk.img";
-        println!("Creating virtual disk image: {}", disk_path);
-        let _ = Command::new("qemu-img")
-            .args(["create", "-f", "raw", disk_path, "10M"])
-            .output();
+        if !Path::new(disk_path).exists() {
+            println!("Creating virtual disk image: {}", disk_path);
+            let result = Command::new("qemu-img")
+                .args(["create", "-f", "raw", disk_path, "10M"])
+                .output();
+            if let Err(e) = result {
+                eprintln!("Warning: Failed to create disk image: {}", e);
+            }
+        } else {
+            println!("Using existing disk image: {}", disk_path);
+        }
 
         // Run in QEMU
-        // Boot disk on default (primary master), data disk on primary slave
+        // Boot disk on IDE0 master (hda), data disk on IDE0 slave (hdb)
         println!("Running in QEMU...");
         let mut qemu = Command::new("qemu-system-x86_64")
             .args([
                 "-drive",
                 &format!("file={},format=raw,if=ide,index=0,media=disk", bios_path),
                 "-drive",
-                &format!("file={},format=raw,if=ide,index=1,media=disk", disk_path),
+                &format!("file={},format=raw,if=ide,index=1,media=disk,cache=none,readonly=off", disk_path),
                 "-serial",
                 "stdio",
                 "-display",
                 "none",
                 "-no-reboot",
+                "-no-shutdown",
                 "-m",
                 "128M",
             ])
