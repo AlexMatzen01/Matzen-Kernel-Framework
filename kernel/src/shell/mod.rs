@@ -616,16 +616,16 @@ fn cmd_mount() {
 
 /// List files in current directory
 fn cmd_ls() {
-    let fs_guard = FILESYSTEM.lock();
+    let mut fs_guard = FILESYSTEM.lock();
 
     if let Some(ref fs) = *fs_guard {
         let current_dir = fs.current_directory();
         drop(fs_guard); // Release lock before device access
 
         let mut device = crate::drivers::block::AtaBlockDevice::new();
-        let fs_guard = FILESYSTEM.lock();
+        let mut fs_guard = FILESYSTEM.lock();
 
-        if let Some(ref fs) = *fs_guard {
+        if let Some(ref mut fs) = *fs_guard {
             match fs.list_directory(&mut device, current_dir) {
                 Ok(files) => {
                     if files.is_empty() {

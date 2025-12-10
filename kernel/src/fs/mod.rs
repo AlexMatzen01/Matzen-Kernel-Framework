@@ -177,27 +177,37 @@ impl DirectoryEntry {
 
         let bytes = name.as_bytes();
         let len = core::cmp::min(bytes.len(), MAX_FILENAME_LEN - 1);
-        entry.name[..len].copy_from_slice(&bytes[..len]);
+        
+        // Copy bytes directly without taking a reference to the packed field
+        for i in 0..len {
+            entry.name[i] = bytes[i];
+        }
 
         entry
     }
 
     /// Check if entry is in use
     pub fn is_used(&self) -> bool {
+        // Note: This method is often called on entries read from disk buffers,
+        // where the entry might not be properly aligned. However, u32 access
+        // should work on x86_64 even if unaligned.
         self.inode_number != 0
     }
 
     /// Get filename as string
     pub fn get_name(&self) -> Result<String, &'static str> {
+        // Copy the name array to avoid taking a reference to a packed struct field
+        let name_copy = self.name;
+        
         let mut len = 0;
-        for (i, &byte) in self.name.iter().enumerate() {
+        for (i, &byte) in name_copy.iter().enumerate() {
             if byte == 0 {
                 len = i;
                 break;
             }
         }
 
-        core::str::from_utf8(&self.name[..len])
+        core::str::from_utf8(&name_copy[..len])
             .map(|s| String::from(s))
             .map_err(|_| "Invalid UTF-8 in filename")
     }
@@ -311,7 +321,7 @@ impl SimpleFilesystem {
         let mut buffer = [0u8; FS_BLOCK_SIZE];
         device.read_blocks(0, 1, &mut buffer)?;
 
-        let superblock = unsafe { core::ptr::read(buffer.as_ptr() as *const Superblock) };
+        let superblock = unsafe { core::ptr::read_unaligned(buffer.as_ptr() as *const Superblock) };
 
         // Verify magic number
         if superblock.magic != Superblock::MAGIC {
@@ -332,7 +342,7 @@ impl SimpleFilesystem {
             let ptr = inode_buffer.as_ptr() as *const Inode;
             let mut vec = Vec::with_capacity(MAX_INODES);
             for i in 0..MAX_INODES {
-                vec.push(*ptr.add(i));
+                vec.push(core::ptr::read_unaligned(ptr.add(i)));
             }
             vec
         };
@@ -365,10 +375,13 @@ impl SimpleFilesystem {
 
     /// List files in a directory
     pub fn list_directory(
-        &self,
+        &mut self,
         device: &mut dyn crate::drivers::block::BlockDevice,
         inode_number: u32,
     ) -> Result<Vec<FileInfo>, &'static str> {
+        // Reload inodes from disk to get latest state
+        self.reload_inodes(device)?;
+        
         if inode_number >= self.superblock.inode_count {
             return Err("Invalid inode number");
         }
@@ -399,10 +412,15 @@ impl SimpleFilesystem {
                         .as_ptr()
                         .add(i * core::mem::size_of::<DirectoryEntry>())
                         as *const DirectoryEntry;
-                    *ptr
+                    core::ptr::read_unaligned(ptr)
                 };
 
                 if entry.is_used() {
+                    // Validate inode number before indexing
+                    if entry.inode_number as usize >= MAX_INODES {
+                        continue; // Skip invalid entries
+                    }
+                    
                     let name = entry.get_name()?;
                     let entry_inode = &self.inodes[entry.inode_number as usize];
 
@@ -465,7 +483,7 @@ impl SimpleFilesystem {
         unsafe {
             let ptr = inode_buffer.as_ptr() as *const Inode;
             for i in 0..MAX_INODES {
-                self.inodes[i] = *ptr.add(i);
+                self.inodes[i] = core::ptr::read_unaligned(ptr.add(i));
             }
         }
 
@@ -523,6 +541,7 @@ impl SimpleFilesystem {
             return Err("Filename too long");
         }
 
+        // list_directory now reloads inodes, so we don't need a separate reload here
         // Check if file already exists
         let files = self.list_directory(device, self.current_dir_inode)?;
         for file in files {
@@ -561,7 +580,7 @@ impl SimpleFilesystem {
             let offset = i * core::mem::size_of::<DirectoryEntry>();
             let entry = unsafe {
                 let ptr = dir_buffer.as_ptr().add(offset) as *const DirectoryEntry;
-                *ptr
+                core::ptr::read_unaligned(ptr)
             };
 
             if !entry.is_used() {
@@ -569,7 +588,7 @@ impl SimpleFilesystem {
                 let new_entry = DirectoryEntry::new_with_name(filename, inode_num);
                 unsafe {
                     let ptr = dir_buffer.as_mut_ptr().add(offset) as *mut DirectoryEntry;
-                    *ptr = new_entry;
+                    core::ptr::write_unaligned(ptr, new_entry);
                 }
                 entry_added = true;
                 break;
@@ -744,14 +763,14 @@ impl SimpleFilesystem {
             let offset = i * core::mem::size_of::<DirectoryEntry>();
             let entry = unsafe {
                 let ptr = dir_buffer.as_ptr().add(offset) as *const DirectoryEntry;
-                *ptr
+                core::ptr::read_unaligned(ptr)
             };
 
             if entry.is_used() && entry.inode_number == file_inode_num {
                 // Clear this entry
                 unsafe {
                     let ptr = dir_buffer.as_mut_ptr().add(offset) as *mut DirectoryEntry;
-                    *ptr = DirectoryEntry::new();
+                    core::ptr::write_unaligned(ptr, DirectoryEntry::new());
                 }
                 break;
             }
