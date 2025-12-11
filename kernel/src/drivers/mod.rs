@@ -12,3 +12,5 @@ pub mod keyboard;
 pub mod rtc;
 pub mod serial;
 pub mod vga;
+pub mod pci;
+pub mod e1000;

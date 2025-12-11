@@ -18,6 +18,7 @@ mod fs;
 mod interrupts;
 mod pic;
 mod shell;
+mod net;
 
 use bootloader_api::config::Mapping;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
@@ -84,6 +85,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Initialize ATA disk driver
     drivers::ata::init();
+
+    // Initialize networking (E1000 NIC)
+    if let Err(e) = drivers::e1000::init(phys_mem_offset) {
+        serial_println!("Warning: E1000 initialization failed: {}", e);
+    } else {
+        net::init();
+    }
 
     // Enable interrupts
     x86_64::instructions::interrupts::enable();

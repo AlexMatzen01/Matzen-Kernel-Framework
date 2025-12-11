@@ -9,7 +9,7 @@
 use crate::drivers::{keyboard, vga};
 use crate::{print, println};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use spin::Mutex;
 
 /// Maximum length of a command line
@@ -21,8 +21,31 @@ const PROMPT: &str = "mfk> ";
 /// Simple tick counter for uptime tracking
 static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Global interrupt flag for Ctrl+C handling
+static INTERRUPT_FLAG: AtomicBool = AtomicBool::new(false);
+
 /// Global filesystem state
 static FILESYSTEM: Mutex<Option<crate::fs::SimpleFilesystem>> = Mutex::new(None);
+
+/// Get the current tick count (rough millisecond approximation)
+pub fn get_tick_count() -> u64 {
+    TICK_COUNTER.load(Ordering::Relaxed)
+}
+
+/// Check if Ctrl+C was pressed
+pub fn is_interrupted() -> bool {
+    INTERRUPT_FLAG.load(Ordering::Relaxed)
+}
+
+/// Clear the interrupt flag
+pub fn clear_interrupt() {
+    INTERRUPT_FLAG.store(false, Ordering::Relaxed);
+}
+
+/// Set the interrupt flag (called when Ctrl+C is detected)
+fn set_interrupt() {
+    INTERRUPT_FLAG.store(true, Ordering::Relaxed);
+}
 
 /// Runs the shell loop
 pub fn run() -> ! {
@@ -35,8 +58,19 @@ pub fn run() -> ! {
         // Increment tick counter for basic timing
         TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
 
+        // Process network packets
+        crate::net::process_packets();
+
         if let Some(c) = keyboard::read_char() {
             match c {
+                '\x03' => {
+                    // Ctrl+C detected
+                    set_interrupt();
+                    println!("^C");
+                    cmd_len = 0;
+                    cmd_buffer = [0; MAX_CMD_LENGTH];
+                    print!("\n{}", PROMPT);
+                }
                 '\n' | '\r' => {
                     println!();
                     if cmd_len > 0 {
@@ -45,6 +79,7 @@ pub fn run() -> ! {
                         cmd_len = 0;
                         cmd_buffer = [0; MAX_CMD_LENGTH];
                     }
+                    clear_interrupt();
                     print!("{}", PROMPT);
                 }
                 '\x08' | '\x7f' => {
@@ -104,6 +139,9 @@ fn execute_command(cmd: &str) {
         "cat" => cmd_cat(parts.1),
         "write" => cmd_write(parts.1),
         "rm" => cmd_rm(parts.1),
+        "ifconfig" => cmd_ifconfig(parts.1),
+        "ping" => cmd_ping(parts.1),
+        "netstat" => cmd_netstat(),
         "" => {}
         _ => {
             println!(
@@ -142,6 +180,11 @@ fn cmd_help() {
     println!("  cat       - Display file contents (e.g., 'cat test.txt')");
     println!("  write     - Write text to file (e.g., 'write test.txt Hello World')");
     println!("  rm        - Delete a file (e.g., 'rm test.txt')");
+    println!();
+    println!("Network Commands:");
+    println!("  ifconfig  - Configure network interface (e.g., 'ifconfig 10.0.2.15')");
+    println!("  ping      - Send ICMP echo request (e.g., 'ping 10.0.2.2 4')");
+    println!("  netstat   - Display network status");
 }
 
 /// Clears the screen
@@ -804,5 +847,174 @@ fn cmd_rm(filename: &str) {
                 println!("Failed to delete file: {}", e);
             }
         }
+    }
+}
+
+/// Configure network interface
+fn cmd_ifconfig(args: &str) {
+    if args.is_empty() {
+        // Display current configuration
+        if let Some(mac) = crate::drivers::e1000::mac_address() {
+            println!("Network Interface:");
+            println!("  MAC Address: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            
+            if let Some(ip) = crate::net::ip::get_ip_address() {
+                println!("  IP Address:  {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+            } else {
+                println!("  IP Address:  Not configured");
+            }
+        } else {
+            println!("Network interface not initialized");
+        }
+    } else {
+        // Parse and set IP address
+        let parts: Vec<&str> = args.split('.').collect();
+        if parts.len() != 4 {
+            println!("Invalid IP address format. Use: ifconfig <ip> (e.g., ifconfig 10.0.2.15)");
+            return;
+        }
+
+        let mut ip = [0u8; 4];
+        for (i, part) in parts.iter().enumerate() {
+            match part.parse::<u8>() {
+                Ok(octet) => ip[i] = octet,
+                Err(_) => {
+                    println!("Invalid IP address format");
+                    return;
+                }
+            }
+        }
+
+        crate::net::ip::set_ip_address(ip);
+        println!("IP address set to {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    }
+}
+
+/// Send ping (ICMP echo request)
+fn cmd_ping(args: &str) {
+    if args.is_empty() {
+        println!("Usage: ping <ip-address> [count]");
+        println!("Example: ping 10.0.2.2 4");
+        return;
+    }
+
+    // Split args to get IP and optional count
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    
+    // Parse IP address
+    let ip_parts: Vec<&str> = parts[0].split('.').collect();
+    if ip_parts.len() != 4 {
+        println!("Invalid IP address format");
+        return;
+    }
+
+    let mut target_ip = [0u8; 4];
+    for (i, part) in ip_parts.iter().enumerate() {
+        match part.parse::<u8>() {
+            Ok(octet) => target_ip[i] = octet,
+            Err(_) => {
+                println!("Invalid IP address");
+                return;
+            }
+        }
+    }
+    
+    // Parse count
+    let count = if parts.len() > 1 {
+        parts[1].parse().unwrap_or(4)
+    } else {
+        4
+    };
+
+    println!("Pinging {}.{}.{}.{} with {} packets...", 
+        target_ip[0], target_ip[1], target_ip[2], target_ip[3], count);
+    
+    // Send pings
+    for seq in 0..count {
+        match crate::net::icmp::send_ping(target_ip, 1, seq) {
+            Ok(_) => {},
+            Err(e) => {
+                println!("Failed to send ping {}: {}", seq, e);
+                break;
+            }
+        }
+        // Small delay between pings
+        for _ in 0..1000000 { core::hint::spin_loop(); }
+    }
+    
+    println!("Sent {} ping(s), waiting for replies...", count);
+    
+    // Wait for replies with timeout
+    let start_time = get_tick_count();
+    let timeout_ms = 5000;
+    let mut received = 0;
+    clear_interrupt();
+    
+    while get_tick_count() - start_time < timeout_ms && !is_interrupted() {
+        // Process incoming packets
+        crate::net::process_packets();
+        
+        // Check for replies
+        while let Some(reply) = crate::net::icmp::pop_reply() {
+            println!("Reply from {}.{}.{}.{}: seq={} time={}ms",
+                reply.source_ip[0], reply.source_ip[1],
+                reply.source_ip[2], reply.source_ip[3],
+                reply.sequence, reply.rtt_ms);
+            received += 1;
+        }
+        
+        // If we got all replies, we're done
+        if received >= count {
+            break;
+        }
+        
+        // Small delay
+        for _ in 0..10000 { core::hint::spin_loop(); }
+    }
+    
+    if is_interrupted() {
+        println!("Ping cancelled by user");
+        clear_interrupt();
+    } else {
+        // Check for timeouts
+        let timed_out = crate::net::icmp::check_timeouts();
+        if timed_out > 0 {
+            println!("{} packet(s) timed out", timed_out);
+        }
+        
+        println!("--- ping statistics ---");
+        println!("{} packets transmitted, {} received, {}% packet loss",
+            count, received, 
+            if count > 0 { ((count - received) * 100) / count } else { 0 });
+    }
+}
+
+/// Display network statistics
+fn cmd_netstat() {
+    println!("Network Status:");
+    println!();
+    
+    if let Some(mac) = crate::drivers::e1000::mac_address() {
+        println!("Interface: E1000");
+        println!("  MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        
+        if let Some(ip) = crate::net::ip::get_ip_address() {
+            println!("  IP:  {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+        } else {
+            println!("  IP:  Not configured");
+        }
+        
+        println!();
+        println!("Protocol Stack:");
+        println!("  Ethernet - Active");
+        println!("  ARP      - Active");
+        println!("  IPv4     - Active");
+        println!("  ICMP     - Active");
+        println!("  UDP      - Active");
+        println!("  TCP      - Not implemented");
+    } else {
+        println!("Network interface not initialized");
     }
 }

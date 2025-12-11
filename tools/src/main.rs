@@ -89,6 +89,11 @@ fn main() {
                 "-no-shutdown",
                 "-m",
                 "128M",
+                // Add E1000 network card
+                "-device",
+                "e1000,netdev=net0",
+                "-netdev",
+                "user,id=net0,hostfwd=udp::5555-:5555",
             ])
             .spawn()
             .expect("Failed to start QEMU");

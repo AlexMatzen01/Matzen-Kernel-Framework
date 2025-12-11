@@ -1,8 +1,17 @@
 # Matzen Kernel Framework (MFK)
 
-A small educational terminal OS written in Rust for x86_64. MFK contains a tiny kernel (`mfk-kernel`) with a basic VGA driver, PS/2 keyboard support, a built-in shell, and a small `mfk-runner` tool that builds bootable disk images and runs them in QEMU.
+A small educational terminal OS written in Rust for x86_64. MFK contains a tiny kernel (`mfk-kernel`) with VGA driver, PS/2 keyboard support, ATA disk driver, filesystem, networking (E1000), and a built-in shell. The `mfk-runner` tool builds bootable disk images and runs them in QEMU.
 
 **Status:** active development — use for experimentation and learning.
+
+## Features
+- VGA text mode output
+- PS/2 keyboard input
+- ATA PIO disk driver
+- SimplFS filesystem (custom implementation)
+- Intel E1000 network driver
+- Network stack: Ethernet, ARP, IPv4, ICMP, UDP
+- Interactive shell with file and network commands
 
 **Repository layout (important files):**
 
@@ -14,6 +23,7 @@ A small educational terminal OS written in Rust for x86_64. MFK contains a tiny 
 - `run.sh`               : Convenience script to run `mfk-runner` with a kernel path
 - `install.sh`           : Convenience script to install Rust/nightly components
 - `test_commands.txt`    : Example shell commands to exercise the kernel's filesystem/shell
+- `NETWORKING.md`        : Networking documentation and usage guide
 
 Prerequisites
 - Linux or macOS (QEMU required for running the image)
@@ -74,7 +84,21 @@ What `mfk-runner` does
 - When not passed `--no-run`, `mfk-runner` launches QEMU with the BIOS disk image attached as the primary drive and the `disk.img` attached as a secondary disk. QEMU is invoked with serial redirected to stdio.
 
 Running and testing the kernel
-- Boot the image in QEMU (see example above). The kernel prints to the serial/VGA and exposes a simple shell.
+- Boot the image in QEMU (see example above). The kerne
+
+Filesystem commands
+- `mkfs`       : Format disk with SimplFS
+- `mount`      : Mount the filesystem
+- `ls`/`dir`   : List files
+- `touch <f>`  : Create a file
+- `cat <f>`    : Display file contents
+- `write <f> <text>`: Write to a file
+- `rm <f>`     : Delete a file
+
+Network commands (see NETWORKING.md for details)
+- `ifconfig [ip]`: Configure/display network interface
+- `ping <ip>`  : Send ICMP echo request
+- `netstat`    : Display network statusl prints to the serial/VGA and exposes a simple shell.
 - Use `test_commands.txt` for quick filesystem/shell smoke tests (examples: `mkfs`, `mount`, `write`, `cat`, `ls`).
 
 Shell commands (common)

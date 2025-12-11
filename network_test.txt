@@ -1,0 +1,16 @@
+# Network Testing Commands
+
+# Configure IP address
+ifconfig 10.0.2.15
+
+# Display network configuration
+ifconfig
+
+# Show network status
+netstat
+
+# Ping the QEMU gateway
+ping 10.0.2.2
+
+# Note: Ping responses will appear in serial output
+# The kernel processes incoming packets in the main loop
