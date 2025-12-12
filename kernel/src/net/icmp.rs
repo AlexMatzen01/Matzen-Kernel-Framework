@@ -1,3 +1,7 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
 //! ICMP (Internet Control Message Protocol) - for ping
 
 use alloc::collections::BTreeMap;
@@ -160,6 +164,9 @@ pub fn send_ping(dst_ip: [u8; 4], identifier: u16, sequence: u16) -> Result<(), 
             sent_time: current_time,
         },
     );
+
+    crate::serial_println!("ICMP: Sending ping to {}.{}.{}.{}, seq={}", 
+        dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], sequence);
 
     crate::net::ip::send_packet(dst_ip, 1, &packet)
 }

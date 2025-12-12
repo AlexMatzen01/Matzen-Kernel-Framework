@@ -1,3 +1,7 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
 //! Intel E1000 Network Driver
 //! 
 //! Basic driver for Intel E1000 network card (commonly used in QEMU)
@@ -90,10 +94,11 @@ pub struct E1000 {
     tx_buffers: Vec<Vec<u8>>,
     rx_current: usize,
     tx_current: usize,
+    phys_mem_offset: u64,
 }
 
 impl E1000 {
-    pub fn new(mem_base: usize) -> Self {
+    pub fn new(mem_base: usize, phys_mem_offset: u64) -> Self {
         let mut driver = E1000 {
             mem_base,
             mac_address: [0; 6],
@@ -118,6 +123,7 @@ impl E1000 {
             tx_buffers: alloc::vec![alloc::vec![0u8; BUFFER_SIZE]; TX_DESC_COUNT],
             rx_current: 0,
             tx_current: 0,
+            phys_mem_offset,
         };
 
         driver.init();
@@ -170,29 +176,34 @@ impl E1000 {
 
         // Setup receive descriptors
         for i in 0..RX_DESC_COUNT {
-            let phys_addr = &self.rx_buffers[i][0] as *const u8 as u64;
+            let virt_addr = &self.rx_buffers[i][0] as *const u8 as u64;
+            // Convert virtual to physical by subtracting the offset
+            let phys_addr = virt_addr - self.phys_mem_offset;
             self.rx_descriptors[i].addr = phys_addr;
             self.rx_descriptors[i].status = 0;
         }
 
-        let rx_desc_addr = self.rx_descriptors.as_ptr() as u64;
-        self.write_reg(REG_RXDESCLO, (rx_desc_addr & 0xFFFFFFFF) as u32);
-        self.write_reg(REG_RXDESCHI, (rx_desc_addr >> 32) as u32);
+        let rx_desc_virt = self.rx_descriptors.as_ptr() as u64;
+        let rx_desc_phys = rx_desc_virt - self.phys_mem_offset;
+        self.write_reg(REG_RXDESCLO, (rx_desc_phys & 0xFFFFFFFF) as u32);
+        self.write_reg(REG_RXDESCHI, (rx_desc_phys >> 32) as u32);
         self.write_reg(REG_RXDESCLEN, (RX_DESC_COUNT * 16) as u32);
         self.write_reg(REG_RXDESCHEAD, 0);
         self.write_reg(REG_RXDESCTAIL, (RX_DESC_COUNT - 1) as u32);
 
         // Setup transmit descriptors
         for i in 0..TX_DESC_COUNT {
-            let phys_addr = &self.tx_buffers[i][0] as *const u8 as u64;
+            let virt_addr = &self.tx_buffers[i][0] as *const u8 as u64;
+            let phys_addr = virt_addr - self.phys_mem_offset;
             self.tx_descriptors[i].addr = phys_addr;
             self.tx_descriptors[i].status = 1; // DD bit
             self.tx_descriptors[i].cmd = 0;
         }
 
-        let tx_desc_addr = self.tx_descriptors.as_ptr() as u64;
-        self.write_reg(REG_TXDESCLO, (tx_desc_addr & 0xFFFFFFFF) as u32);
-        self.write_reg(REG_TXDESCHI, (tx_desc_addr >> 32) as u32);
+        let tx_desc_virt = self.tx_descriptors.as_ptr() as u64;
+        let tx_desc_phys = tx_desc_virt - self.phys_mem_offset;
+        self.write_reg(REG_TXDESCLO, (tx_desc_phys & 0xFFFFFFFF) as u32);
+        self.write_reg(REG_TXDESCHI, (tx_desc_phys >> 32) as u32);
         self.write_reg(REG_TXDESCLEN, (TX_DESC_COUNT * 16) as u32);
         self.write_reg(REG_TXDESCHEAD, 0);
         self.write_reg(REG_TXDESCTAIL, 0);
@@ -240,11 +251,16 @@ impl E1000 {
         let desc_index = self.rx_current;
 
         // Check if descriptor has data
-        if self.rx_descriptors[desc_index].status & 1 == 0 {
+        let status = self.rx_descriptors[desc_index].status;
+        if status & 1 == 0 {
+            // No packet available
             return None;
         }
 
         let length = self.rx_descriptors[desc_index].length as usize;
+        crate::serial_println!("E1000: RX descriptor {} has packet, length={}, status={:#x}", 
+            desc_index, length, status);
+        
         let packet = self.rx_buffers[desc_index][..length].to_vec();
 
         // Reset descriptor
@@ -291,7 +307,7 @@ pub fn init(phys_mem_offset: u64) -> Result<(), &'static str> {
     let virt_base = (phys_mem_offset + mem_base) as usize;
     crate::serial_println!("  Virtual memory base: {:#x}", virt_base);
     
-    let driver = E1000::new(virt_base);
+    let driver = E1000::new(virt_base, phys_mem_offset);
     let mac = driver.mac_address();
     
     crate::serial_println!("E1000 initialized");

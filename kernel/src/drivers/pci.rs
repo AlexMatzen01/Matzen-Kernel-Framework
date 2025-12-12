@@ -1,3 +1,7 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
 //! Basic PCI device enumeration
 //!
 //! Provides simple PCI configuration space access

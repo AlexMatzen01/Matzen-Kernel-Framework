@@ -1,3 +1,7 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
 //! UDP (User Datagram Protocol)
 
 #[repr(C, packed)]

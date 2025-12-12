@@ -1,3 +1,7 @@
+//! Copyright (c) Alexander Matzen. All rights reserved.
+//! Author: Alexander Matzen
+//! Licensed under the MIT license.
+
 //! Network stack implementation
 
 pub mod ethernet;
@@ -21,12 +25,16 @@ pub fn init() {
 
 pub fn process_packets() {
     // Receive packets from driver
+    let mut packet_count = 0;
     while let Some(packet) = crate::drivers::e1000::receive_packet() {
+        packet_count += 1;
+        crate::serial_println!("RX: Received packet {} bytes", packet.len());
         RX_QUEUE.lock().push_back(packet);
     }
 
     // Process received packets
     while let Some(packet) = RX_QUEUE.lock().pop_front() {
+        crate::serial_println!("Processing packet {} bytes", packet.len());
         ethernet::process_packet(&packet);
     }
 }
