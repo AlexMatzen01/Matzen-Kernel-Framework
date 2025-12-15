@@ -168,7 +168,7 @@ impl E1000 {
     }
 
     fn init(&mut self) {
-        // Read MAC address
+        // Read MAC addressx
         self.read_mac_address();
 
         // Enable bus mastering and memory access
@@ -177,14 +177,15 @@ impl E1000 {
         // Setup receive descriptors
         for i in 0..RX_DESC_COUNT {
             let virt_addr = &self.rx_buffers[i][0] as *const u8 as u64;
-            // Convert virtual to physical by subtracting the offset
-            let phys_addr = virt_addr - self.phys_mem_offset;
+            // Kernel heap is identity-mapped, so virtual address = physical address
+            let phys_addr = virt_addr;
             self.rx_descriptors[i].addr = phys_addr;
             self.rx_descriptors[i].status = 0;
         }
 
         let rx_desc_virt = self.rx_descriptors.as_ptr() as u64;
-        let rx_desc_phys = rx_desc_virt - self.phys_mem_offset;
+        // Kernel heap is identity-mapped
+        let rx_desc_phys = rx_desc_virt;
         self.write_reg(REG_RXDESCLO, (rx_desc_phys & 0xFFFFFFFF) as u32);
         self.write_reg(REG_RXDESCHI, (rx_desc_phys >> 32) as u32);
         self.write_reg(REG_RXDESCLEN, (RX_DESC_COUNT * 16) as u32);
@@ -194,14 +195,16 @@ impl E1000 {
         // Setup transmit descriptors
         for i in 0..TX_DESC_COUNT {
             let virt_addr = &self.tx_buffers[i][0] as *const u8 as u64;
-            let phys_addr = virt_addr - self.phys_mem_offset;
+            // Kernel heap is identity-mapped
+            let phys_addr = virt_addr;
             self.tx_descriptors[i].addr = phys_addr;
             self.tx_descriptors[i].status = 1; // DD bit
             self.tx_descriptors[i].cmd = 0;
         }
 
         let tx_desc_virt = self.tx_descriptors.as_ptr() as u64;
-        let tx_desc_phys = tx_desc_virt - self.phys_mem_offset;
+        // Kernel heap is identity-mapped
+        let tx_desc_phys = tx_desc_virt;
         self.write_reg(REG_TXDESCLO, (tx_desc_phys & 0xFFFFFFFF) as u32);
         self.write_reg(REG_TXDESCHI, (tx_desc_phys >> 32) as u32);
         self.write_reg(REG_TXDESCLEN, (TX_DESC_COUNT * 16) as u32);
