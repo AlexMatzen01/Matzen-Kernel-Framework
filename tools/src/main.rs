@@ -93,7 +93,9 @@ fn main() {
                 "-device",
                 "e1000,netdev=net0",
                 "-netdev",
-                "user,id=net0,hostfwd=udp::5555-:5555",
+                "user,id=net0,restrict=off,hostfwd=udp::5555-:5555",
+                "-net",
+                "user,hostfwd=tcp::49152-:49152",
             ])
             .spawn()
             .expect("Failed to start QEMU");

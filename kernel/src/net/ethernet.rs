@@ -40,6 +40,9 @@ pub fn process_packet(packet: &[u8]) {
         core::ptr::read_unaligned(packet.as_ptr() as *const EthernetFrame)
     };
 
+    crate::serial_println!("Ethernet: Received frame, ethertype={:#x}, len={}",
+        frame.get_ethertype(), packet.len());
+
     let payload = &packet[14..];
     
     match frame.get_ethertype() {

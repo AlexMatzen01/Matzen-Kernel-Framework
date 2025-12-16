@@ -247,6 +247,9 @@ impl E1000 {
         self.tx_current = (self.tx_current + 1) % TX_DESC_COUNT;
         self.write_reg(REG_TXDESCTAIL, self.tx_current as u32);
 
+        crate::serial_println!("E1000: TX packet {} bytes, desc={}, tail={}", 
+            data.len(), desc_index, self.tx_current);
+
         Ok(())
     }
 

@@ -44,6 +44,7 @@ Purpose: get an AI coding agent productive quickly in this repo. Focus on concre
   - QEMU launched by `mfk-runner` redirects serial to stdio — read console output in the terminal.
   - Use `serial_println!()` in early init to get output even when VGA is unavailable.
   - If changing memory mapping or bootloader config, check `BOOTLOADER_CONFIG` in `kernel/src/main.rs`.
+  - **Known issue:** QEMU's user-mode networking has limited ICMP support. Ping may not receive replies due to SLIRP limitations, not kernel bugs. Use TAP networking for proper ICMP testing (see `ICMP_STATUS.md`).
 
 - **Tests & manual checks:**
   - There are no automated unit tests for the kernel; use `test_commands.txt` for manual shell smoke tests (filesystem, network commands).

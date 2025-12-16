@@ -16,6 +16,7 @@ The Matzen Kernel Framework now includes basic networking support with an Intel 
 - **IPv4 (Layer 3)**: Basic IP packet handling
 - **ICMP**: Internet Control Message Protocol (ping support)
 - **UDP**: User Datagram Protocol (connectionless communication)
+- **TCP**: Transmission Control Protocol (connection-oriented communication)
 
 ## Shell Commands
 
@@ -38,6 +39,31 @@ ping 10.0.2.2            # Ping the QEMU gateway
 
 ### `netstat`
 Display network status and protocol information.
+
+### `tcpconnect <ip-address> <port>`
+Establish a TCP connection to a remote server.
+
+**Examples:**
+```
+tcpconnect 10.0.2.2 80           # Connect to QEMU host on port 80
+tcpconnect 93.184.216.34 80      # Connect to example.com (requires TAP)
+```
+
+### `tcpsend <local-port> <data>`
+Send data over an established TCP connection.
+
+**Example:**
+```
+tcpsend 49152 GET / HTTP/1.0     # Send HTTP request
+```
+
+### `tcpclose <local-port>`
+Close a TCP connection.
+
+**Example:**
+```
+tcpclose 49152                    # Close connection on port 49152
+```
 
 ## Usage Example
 
@@ -68,7 +94,23 @@ Protocol Stack:
   IPv4     - Active
   ICMP     - Active
   UDP      - Active
-  TCP      - Not implemented
+  TCP      - Active
+
+mfk> tcpconnect 10.0.2.2 80
+Connecting to 10.0.2.2:80...
+Connection initiated from local port 49152
+Waiting for connection to establish...
+Connection established! Local port: 49152
+
+mfk> tcpsend 49152 GET / HTTP/1.0
+Sent 17 bytes on port 49152
+Checking for response...
+Received 256 bytes:
+HTTP/1.0 200 OK
+...
+
+mfk> tcpclose 49152
+Closing connection on port 49152
 ```
 
 ## QEMU Network Configuration
@@ -94,6 +136,7 @@ Port forwarding is configured for UDP port 5555.
 - **ip.rs**: IPv4 header construction and checksum
 - **icmp.rs**: Echo request/reply (ping)
 - **udp.rs**: UDP packet handling
+- **tcp.rs**: TCP connection management, 3-way handshake, data transfer
 
 ### Packet Flow
 1. E1000 driver receives raw ethernet frames
@@ -103,17 +146,19 @@ Port forwarding is configured for UDP port 5555.
 5. ICMP/UDP handlers process protocol-specific data
 
 ## Future Enhancements
-- TCP implementation
+- TCP retransmission and congestion control
 - DHCP client for automatic IP configuration
 - DNS resolver
-- Socket API
+- Socket API with file descriptors
 - Multiple network interfaces
 - IPv6 support
+- TLS/SSL support
 
 ## Limitations
-- No TCP support yet
+- Basic TCP implementation (no retransmission, window scaling, or advanced features)
 - Single network interface only
 - No fragmentation/reassembly
 - Simplified routing (assumes single subnet)
 - ARP cache doesn't expire entries
-- No ICMP error messages
+- Limited error handling
+- QEMU user-mode networking restrictions (see ICMP_STATUS.md)

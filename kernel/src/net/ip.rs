@@ -100,11 +100,20 @@ pub fn process_packet(packet: &[u8], src_mac: [u8; 6]) {
         core::ptr::read_unaligned(packet.as_ptr() as *const IpHeader)
     };
 
+    crate::serial_println!("IP: Received packet from {}.{}.{}.{} to {}.{}.{}.{}, protocol={}",
+        ip_header.src_ip[0], ip_header.src_ip[1], ip_header.src_ip[2], ip_header.src_ip[3],
+        ip_header.dst_ip[0], ip_header.dst_ip[1], ip_header.dst_ip[2], ip_header.dst_ip[3],
+        ip_header.protocol);
+
     // Check if packet is for us
     if let Some(our_ip) = get_ip_address() {
         if ip_header.dst_ip != our_ip {
+            crate::serial_println!("IP: Packet not for us (our IP: {}.{}.{}.{}), discarding",
+                our_ip[0], our_ip[1], our_ip[2], our_ip[3]);
             return;
         }
+    } else {
+        crate::serial_println!("IP: No IP address configured, accepting all packets");
     }
 
     let header_len = ip_header.get_ihl() as usize;
@@ -121,8 +130,11 @@ pub fn process_packet(packet: &[u8], src_mac: [u8; 6]) {
         IP_PROTO_UDP => {
             crate::net::udp::process_packet(payload, ip_header.src_ip);
         }
+        IP_PROTO_TCP => {
+            crate::net::tcp::process_packet(payload, ip_header.src_ip, src_mac);
+        }
         _ => {
-            // Unsupported protocol
+            crate::serial_println!("IP: Unsupported protocol {}", ip_header.protocol);
         }
     }
 }

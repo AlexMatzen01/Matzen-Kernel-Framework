@@ -10,7 +10,7 @@ A small educational terminal OS written in Rust for x86_64. MFK contains a tiny 
 - ATA PIO disk driver
 - SimplFS filesystem (custom implementation)
 - Intel E1000 network driver
-- Network stack: Ethernet, ARP, IPv4, ICMP, UDP
+- Network stack: Ethernet, ARP, IPv4, ICMP, UDP, TCP
 - Interactive shell with file and network commands
 
 **Repository layout (important files):**

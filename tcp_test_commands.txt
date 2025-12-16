@@ -1,0 +1,52 @@
+# TCP Test Commands
+
+# Basic connection test to QEMU host
+ifconfig 10.0.2.15
+tcpconnect 10.0.2.2 80
+
+# Send HTTP request (replace 49152 with your local port from tcpconnect output)
+tcpsend 49152 GET / HTTP/1.0
+
+# Close connection
+tcpclose 49152
+
+# ===== With TAP Networking =====
+
+# Configure for TAP network
+ifconfig 192.168.100.2
+
+# Connect to host
+tcpconnect 192.168.100.1 80
+
+# Test with netcat on host:
+# Terminal 1 (host): nc -l 192.168.100.1 8080
+# Terminal 2 (kernel): tcpconnect 192.168.100.1 8080
+
+# ===== Full HTTP Test =====
+
+# 1. Configure network
+ifconfig 10.0.2.15
+netstat
+
+# 2. Connect to web server
+tcpconnect 10.0.2.2 80
+
+# 3. Send minimal HTTP request (note the port from step 2)
+tcpsend 49152 GET / HTTP/1.0
+
+# 4. Wait for response in output
+
+# 5. Close when done
+tcpclose 49152
+
+# ===== Multiple Connections =====
+
+# You can have multiple TCP connections simultaneously
+tcpconnect 10.0.2.2 80    # Returns port 49152
+tcpconnect 10.0.2.2 8080  # Returns port 49153
+
+tcpsend 49152 test1
+tcpsend 49153 test2
+
+tcpclose 49152
+tcpclose 49153

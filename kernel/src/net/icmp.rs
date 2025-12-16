@@ -109,6 +109,9 @@ pub fn process_packet(packet: &[u8], src_ip: [u8; 4], _src_mac: [u8; 6]) {
         let identifier = u16::from_be(icmp_header.identifier);
         let sequence = u16::from_be(icmp_header.sequence);
         
+        crate::serial_println!("ICMP: Received echo reply from {}.{}.{}.{}, id={}, seq={}",
+            src_ip[0], src_ip[1], src_ip[2], src_ip[3], identifier, sequence);
+        
         let mut pending = PENDING_PINGS.lock();
         if let Some(request) = pending.remove(&(identifier, sequence)) {
             let current_time = crate::shell::get_tick_count();

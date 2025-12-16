@@ -142,6 +142,9 @@ fn execute_command(cmd: &str) {
         "ifconfig" => cmd_ifconfig(parts.1),
         "ping" => cmd_ping(parts.1),
         "netstat" => cmd_netstat(),
+        "tcpconnect" => cmd_tcpconnect(parts.1),
+        "tcpsend" => cmd_tcpsend(parts.1),
+        "tcpclose" => cmd_tcpclose(parts.1),
         "" => {}
         _ => {
             println!(
@@ -182,9 +185,12 @@ fn cmd_help() {
     println!("  rm        - Delete a file (e.g., 'rm test.txt')");
     println!();
     println!("Network Commands:");
-    println!("  ifconfig  - Configure network interface (e.g., 'ifconfig 10.0.2.15')");
-    println!("  ping      - Send ICMP echo request (e.g., 'ping 10.0.2.2 4')");
-    println!("  netstat   - Display network status");
+    println!("  ifconfig     - Configure network interface (e.g., 'ifconfig 10.0.2.15')");
+    println!("  ping         - Send ICMP echo request (e.g., 'ping 10.0.2.2 4')");
+    println!("  netstat      - Display network status");
+    println!("  tcpconnect   - Connect to TCP server (e.g., 'tcpconnect 10.0.2.2 80')");
+    println!("  tcpsend      - Send data on TCP connection (e.g., 'tcpsend <port> <data>')");
+    println!("  tcpclose     - Close TCP connection (e.g., 'tcpclose <port>')");
 }
 
 /// Clears the screen
@@ -1013,8 +1019,171 @@ fn cmd_netstat() {
         println!("  IPv4     - Active");
         println!("  ICMP     - Active");
         println!("  UDP      - Active");
-        println!("  TCP      - Not implemented");
+        println!("  TCP      - Active");
     } else {
         println!("Network interface not initialized");
+    }
+}
+
+fn cmd_tcpconnect(args: &str) {
+    if args.is_empty() {
+        println!("Usage: tcpconnect <ip-address> <port>");
+        println!("Example: tcpconnect 10.0.2.2 80");
+        println!("         tcpconnect 93.184.216.34 80  (example.com)");
+        return;
+    }
+
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.len() < 2 {
+        println!("Error: Missing IP address or port");
+        return;
+    }
+
+    // Parse IP address
+    let ip_parts: Vec<&str> = parts[0].split('.').collect();
+    if ip_parts.len() != 4 {
+        println!("Invalid IP address format");
+        return;
+    }
+
+    let mut target_ip = [0u8; 4];
+    for (i, part) in ip_parts.iter().enumerate() {
+        match part.parse::<u8>() {
+            Ok(octet) => target_ip[i] = octet,
+            Err(_) => {
+                println!("Invalid IP address");
+                return;
+            }
+        }
+    }
+
+    // Parse port
+    let port = match parts[1].parse::<u16>() {
+        Ok(p) => p,
+        Err(_) => {
+            println!("Invalid port number");
+            return;
+        }
+    };
+
+    println!("Connecting to {}.{}.{}.{}:{}...", 
+        target_ip[0], target_ip[1], target_ip[2], target_ip[3], port);
+
+    match crate::net::tcp::connect(target_ip, port) {
+        Ok(local_port) => {
+            println!("Connection initiated from local port {}", local_port);
+            println!("Waiting for connection to establish...");
+            
+            // Wait for connection to establish
+            let start_time = get_tick_count();
+            let timeout_ms = 5000;
+            clear_interrupt();
+            
+            while get_tick_count() - start_time < timeout_ms && !is_interrupted() {
+                crate::net::process_packets();
+                
+                if let Some(state) = crate::net::tcp::get_state(local_port) {
+                    if state == crate::net::tcp::TcpState::Established {
+                        println!("Connection established! Local port: {}", local_port);
+                        println!("Use 'tcpsend {} <data>' to send data", local_port);
+                        println!("Use 'tcpclose {}' to close connection", local_port);
+                        return;
+                    }
+                }
+                
+                for _ in 0..10000 { core::hint::spin_loop(); }
+            }
+            
+            if is_interrupted() {
+                println!("Connection cancelled by user");
+                clear_interrupt();
+            } else {
+                println!("Connection timeout - no response from server");
+                println!("Note: With QEMU user-mode networking, only connections to");
+                println!("      the host (10.0.2.2) may work. Use TAP networking for");
+                println!("      connections to external servers.");
+            }
+        }
+        Err(e) => {
+            println!("Failed to initiate connection: {}", e);
+        }
+    }
+}
+
+fn cmd_tcpsend(args: &str) {
+    if args.is_empty() {
+        println!("Usage: tcpsend <local-port> <data>");
+        println!("Example: tcpsend 49152 GET / HTTP/1.0");
+        return;
+    }
+
+    let parts: Vec<&str> = args.splitn(2, ' ').collect();
+    if parts.len() < 2 {
+        println!("Error: Missing port or data");
+        return;
+    }
+
+    let port = match parts[0].parse::<u16>() {
+        Ok(p) => p,
+        Err(_) => {
+            println!("Invalid port number");
+            return;
+        }
+    };
+
+    let data = parts[1].as_bytes();
+    
+    match crate::net::tcp::send_data(port, data) {
+        Ok(_) => {
+            println!("Sent {} bytes on port {}", data.len(), port);
+            println!("Checking for response...");
+            
+            // Wait a bit for response
+            let start_time = get_tick_count();
+            let timeout_ms = 2000;
+            
+            while get_tick_count() - start_time < timeout_ms {
+                crate::net::process_packets();
+                
+                if let Some(recv_data) = crate::net::tcp::read_data(port) {
+                    println!("Received {} bytes:", recv_data.len());
+                    // Print as string if possible
+                    if let Ok(s) = core::str::from_utf8(&recv_data) {
+                        println!("{}", s);
+                    } else {
+                        println!("(binary data)");
+                    }
+                    return;
+                }
+                
+                for _ in 0..10000 { core::hint::spin_loop(); }
+            }
+            
+            println!("No response received (timeout)");
+        }
+        Err(e) => {
+            println!("Failed to send data: {}", e);
+        }
+    }
+}
+
+fn cmd_tcpclose(args: &str) {
+    if args.is_empty() {
+        println!("Usage: tcpclose <local-port>");
+        println!("Example: tcpclose 49152");
+        return;
+    }
+
+    let port = match args.trim().parse::<u16>() {
+        Ok(p) => p,
+        Err(_) => {
+            println!("Invalid port number");
+            return;
+        }
+    };
+
+    match crate::net::tcp::close(port) {
+        Ok(_) => println!("Closing connection on port {}", port),
+        Err(e) => println!("Failed to close connection: {}", e),
     }
 }

@@ -9,6 +9,7 @@ pub mod arp;
 pub mod ip;
 pub mod icmp;
 pub mod udp;
+pub mod tcp;
 
 use alloc::vec::Vec;
 use spin::Mutex;
