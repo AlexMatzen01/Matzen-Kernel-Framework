@@ -89,11 +89,17 @@ Running and testing the kernel
 Filesystem commands
 - `mkfs`       : Format disk with SimplFS
 - `mount`      : Mount the filesystem
-- `ls`/`dir`   : List files
+- `pwd`        : Print working directory
+- `ls`/`dir`   : List files in current directory
+- `cd <dir>`   : Change directory (supports `.`, `..`, `/`, and directory names)
+- `mkdir <d>`  : Create a directory
 - `touch <f>`  : Create a file
 - `cat <f>`    : Display file contents
 - `write <f> <text>`: Write to a file
+- `cp <s> <d>` : Copy a file
+- `mv <s> <d>` : Move/rename a file or directory
 - `rm <f>`     : Delete a file
+- `rmdir <d>`  : Delete an empty directory
 
 Network commands (see NETWORKING.md for details)
 - `ifconfig [ip]`: Configure/display network interface
