@@ -311,8 +311,23 @@ impl SimpleFilesystem {
             block_num += 1;
         }
 
-        // Clear root directory data block
-        let root_dir_buffer = [0u8; FS_BLOCK_SIZE];
+        // Initialize root directory data block with . and .. entries
+        let mut root_dir_buffer = [0u8; FS_BLOCK_SIZE];
+        
+        // Add "." entry (self) - root points to itself
+        let dot_entry = DirectoryEntry::new_with_name(".", 0);
+        unsafe {
+            let ptr = root_dir_buffer.as_mut_ptr() as *mut DirectoryEntry;
+            core::ptr::write_unaligned(ptr, dot_entry);
+        }
+
+        // Add ".." entry (parent) - root's parent is itself
+        let dotdot_entry = DirectoryEntry::new_with_name("..", 0);
+        unsafe {
+            let ptr = root_dir_buffer.as_mut_ptr().add(core::mem::size_of::<DirectoryEntry>()) as *mut DirectoryEntry;
+            core::ptr::write_unaligned(ptr, dotdot_entry);
+        }
+        
         device.write_blocks(data_block_start, 1, &root_dir_buffer)?;
 
         serial_println!("Filesystem formatted successfully");
@@ -1020,19 +1035,19 @@ impl SimpleFilesystem {
         Ok(())
     }
 
-    /// Move/rename a file
+    /// Move/rename a file or directory
     pub fn move_file(
         &mut self,
         device: &mut dyn crate::drivers::block::BlockDevice,
         src_name: &str,
         dst_name: &str,
     ) -> Result<(), &'static str> {
-        // Find source file
+        // Find source (can be file or directory)
         let files = self.list_directory(device, self.current_dir_inode)?;
         let src_info = files
             .iter()
-            .find(|f| f.name == src_name && !f.is_directory)
-            .ok_or("Source file not found")?;
+            .find(|f| f.name == src_name)
+            .ok_or("Source not found")?;
 
         let src_inode_num = src_info.inode_number;
 
@@ -1089,10 +1104,38 @@ impl SimpleFilesystem {
             .ok_or("Directory not found")?;
 
         let dir_inode_num = dir_info.inode_number;
+        let dir_inode = &self.inodes[dir_inode_num as usize];
 
         // Check if directory is empty (only . and .. entries)
-        let dir_files = self.list_directory(device, dir_inode_num)?;
-        if !dir_files.is_empty() {
+        // We need to check the raw directory entries, not use list_directory
+        // because that filters out . and ..
+        let dir_block_num = unsafe { core::ptr::addr_of!(dir_inode.direct_blocks[0]).read_unaligned() };
+        
+        if dir_block_num == 0 {
+            return Err("Directory has no data blocks");
+        }
+
+        let mut dir_buffer = [0u8; FS_BLOCK_SIZE];
+        device.read_blocks(dir_block_num, 1, &mut dir_buffer)?;
+
+        // Count entries - should only have . and ..
+        let entries_per_block = FS_BLOCK_SIZE / core::mem::size_of::<DirectoryEntry>();
+        let mut entry_count = 0;
+        
+        for i in 0..entries_per_block {
+            let offset = i * core::mem::size_of::<DirectoryEntry>();
+            let entry = unsafe {
+                let ptr = dir_buffer.as_ptr().add(offset) as *const DirectoryEntry;
+                core::ptr::read_unaligned(ptr)
+            };
+
+            if entry.is_used() {
+                entry_count += 1;
+            }
+        }
+
+        // Should have exactly 2 entries (. and ..)
+        if entry_count > 2 {
             return Err("Directory not empty");
         }
 

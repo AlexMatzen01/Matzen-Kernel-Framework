@@ -766,8 +766,8 @@ fn cmd_mkdir(dirname: &str) {
 
     if let Some(ref mut fs) = *fs_guard {
         match fs.create_directory(&mut device, dirname) {
-            Ok(inode_num) => {
-                println!("Created directory '{}' (inode {})", dirname, inode_num);
+            Ok(_) => {
+                println!("Created directory '{}'", dirname);
             }
             Err(e) => {
                 println!("Failed to create directory: {}", e);
@@ -793,8 +793,8 @@ fn cmd_touch(filename: &str) {
 
     if let Some(ref mut fs) = *fs_guard {
         match fs.create_file(&mut device, filename) {
-            Ok(inode_num) => {
-                println!("Created file '{}' (inode {})", filename, inode_num);
+            Ok(_) => {
+                println!("Created file '{}'", filename);
             }
             Err(e) => {
                 println!("Failed to create file: {}", e);
