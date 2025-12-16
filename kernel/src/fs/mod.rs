@@ -241,6 +241,7 @@ pub struct SimpleFilesystem {
     superblock: Superblock,
     inodes: Vec<Inode>,
     current_dir_inode: u32,
+    current_path: Vec<(u32, String)>, // Stack of (inode, name) for current path
 }
 
 impl SimpleFilesystem {
@@ -250,6 +251,7 @@ impl SimpleFilesystem {
             superblock: Superblock::new(0),
             inodes: Vec::new(),
             current_dir_inode: 0,
+            current_path: Vec::new(),
         }
     }
 
@@ -359,12 +361,31 @@ impl SimpleFilesystem {
             superblock,
             inodes,
             current_dir_inode: 0, // Start at root
+            current_path: Vec::new(), // Empty path means root
         })
     }
 
     /// Get current directory inode number
     pub fn current_directory(&self) -> u32 {
         self.current_dir_inode
+    }
+
+    /// Get current directory path as a string
+    pub fn current_path(&self) -> String {
+        if self.current_path.is_empty() {
+            String::from("/")
+        } else {
+            let mut path = String::from("/");
+            for (_, name) in &self.current_path {
+                path.push_str(name);
+                path.push('/');
+            }
+            // Remove trailing slash
+            if path.len() > 1 {
+                path.pop();
+            }
+            path
+        }
     }
 
     /// Change current directory
@@ -378,6 +399,50 @@ impl SimpleFilesystem {
         }
 
         self.current_dir_inode = inode;
+        Ok(())
+    }
+
+    /// Change directory by name (relative to current directory)
+    pub fn change_directory_by_name(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        name: &str,
+    ) -> Result<(), &'static str> {
+        if name == "." {
+            // Stay in current directory
+            return Ok(());
+        }
+
+        if name == ".." {
+            // Go to parent directory
+            if !self.current_path.is_empty() {
+                self.current_path.pop();
+                if self.current_path.is_empty() {
+                    self.current_dir_inode = 0; // Back to root
+                } else {
+                    self.current_dir_inode = self.current_path.last().unwrap().0;
+                }
+            }
+            return Ok(());
+        }
+
+        if name == "/" {
+            // Go to root
+            self.current_path.clear();
+            self.current_dir_inode = 0;
+            return Ok(());
+        }
+
+        // Find the directory in current directory
+        let files = self.list_directory(device, self.current_dir_inode)?;
+        let dir_info = files
+            .iter()
+            .find(|f| f.name == name && f.is_directory)
+            .ok_or("Directory not found")?;
+
+        // Update path and current directory
+        self.current_path.push((dir_info.inode_number, String::from(name)));
+        self.current_dir_inode = dir_info.inode_number;
         Ok(())
     }
 
@@ -572,7 +637,106 @@ impl SimpleFilesystem {
         self.inodes[inode_num as usize].blocks_used = 0;
 
         // Add directory entry
-        let dir_inode = &self.inodes[self.current_dir_inode as usize];
+        self.add_directory_entry(device, self.current_dir_inode, filename, inode_num)?;
+
+        // Update superblock
+        unsafe {
+            let free_inodes_ptr = core::ptr::addr_of!(self.superblock.free_inodes) as *mut u32;
+            let current_val = core::ptr::read_unaligned(free_inodes_ptr);
+            core::ptr::write_unaligned(free_inodes_ptr, current_val.saturating_sub(1));
+        }
+
+        // Write updates to disk
+        self.write_inodes(device)?;
+        self.write_superblock(device)?;
+
+        Ok(inode_num)
+    }
+
+    /// Create a new directory in the current directory
+    pub fn create_directory(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        dirname: &str,
+    ) -> Result<u32, &'static str> {
+        if dirname.len() >= MAX_FILENAME_LEN {
+            return Err("Directory name too long");
+        }
+
+        if dirname == "." || dirname == ".." || dirname == "/" {
+            return Err("Invalid directory name");
+        }
+
+        // Check if directory already exists
+        let files = self.list_directory(device, self.current_dir_inode)?;
+        for file in files {
+            if file.name == dirname {
+                return Err("Directory already exists");
+            }
+        }
+
+        // Find free inode
+        let inode_num = self.find_free_inode().ok_or("No free inodes")?;
+
+        // Find free data block for directory contents
+        let dir_block = self.find_free_data_block().ok_or("No free blocks")?;
+
+        // Create new directory inode
+        self.inodes[inode_num as usize] = Inode::new_directory();
+        self.inodes[inode_num as usize].size = 0;
+        self.inodes[inode_num as usize].blocks_used = 1;
+        self.inodes[inode_num as usize].direct_blocks[0] = dir_block;
+
+        // Initialize directory block with . and .. entries
+        let mut dir_buffer = [0u8; FS_BLOCK_SIZE];
+        
+        // Add "." entry (self)
+        let dot_entry = DirectoryEntry::new_with_name(".", inode_num);
+        unsafe {
+            let ptr = dir_buffer.as_mut_ptr() as *mut DirectoryEntry;
+            core::ptr::write_unaligned(ptr, dot_entry);
+        }
+
+        // Add ".." entry (parent)
+        let dotdot_entry = DirectoryEntry::new_with_name("..", self.current_dir_inode);
+        unsafe {
+            let ptr = dir_buffer.as_mut_ptr().add(core::mem::size_of::<DirectoryEntry>()) as *mut DirectoryEntry;
+            core::ptr::write_unaligned(ptr, dotdot_entry);
+        }
+
+        // Write directory block
+        device.write_blocks(dir_block, 1, &dir_buffer)?;
+
+        // Add directory entry in parent
+        self.add_directory_entry(device, self.current_dir_inode, dirname, inode_num)?;
+
+        // Update superblock
+        unsafe {
+            let free_inodes_ptr = core::ptr::addr_of!(self.superblock.free_inodes) as *mut u32;
+            let current_val = core::ptr::read_unaligned(free_inodes_ptr);
+            core::ptr::write_unaligned(free_inodes_ptr, current_val.saturating_sub(1));
+
+            let free_blocks_ptr = core::ptr::addr_of!(self.superblock.free_blocks) as *mut u64;
+            let current_blocks = core::ptr::read_unaligned(free_blocks_ptr);
+            core::ptr::write_unaligned(free_blocks_ptr, current_blocks.saturating_sub(1));
+        }
+
+        // Write updates to disk
+        self.write_inodes(device)?;
+        self.write_superblock(device)?;
+
+        Ok(inode_num)
+    }
+
+    /// Helper method to add a directory entry
+    fn add_directory_entry(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        dir_inode_num: u32,
+        name: &str,
+        inode_num: u32,
+    ) -> Result<(), &'static str> {
+        let dir_inode = &self.inodes[dir_inode_num as usize];
 
         // Read first directory block
         let dir_block_num =
@@ -598,7 +762,7 @@ impl SimpleFilesystem {
 
             if !entry.is_used() {
                 // Found empty slot, add entry
-                let new_entry = DirectoryEntry::new_with_name(filename, inode_num);
+                let new_entry = DirectoryEntry::new_with_name(name, inode_num);
                 
                 unsafe {
                     let ptr = dir_buffer.as_mut_ptr().add(offset) as *mut DirectoryEntry;
@@ -615,19 +779,7 @@ impl SimpleFilesystem {
 
         // Write directory block back
         device.write_blocks(dir_block_num, 1, &dir_buffer)?;
-
-        // Update superblock
-        unsafe {
-            let free_inodes_ptr = core::ptr::addr_of!(self.superblock.free_inodes) as *mut u32;
-            let current_val = core::ptr::read_unaligned(free_inodes_ptr);
-            core::ptr::write_unaligned(free_inodes_ptr, current_val.saturating_sub(1));
-        }
-
-        // Write updates to disk
-        self.write_inodes(device)?;
-        self.write_superblock(device)?;
-
-        Ok(inode_num)
+        Ok(())
     }
 
     /// Write data to a file
@@ -815,6 +967,163 @@ impl SimpleFilesystem {
 
         // Write directory block back
         device.write_blocks(dir_block_num, 1, &dir_buffer)?;
+
+        // Update superblock
+        unsafe {
+            let free_inodes_ptr = core::ptr::addr_of!(self.superblock.free_inodes) as *mut u32;
+            let current_inodes = core::ptr::read_unaligned(free_inodes_ptr);
+            core::ptr::write_unaligned(free_inodes_ptr, current_inodes.saturating_add(1));
+
+            let free_blocks_ptr = core::ptr::addr_of!(self.superblock.free_blocks) as *mut u64;
+            let current_blocks = core::ptr::read_unaligned(free_blocks_ptr);
+            core::ptr::write_unaligned(
+                free_blocks_ptr,
+                current_blocks.saturating_add(blocks_used as u64),
+            );
+        }
+
+        // Write updates to disk
+        self.write_inodes(device)?;
+        self.write_superblock(device)?;
+
+        Ok(())
+    }
+
+    /// Copy a file to a new location
+    pub fn copy_file(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        src_name: &str,
+        dst_name: &str,
+    ) -> Result<(), &'static str> {
+        // Read source file
+        let data = self.read_file(device, src_name)?;
+        
+        // Check if destination already exists
+        let files = self.list_directory(device, self.current_dir_inode)?;
+        if files.iter().any(|f| f.name == dst_name) {
+            return Err("Destination already exists");
+        }
+
+        // Create destination file
+        let dst_inode = self.create_file(device, dst_name)?;
+
+        // Write data to destination
+        self.write_file_by_inode(device, dst_inode, &data)?;
+
+        Ok(())
+    }
+
+    /// Move/rename a file
+    pub fn move_file(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        src_name: &str,
+        dst_name: &str,
+    ) -> Result<(), &'static str> {
+        // Find source file
+        let files = self.list_directory(device, self.current_dir_inode)?;
+        let src_info = files
+            .iter()
+            .find(|f| f.name == src_name && !f.is_directory)
+            .ok_or("Source file not found")?;
+
+        let src_inode_num = src_info.inode_number;
+
+        // Check if destination already exists
+        if files.iter().any(|f| f.name == dst_name) {
+            return Err("Destination already exists");
+        }
+
+        // Remove old directory entry and add new one
+        let dir_inode = &self.inodes[self.current_dir_inode as usize];
+        let dir_block_num =
+            unsafe { core::ptr::addr_of!(dir_inode.direct_blocks[0]).read_unaligned() };
+
+        let mut dir_buffer = [0u8; FS_BLOCK_SIZE];
+        device.read_blocks(dir_block_num, 1, &mut dir_buffer)?;
+
+        // Find and update the directory entry
+        let entries_per_block = FS_BLOCK_SIZE / core::mem::size_of::<DirectoryEntry>();
+        for i in 0..entries_per_block {
+            let offset = i * core::mem::size_of::<DirectoryEntry>();
+            let entry = unsafe {
+                let ptr = dir_buffer.as_ptr().add(offset) as *const DirectoryEntry;
+                core::ptr::read_unaligned(ptr)
+            };
+
+            if entry.is_used() && entry.inode_number == src_inode_num {
+                // Update this entry with new name
+                let new_entry = DirectoryEntry::new_with_name(dst_name, src_inode_num);
+                unsafe {
+                    let ptr = dir_buffer.as_mut_ptr().add(offset) as *mut DirectoryEntry;
+                    core::ptr::write_unaligned(ptr, new_entry);
+                }
+                break;
+            }
+        }
+
+        // Write directory block back
+        device.write_blocks(dir_block_num, 1, &dir_buffer)?;
+
+        Ok(())
+    }
+
+    /// Delete a directory (must be empty)
+    pub fn delete_directory(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        dirname: &str,
+    ) -> Result<(), &'static str> {
+        // Find the directory
+        let files = self.list_directory(device, self.current_dir_inode)?;
+        let dir_info = files
+            .iter()
+            .find(|f| f.name == dirname && f.is_directory)
+            .ok_or("Directory not found")?;
+
+        let dir_inode_num = dir_info.inode_number;
+
+        // Check if directory is empty (only . and .. entries)
+        let dir_files = self.list_directory(device, dir_inode_num)?;
+        if !dir_files.is_empty() {
+            return Err("Directory not empty");
+        }
+
+        // Clear the inode
+        let inode = &mut self.inodes[dir_inode_num as usize];
+        let blocks_used = inode.blocks_used;
+        *inode = Inode::new(); // Clear to empty
+
+        // Remove directory entry from parent
+        let parent_inode = &self.inodes[self.current_dir_inode as usize];
+        let parent_block_num =
+            unsafe { core::ptr::addr_of!(parent_inode.direct_blocks[0]).read_unaligned() };
+
+        let mut dir_buffer = [0u8; FS_BLOCK_SIZE];
+        device.read_blocks(parent_block_num, 1, &mut dir_buffer)?;
+
+        // Find and clear the directory entry
+        let entries_per_block = FS_BLOCK_SIZE / core::mem::size_of::<DirectoryEntry>();
+        for i in 0..entries_per_block {
+            let offset = i * core::mem::size_of::<DirectoryEntry>();
+            let entry = unsafe {
+                let ptr = dir_buffer.as_ptr().add(offset) as *const DirectoryEntry;
+                core::ptr::read_unaligned(ptr)
+            };
+
+            if entry.is_used() && entry.inode_number == dir_inode_num {
+                // Clear this entry
+                unsafe {
+                    let ptr = dir_buffer.as_mut_ptr().add(offset) as *mut DirectoryEntry;
+                    core::ptr::write_unaligned(ptr, DirectoryEntry::new());
+                }
+                break;
+            }
+        }
+
+        // Write directory block back
+        device.write_blocks(parent_block_num, 1, &dir_buffer)?;
 
         // Update superblock
         unsafe {
