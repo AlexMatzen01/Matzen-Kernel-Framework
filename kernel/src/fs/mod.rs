@@ -495,6 +495,12 @@ impl SimpleFilesystem {
                     }
                     
                     let name = entry.get_name()?;
+                    
+                    // Skip . and .. entries in listings (but keep them in the directory)
+                    if name == "." || name == ".." {
+                        continue;
+                    }
+                    
                     let entry_inode = &self.inodes[entry.inode_number as usize];
 
                     files.push(FileInfo {
