@@ -258,7 +258,15 @@ impl SimpleFilesystem {
         use crate::serial_println;
 
         let total_blocks = device.block_count();
-        let superblock = Superblock::new(total_blocks);
+        let mut superblock = Superblock::new(total_blocks);
+        
+        // Reserve 1 block for root directory
+        unsafe {
+            let free_ptr = core::ptr::addr_of_mut!(superblock.free_blocks);
+            let current = free_ptr.read_unaligned();
+            free_ptr.write_unaligned(current.saturating_sub(1));
+        }
+
         let data_block_start =
             unsafe { core::ptr::addr_of!(superblock.data_block_start).read_unaligned() };
         let free_blocks = unsafe { core::ptr::addr_of!(superblock.free_blocks).read_unaligned() };
@@ -469,6 +477,8 @@ impl SimpleFilesystem {
         &mut self,
         device: &mut dyn crate::drivers::block::BlockDevice,
     ) -> Result<(), &'static str> {
+        use crate::serial_println;
+        
         let inode_blocks = unsafe { core::ptr::addr_of!(self.superblock.inode_blocks).read_unaligned() };
         let inode_table_size = (inode_blocks as usize) * FS_BLOCK_SIZE;
         let mut inode_buffer = alloc::vec![0u8; inode_table_size];
@@ -486,7 +496,7 @@ impl SimpleFilesystem {
                 self.inodes[i] = core::ptr::read_unaligned(ptr.add(i));
             }
         }
-
+        
         Ok(())
     }
 
@@ -495,10 +505,13 @@ impl SimpleFilesystem {
         &self,
         device: &mut dyn crate::drivers::block::BlockDevice,
     ) -> Result<(), &'static str> {
+        // Only write the portion of the inode table that actually exists on disk.
+        // Writing past superblock.inode_blocks would overwrite data blocks (bug).
+        let inode_table_bytes = (self.superblock.inode_blocks as usize) * FS_BLOCK_SIZE;
         let inode_bytes = unsafe {
             core::slice::from_raw_parts(
                 self.inodes.as_ptr() as *const u8,
-                MAX_INODES * core::mem::size_of::<Inode>(),
+                inode_table_bytes,
             )
         };
 
@@ -587,11 +600,6 @@ impl SimpleFilesystem {
                 // Found empty slot, add entry
                 let new_entry = DirectoryEntry::new_with_name(filename, inode_num);
                 
-                // Debug: log what we're writing
-                use crate::serial_println;
-                let inode_copy = new_entry.inode_number;
-                serial_println!("Creating directory entry: inode={}, name={}", inode_copy, filename);
-                
                 unsafe {
                     let ptr = dir_buffer.as_mut_ptr().add(offset) as *mut DirectoryEntry;
                     core::ptr::write_unaligned(ptr, new_entry);
@@ -623,6 +631,7 @@ impl SimpleFilesystem {
     }
 
     /// Write data to a file
+    /// Write data to a file
     pub fn write_file(
         &mut self,
         device: &mut dyn crate::drivers::block::BlockDevice,
@@ -637,6 +646,28 @@ impl SimpleFilesystem {
             .map(|f| f.inode_number)
             .ok_or("File not found")?;
 
+        self.write_file_by_inode(device, file_inode_num, data)
+    }
+
+    /// Write data to a file by inode number (avoids directory lookup)
+    pub fn write_file_by_inode(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        file_inode_num: u32,
+        data: &[u8],
+    ) -> Result<(), &'static str> {
+        use crate::serial_println;
+        // Validate inode number
+        if file_inode_num as usize >= MAX_INODES {
+            return Err("Invalid inode number");
+        }
+        
+        // Check if inode is actually used
+        let inode = &self.inodes[file_inode_num as usize];
+        if !inode.is_used() {
+            return Err("Inode not in use");
+        }
+        
         if data.len() > INODE_DIRECT_BLOCKS * FS_BLOCK_SIZE {
             return Err("File too large");
         }

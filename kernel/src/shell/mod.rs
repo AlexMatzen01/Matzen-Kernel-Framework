@@ -805,20 +805,26 @@ fn cmd_write(args: &str) {
             }
         };
 
-        let file_exists = files.iter().any(|f| f.name == filename && !f.is_directory);
-
-        if !file_exists {
+        let file_info = files.iter().find(|f| f.name == filename && !f.is_directory);
+        let inode_num = if let Some(info) = file_info {
+            // File exists, use existing inode
+            info.inode_number
+        } else {
+            // File doesn't exist, create it
             match fs.create_file(&mut device, filename) {
-                Ok(_) => println!("Created new file '{}'", filename),
+                Ok(inode) => {
+                    println!("Created new file '{}'", filename);
+                    inode
+                }
                 Err(e) => {
                     println!("Failed to create file: {}", e);
                     return;
                 }
             }
-        }
+        };
 
-        // Write data to file
-        match fs.write_file(&mut device, filename, content.as_bytes()) {
+        // Write data to file using inode number directly
+        match fs.write_file_by_inode(&mut device, inode_num, content.as_bytes()) {
             Ok(()) => {
                 println!("Wrote {} bytes to '{}'", content.len(), filename);
             }
