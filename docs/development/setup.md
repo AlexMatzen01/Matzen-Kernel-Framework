@@ -218,7 +218,7 @@ EOF
 
 ### 5. Release Build
 ```bash
-cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zbuild-std=core,alloc --release
+cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zjson-target-spec -Zbuild-std=core,alloc --release
 ```
 
 ## Code Style

@@ -75,6 +75,7 @@ fn main() {
         // Run in QEMU
         // Boot disk on IDE0 master (hda), data disk on IDE0 slave (hdb)
         println!("Running in QEMU...");
+        println!("Networking: user-mode NAT (internet + LAN outbound), unrestricted");
         let mut qemu = Command::new("qemu-system-x86_64")
             .args([
                 "-drive",
@@ -93,9 +94,7 @@ fn main() {
                 "-device",
                 "e1000,netdev=net0",
                 "-netdev",
-                "user,id=net0,restrict=off,hostfwd=udp::5555-:5555",
-                "-net",
-                "user,hostfwd=tcp::49152-:49152",
+                "user,id=net0,restrict=off,hostfwd=udp::5555-:5555,hostfwd=tcp::49152-:49152",
             ])
             .spawn()
             .expect("Failed to start QEMU");

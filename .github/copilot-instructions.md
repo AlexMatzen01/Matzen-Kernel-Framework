@@ -12,7 +12,7 @@ Purpose: get an AI coding agent productive quickly in this repo. Focus on concre
   - Install helper (sets up nightly + components): `./install.sh`
   - Full build: `./build.sh`
   - Manual kernel build (required flags):
-    `cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem`
+    `cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zjson-target-spec -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem`
   - Build runner: `cargo build -p mfk-runner --release`
   - Create and run image (runner):
     `cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel`

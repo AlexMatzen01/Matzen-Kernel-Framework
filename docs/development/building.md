@@ -19,7 +19,7 @@ Main build script that orchestrates the entire process.
 ```bash
 #!/bin/bash
 # 1. Compile kernel in release mode
-cargo build -p mfk-kernel --release --target targets/x86_64-mfk.json
+cargo build -p mfk-kernel --release --target targets/x86_64-mfk.json -Zjson-target-spec
 
 # 2. Create disk image if missing
 qemu-img create -f raw target/disk.img 10M 2>/dev/null || true

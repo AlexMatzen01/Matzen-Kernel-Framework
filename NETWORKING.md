@@ -120,7 +120,13 @@ The kernel runs with QEMU's user-mode networking:
 - DNS server: 10.0.2.3
 - Suggested kernel IP: 10.0.2.15
 
-Port forwarding is configured for UDP port 5555.
+Port forwarding is configured by default for:
+- UDP `5555` -> guest `5555`
+- TCP `49152` -> guest `49152`
+
+`run.sh` uses unrestricted user-mode networking (`restrict=off`) so the guest can make outbound internet and LAN connections without additional setup.
+
+Note: ICMP echo replies (ping) are still limited by QEMU user-mode networking. For reliable ICMP testing, use TAP mode (`run_with_tap.sh`).
 
 ## Implementation Details
 
