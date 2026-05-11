@@ -1,8 +1,13 @@
 # Matzen Kernel Framework (MFK)
 
-A small educational terminal OS written in Rust for x86_64. MFK contains a tiny kernel (`mfk-kernel`) with VGA driver, PS/2 keyboard support, ATA disk driver, filesystem, networking (E1000), and a built-in shell. The `mfk-runner` tool builds bootable disk images and runs them in QEMU.
+A small educational terminal OS written in Rust for x86_64. MFK contains a tiny kernel (`mfk-kernel`) with VGA driver, PS/2 keyboard support, ATA disk driver, filesystem, networking (E1000), and a built-in shell. The `mfk-runner` tool builds bootable disk images and runs them in **VirtualBox** (or optionally QEMU).
 
 **Status:** active development — use for experimentation and learning.
+
+**Platform Support:**
+- ✅ **Windows:** PowerShell (`.ps1`) or Batch (`.bat`) scripts
+- ✅ **Linux/macOS:** Bash (`.sh`) scripts
+- ✅ **All platforms:** Direct `cargo` commands
 
 ## Features
 - VGA text mode output
@@ -15,78 +20,223 @@ A small educational terminal OS written in Rust for x86_64. MFK contains a tiny 
 
 **Repository layout (important files):**
 
-- `Cargo.toml`           : Workspace configuration (members: `kernel`, `tools`)
-- `kernel/`              : Kernel crate (`mfk-kernel`)
-- `tools/`               : Runner tool (`mfk-runner`) — creates disk images and runs QEMU
+- `Cargo.toml`              : Workspace configuration (members: `kernel`, `tools`)
+- `kernel/`                 : Kernel crate (`mfk-kernel`)
+- `tools/`                  : Runner tool (`mfk-runner`) — creates disk images and runs VirtualBox/QEMU
 - `targets/x86_64-mfk.json` : Custom target specification used for building the kernel
-- `build.sh`             : Convenience script to build kernel + runner
-- `run.sh`               : Convenience script to run `mfk-runner` with a kernel path
-- `install.sh`           : Convenience script to install Rust/nightly components
-- `test_commands.txt`    : Example shell commands to exercise the kernel's filesystem/shell
-- `NETWORKING.md`        : Networking documentation and usage guide
+- `build.sh` / `build.ps1` / `build.bat` : Build scripts (choose your OS)
+- `run.sh` / `run.ps1` / `run.bat`       : Run scripts (choose your OS)
+- `install.sh` / `install.ps1` / `install.bat` : Setup scripts (choose your OS)
+- `test_commands.txt`       : Example shell commands to exercise the kernel's filesystem/shell
+- `NETWORKING.md`           : Networking documentation and usage guide
+- `VIRTUALBOX_SETUP.md`     : VirtualBox setup and configuration guide
+- `WINDOWS_SUPPORT.md`      : Complete Windows support guide (batch + PowerShell)
 
-Prerequisites
-- Linux or macOS (QEMU required for running the image)
-- Rust (we use nightly for building the kernel)
-- `qemu-system-x86_64` and `qemu-img` available in `PATH`
+## Prerequisites
 
-Quick setup
-1. Install the nightly toolchain and required components (or run the helper):
+### Core Requirements
+- Rust (nightly) and build tools
+- **VirtualBox** (default hypervisor, provides unrestricted networking)
+  - Alternative: QEMU (use `./run.sh --qemu`)
+
+### Installation by Platform
+
+**Linux:**
+```bash
+# Install VirtualBox
+sudo apt-get install virtualbox virtualbox-dkms  # Debian/Ubuntu
+sudo dnf install virtualbox                       # Fedora/RHEL
+```
+
+**macOS:**
+```bash
+brew install virtualbox
+```
+
+**Windows:**
+```bash
+choco install virtualbox
+# or download from https://www.virtualbox.org/wiki/Downloads
+```
+
+**Verify Installation:**
+```bash
+VBoxManage --version
+```
+
+## Quick Start
+
+### On Windows (Choose One)
+
+#### Option 1: Command Prompt (Simplest)
+
+```batch
+install.bat
+build.bat
+run.bat
+```
+
+See [CMD_QUICKSTART.md](CMD_QUICKSTART.md) for details.
+
+#### Option 2: PowerShell (More Features)
+
+```powershell
+.\install.ps1
+.\build.ps1
+.\run.ps1
+```
+
+See [POWERSHELL_QUICKSTART.md](POWERSHELL_QUICKSTART.md) for details.
+
+**Note:** If PowerShell gives a script execution error, run first:
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+#### Option 3: Direct Cargo Commands (Advanced)
+
+```batch
+# Install prerequisites
+rustup toolchain install nightly
+rustup component add rust-src llvm-tools-preview --toolchain nightly
+
+# Build
+cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zjson-target-spec -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
+cargo build -p mfk-runner --release
+
+# Run
+cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel
+```
+
+### On Linux/macOS (Bash)
 
 ```bash
 ./install.sh
-```
-
-2. Build everything (kernel + runner):
-
-```bash
 ./build.sh
+./run.sh
 ```
 
-Manual build steps
+The runner will automatically:
+- Create bootable disk images
+- Convert to VirtualBox format (VDI)
+- Create a new VM with bridged networking
+- Boot the kernel
 
-- Build the kernel (required flags for no-std build):
+4. Inside the kernel shell, configure networking:
 
 ```bash
+# DHCP (recommended)
+dhclient eth0
+
+# Or static IP
+ifconfig eth0 192.168.1.100/24
+route add default 192.168.1.1
+
+# Test connectivity
+ping 8.8.8.8
+ping google.com
+```
+
+For more details, see [VIRTUALBOX_SETUP.md](VIRTUALBOX_SETUP.md).
+
+## Switching Between Hypervisors
+
+VirtualBox is the default for better networking support. To use QEMU:
+
+**PowerShell:**
+```powershell
+.\run.ps1 --qemu
+```
+
+**Bash:**
+```bash
+./run.sh --qemu
+```
+
+Both use the same kernel binary and disk images.
+
+## Manual Build Steps
+
+**PowerShell (Windows):**
+```powershell
+# Build kernel
 cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zjson-target-spec -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
-```
 
-- Build the runner tool (release recommended):
-
-```bash
+# Build runner
 cargo build -p mfk-runner --release
 ```
 
-Using the runner (`mfk-runner`)
-
-The runner creates both UEFI and BIOS bootable disk images from a kernel binary and — by default — will launch QEMU to run the BIOS image. The runner usage is:
-
+**Bash (Linux/macOS):**
 ```bash
-cargo run -p mfk-runner --release -- <path-to-kernel-binary> [--no-run]
+cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zjson-target-spec -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
+
+cargo build -p mfk-runner --release
 ```
 
-Examples (after building the kernel):
+## Using the Runner
 
-```bash
-# Run and boot the kernel in QEMU (uses target/x86_64-mfk/debug/mfk-kernel by default path shown in examples)
-cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel
+The runner creates BIOS and UEFI bootable disk images and runs them in VirtualBox (or QEMU).
 
-# Only create disk images, don't start QEMU:
+**PowerShell (Windows):**
+```powershell
+# Run in VirtualBox (default)
+.\run.ps1
+
+# Run with QEMU
+.\run.ps1 --qemu
+
+# Custom kernel path
+.\run.ps1 target/x86_64-mfk/release/mfk-kernel
+
+# Only create images, don't run
 cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel --no-run
-
-# Helper script (runs the above):
-./run.sh target/x86_64-mfk/debug/mfk-kernel
 ```
 
-What `mfk-runner` does
+**Bash (Linux/macOS):**
+```bash
+# Run in VirtualBox (default)
+./run.sh
+
+# Run with QEMU
+./run.sh --qemu
+
+# Custom kernel path
+./run.sh target/x86_64-mfk/release/mfk-kernel
+
+# Only create images, don't run
+cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel --no-run
+```
+
+## What `mfk-runner` Does
+
 - Creates UEFI and BIOS disk images named like `<kernel-path>-uefi.img` and `<kernel-path>-bios.img`.
-- Creates/uses a small `target/disk.img` (10MB) for data; if the file doesn't exist the runner will attempt to create it using `qemu-img`.
-- When not passed `--no-run`, `mfk-runner` launches QEMU with the BIOS disk image attached as the primary drive and the `disk.img` attached as a secondary disk. QEMU is invoked with serial redirected to stdio.
+- Converts BIOS image to VirtualBox VDI format (`<kernel-path>-bios.img.vdi`).
+- Creates/uses a small `target/disk.vdi` (10MB) for data storage.
+- When not passed `--no-run`, `mfk-runner` launches the VM:
+  - **VirtualBox (default):** Creates a new VM with bridged networking, full Layer 2 access, and unrestricted ICMP/ping support.
+  - **QEMU (with `--qemu`):** Uses user-mode networking with limited ICMP support; useful for comparison testing.
+- Serial output is logged to `target/mfk-serial.log` (VirtualBox) or redirected to stdio (QEMU).
 
-Running and testing the kernel
-- Boot the image in QEMU (see example above). The kerne
+## Running and Testing the Kernel
 
-Filesystem commands
+1. **Boot the VM in VirtualBox** (see [VIRTUALBOX_SETUP.md](VIRTUALBOX_SETUP.md) for detailed networking setup):
+   ```bash
+   ./run.sh
+   ```
+
+2. **Configure networking inside the kernel:**
+   ```bash
+   dhclient eth0    # Get IP via DHCP
+   ping 8.8.8.8     # Test connectivity
+   ```
+
+3. **Use the shell** to test filesystem, network, and system commands.
+
+See [test_commands.txt](test_commands.txt) for quick smoke tests and [NETWORKING.md](NETWORKING.md) for protocol details.
+
+## Available Commands
+
+**Filesystem commands:**
 - `mkfs`       : Format disk with SimplFS
 - `mount`      : Mount the filesystem
 - `ls`/`dir`   : List files
@@ -95,13 +245,12 @@ Filesystem commands
 - `write <f> <text>`: Write to a file
 - `rm <f>`     : Delete a file
 
-Network commands (see NETWORKING.md for details)
+**Network commands** (see [NETWORKING.md](NETWORKING.md) for details):
 - `ifconfig [ip]`: Configure/display network interface
 - `ping <ip>`  : Send ICMP echo request
-- `netstat`    : Display network statusl prints to the serial/VGA and exposes a simple shell.
-- Use `test_commands.txt` for quick filesystem/shell smoke tests (examples: `mkfs`, `mount`, `write`, `cat`, `ls`).
+- `netstat`    : Display network status
 
-Shell commands (common)
+**Shell commands:**
 - `help`       : Show available shell commands
 - `clear`/`cls`: Clear the screen
 - `echo <x>`   : Print text
@@ -110,17 +259,23 @@ Shell commands (common)
 - `mem`/`memory`: Show memory info
 - `reboot`, `halt`, `shutdown`: System control commands
 
-Development notes
-- The `kernel` crate (`mfk-kernel`) depends on `bootloader_api`, and is configured as the binary named `mfk-kernel` (see `kernel/Cargo.toml`).
-- The `tools` crate (`mfk-runner`) depends on `bootloader` and implements helpers to create UEFI/BIOS disk images and launch QEMU.
+## Development Architecture
 
-Contributing
-- Fork the repository, create a branch, and open a pull request. Keep changes small and focused.
+- The `kernel` crate (`mfk-kernel`) depends on `bootloader_api`, configured as binary `mfk-kernel` (see [kernel/Cargo.toml](kernel/Cargo.toml)).
+- The `tools` crate (`mfk-runner`) depends on `bootloader` and implements disk image creation + VM launch logic.
+- For architecture details, see [docs/reference/architecture.md](docs/reference/architecture.md).
 
-License
-- MIT License — see `LICENSE` for details.
+## Contributing
 
-Contact / author
+- Fork the repository, create a branch, and open a pull request.
+- Keep changes small and focused.
+- For questions or issues, check [docs/development/troubleshooting.md](docs/development/troubleshooting.md).
+
+## License
+
+- MIT License — see [LICENSE](LICENSE) for details.
+
+## Contact / Author
 - Alexander Matzen — repository owner
 
 If anything in this README is out of date, please open an issue or send a PR with suggested corrections.
