@@ -135,10 +135,16 @@ fn execute_command(cmd: &str) {
         "mkfs" => cmd_mkfs(),
         "mount" => cmd_mount(),
         "ls" | "dir" => cmd_ls(),
+        "pwd" => cmd_pwd(),
+        "cd" => cmd_cd(parts.1),
+        "mkdir" => cmd_mkdir(parts.1),
         "touch" => cmd_touch(parts.1),
         "cat" => cmd_cat(parts.1),
         "write" => cmd_write(parts.1),
         "rm" => cmd_rm(parts.1),
+        "rmdir" => cmd_rmdir(parts.1),
+        "cp" => cmd_cp(parts.1),
+        "mv" => cmd_mv(parts.1),
         "ifconfig" => cmd_ifconfig(parts.1),
         "ping" => cmd_ping(parts.1),
         "netstat" => cmd_netstat(),
@@ -179,10 +185,16 @@ fn cmd_help() {
     println!("  mkfs      - Format the disk with SimplFS");
     println!("  mount     - Mount the filesystem");
     println!("  ls/dir    - List files in current directory");
+    println!("  pwd       - Print current working directory");
+    println!("  cd        - Change directory (e.g., 'cd mydir', 'cd ..', 'cd /')");
+    println!("  mkdir     - Create a directory (e.g., 'mkdir mydir')");
     println!("  touch     - Create a new file (e.g., 'touch test.txt')");
     println!("  cat       - Display file contents (e.g., 'cat test.txt')");
     println!("  write     - Write text to file (e.g., 'write test.txt Hello World')");
     println!("  rm        - Delete a file (e.g., 'rm test.txt')");
+    println!("  rmdir     - Delete an empty directory (e.g., 'rmdir mydir')");
+    println!("  cp        - Copy a file (e.g., 'cp source.txt dest.txt')");
+    println!("  mv        - Move/rename a file (e.g., 'mv old.txt new.txt')");
     println!();
     println!("Network Commands:");
     println!("  ifconfig     - Configure network interface (e.g., 'ifconfig 10.0.2.15')");
@@ -696,6 +708,74 @@ fn cmd_ls() {
     }
 }
 
+/// Print current working directory
+fn cmd_pwd() {
+    let fs_guard = FILESYSTEM.lock();
+
+    if let Some(ref fs) = *fs_guard {
+        println!("{}", fs.current_path());
+    } else {
+        println!("Filesystem not mounted. Use 'mount' first.");
+    }
+}
+
+/// Change directory
+fn cmd_cd(dirname: &str) {
+    if dirname.is_empty() {
+        println!("Usage: cd <directory>");
+        println!("  cd ..    - Go to parent directory");
+        println!("  cd /     - Go to root directory");
+        println!("  cd name  - Go to subdirectory");
+        return;
+    }
+
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+
+    if let Some(ref mut fs) = *fs_guard {
+        match fs.change_directory_by_name(&mut device, dirname) {
+            Ok(()) => {
+                // Successfully changed directory
+            }
+            Err(e) => {
+                println!("Failed to change directory: {}", e);
+            }
+        }
+    }
+}
+
+/// Create a new directory
+fn cmd_mkdir(dirname: &str) {
+    if dirname.is_empty() {
+        println!("Usage: mkdir <directory>");
+        return;
+    }
+
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+
+    if let Some(ref mut fs) = *fs_guard {
+        match fs.create_directory(&mut device, dirname) {
+            Ok(_) => {
+                println!("Created directory '{}'", dirname);
+            }
+            Err(e) => {
+                println!("Failed to create directory: {}", e);
+            }
+        }
+    }
+}
+
 /// Create a new file
 fn cmd_touch(filename: &str) {
     if filename.is_empty() {
@@ -713,8 +793,8 @@ fn cmd_touch(filename: &str) {
 
     if let Some(ref mut fs) = *fs_guard {
         match fs.create_file(&mut device, filename) {
-            Ok(inode_num) => {
-                println!("Created file '{}' (inode {})", filename, inode_num);
+            Ok(_) => {
+                println!("Created file '{}'", filename);
             }
             Err(e) => {
                 println!("Failed to create file: {}", e);
@@ -857,6 +937,97 @@ fn cmd_rm(filename: &str) {
             }
             Err(e) => {
                 println!("Failed to delete file: {}", e);
+            }
+        }
+    }
+}
+
+/// Delete a directory
+fn cmd_rmdir(dirname: &str) {
+    if dirname.is_empty() {
+        println!("Usage: rmdir <directory>");
+        return;
+    }
+
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+
+    if let Some(ref mut fs) = *fs_guard {
+        match fs.delete_directory(&mut device, dirname) {
+            Ok(()) => {
+                println!("Deleted directory '{}'", dirname);
+            }
+            Err(e) => {
+                println!("Failed to delete directory: {}", e);
+            }
+        }
+    }
+}
+
+/// Copy a file
+fn cmd_cp(args: &str) {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+
+    if parts.len() < 2 {
+        println!("Usage: cp <source> <destination>");
+        return;
+    }
+
+    let src = parts[0];
+    let dst = parts[1];
+
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+
+    if let Some(ref mut fs) = *fs_guard {
+        match fs.copy_file(&mut device, src, dst) {
+            Ok(()) => {
+                println!("Copied '{}' to '{}'", src, dst);
+            }
+            Err(e) => {
+                println!("Failed to copy file: {}", e);
+            }
+        }
+    }
+}
+
+/// Move/rename a file
+fn cmd_mv(args: &str) {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+
+    if parts.len() < 2 {
+        println!("Usage: mv <source> <destination>");
+        return;
+    }
+
+    let src = parts[0];
+    let dst = parts[1];
+
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+
+    if let Some(ref mut fs) = *fs_guard {
+        match fs.move_file(&mut device, src, dst) {
+            Ok(()) => {
+                println!("Moved '{}' to '{}'", src, dst);
+            }
+            Err(e) => {
+                println!("Failed to move file: {}", e);
             }
         }
     }

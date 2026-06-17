@@ -1,0 +1,34 @@
+mkfs
+mount
+pwd
+mkdir test_dir
+ls
+cd test_dir
+pwd
+touch file1.txt
+write file1.txt Hello from test_dir
+cat file1.txt
+ls
+cd ..
+pwd
+ls
+mkdir dir1
+mkdir dir2
+touch root_file.txt
+write root_file.txt Root level file
+ls
+cp root_file.txt copy_file.txt
+ls
+mv copy_file.txt renamed_file.txt
+ls
+cat renamed_file.txt
+cd dir1
+pwd
+touch file_in_dir1.txt
+write file_in_dir1.txt Inside directory 1
+cd ..
+cd dir1
+ls
+cd ..
+rmdir dir2
+ls
