@@ -23,7 +23,8 @@ fn main() {
         eprintln!("Error: Kernel binary not found at: {}", args[1]);
         eprintln!();
         eprintln!("Make sure you've built the kernel first:");
-        eprintln!("  cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem");
+        eprintln!("  ./build.sh");
+        eprintln!("  # or: cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem");
         eprintln!();
         eprintln!("Then run with the correct path:");
         eprintln!("  cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel");
@@ -40,6 +41,7 @@ fn main() {
     };
 
     let no_run = args.iter().any(|a| a == "--no-run");
+    let force = args.iter().any(|a| a == "--force");
 
     // Create disk image paths
     let uefi_path = format!("{}-uefi.img", args[1]);
@@ -66,7 +68,7 @@ fn main() {
 
     if !no_run {
         match hypervisor {
-            "vbox" => run_virtualbox(&bios_path, kernel_path),
+            "vbox" => run_virtualbox(&bios_path, kernel_path, force),
             "qemu" => run_qemu(&bios_path),
             _ => {
                 eprintln!("Unknown hypervisor: {}", hypervisor);
@@ -83,18 +85,53 @@ fn print_usage(program: &str) {
     eprintln!("  --vbox, --virtualbox  Run in VirtualBox (default)");
     eprintln!("  --qemu                Run in QEMU");
     eprintln!("  --no-run              Only create disk images, don't run");
+    eprintln!("  --force               Force rebuild VDI/VM (fixes stale kernel)");
     eprintln!();
     eprintln!("Example:");
     eprintln!("  {} target/x86_64-mfk/debug/mfk-kernel --vbox", program);
     eprintln!("  {} target/x86_64-mfk/debug/mfk-kernel --qemu", program);
+    eprintln!("  {} target/x86_64-mfk/debug/mfk-kernel --force  # purge stale VDI", program);
 }
 
-fn run_virtualbox(bios_path: &str, kernel_path: &Path) {
-    // Create VDI disk from BIOS image
+fn run_virtualbox(bios_path: &str, kernel_path: &Path, force: bool) {
+    // Create VDI disk from BIOS image - always regenerate to avoid stale kernel boot
     let vdi_path = format!("{}.vdi", bios_path);
     
-    if !Path::new(&vdi_path).exists() {
+    // If --force or BIOS newer than VDI, delete stale VDI
+    let needs_convert = if force {
+        if Path::new(&vdi_path).exists() {
+            println!("--force: removing stale VDI {}", vdi_path);
+            let _ = Command::new("VBoxManage")
+                .args(["closemedium", "disk", &vdi_path, "--delete"])
+                .output();
+            let _ = std::fs::remove_file(&vdi_path);
+        }
+        true
+    } else if Path::new(&vdi_path).exists() {
+        // Check timestamps: if BIOS newer than VDI, regenerate
+        let bios_mtime = std::fs::metadata(bios_path).and_then(|m| m.modified()).ok();
+        let vdi_mtime = std::fs::metadata(&vdi_path).and_then(|m| m.modified()).ok();
+        match (bios_mtime, vdi_mtime) {
+            (Some(b), Some(v)) if b > v => {
+                println!("BIOS image newer than VDI - regenerating...");
+                let _ = Command::new("VBoxManage")
+                    .args(["closemedium", "disk", &vdi_path, "--delete"])
+                    .output();
+                let _ = std::fs::remove_file(&vdi_path);
+                true
+            }
+            _ => false,
+        }
+    } else {
+        true
+    };
+
+    if needs_convert {
         println!("Converting BIOS image to VDI format...");
+        // Ensure any old medium registration is closed
+        if Path::new(&vdi_path).exists() {
+            let _ = std::fs::remove_file(&vdi_path);
+        }
         let result = Command::new("VBoxManage")
             .args([
                 "convertfromraw",
@@ -178,6 +215,22 @@ fn run_virtualbox(bios_path: &str, kernel_path: &Path) {
         false
     };
 
+    // Helper to run VBoxManage with error checking
+    let run_vbox = |args: &[&str], desc: &str| -> bool {
+        let result = Command::new("VBoxManage").args(args).output();
+        match result {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                eprintln!("Warning: {} failed: {}", desc, String::from_utf8_lossy(&output.stderr).trim());
+                false
+            }
+            Err(e) => {
+                eprintln!("Warning: {} failed to execute VBoxManage: {}", desc, e);
+                false
+            }
+        }
+    };
+
     if !vm_exists {
         println!("Creating VirtualBox VM: {}", vm_name);
         
@@ -195,130 +248,131 @@ fn run_virtualbox(bios_path: &str, kernel_path: &Path) {
 
         if let Ok(output) = result {
             if !output.status.success() {
-                eprintln!("Warning: Failed to create VM");
-                eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+                eprintln!("Error: Failed to create VM: {}", String::from_utf8_lossy(&output.stderr));
+                std::process::exit(1);
             }
+        } else if let Err(e) = result {
+            eprintln!("Error: Failed to run VBoxManage createvm: {}", e);
+            std::process::exit(1);
         }
 
-        // Configure VM memory
-        let _ = Command::new("VBoxManage")
-            .args([
-                "modifyvm",
-                &vm_name,
-                "--memory",
-                "256",
-                "--cpus",
-                "2",
-                "--rtcuseutc",
-                "on",
-                "--vram",
-                "16",
-            ])
-            .output();
+        // Configure VM memory - fail loudly if can't configure
+        if !run_vbox(&["modifyvm", &vm_name, "--memory", "256", "--cpus", "2", "--rtcuseutc", "on", "--vram", "16"], "modifyvm memory") {
+            eprintln!("VM created but memory config failed - VM may not boot correctly");
+        }
 
         // Create IDE controller
-        let _ = Command::new("VBoxManage")
-            .args([
-                "storagectl",
-                &vm_name,
-                "--name",
-                "IDE",
-                "--add",
-                "ide",
-                "--controller",
-                "PIIX4",
-            ])
-            .output();
+        if !run_vbox(&["storagectl", &vm_name, "--name", "IDE", "--add", "ide", "--controller", "PIIX4"], "create IDE controller") {
+            eprintln!("Error: Failed to create IDE controller");
+            std::process::exit(1);
+        }
 
         // Attach boot disk
-        let _ = Command::new("VBoxManage")
-            .args([
-                "storageattach",
-                &vm_name,
-                "--storagectl",
-                "IDE",
-                "--port",
-                "0",
-                "--device",
-                "0",
-                "--type",
-                "hdd",
-                "--medium",
-                &vdi_path,
-            ])
-            .output();
+        if !run_vbox(&["storageattach", &vm_name, "--storagectl", "IDE", "--port", "0", "--device", "0", "--type", "hdd", "--medium", &vdi_path], "attach boot disk") {
+            eprintln!("Error: Failed to attach boot disk");
+            std::process::exit(1);
+        }
 
         // Attach data disk
         if Path::new(data_vdi_path).exists() {
-            let _ = Command::new("VBoxManage")
-                .args([
-                    "storageattach",
-                    &vm_name,
-                    "--storagectl",
-                    "IDE",
-                    "--port",
-                    "0",
-                    "--device",
-                    "1",
-                    "--type",
-                    "hdd",
-                    "--medium",
-                    data_vdi_path,
-                ])
-                .output();
+            run_vbox(&["storageattach", &vm_name, "--storagectl", "IDE", "--port", "0", "--device", "1", "--type", "hdd", "--medium", data_vdi_path], "attach data disk");
         }
 
         // Configure network - Bridged for unrestricted networking
-        let _ = Command::new("VBoxManage")
-            .args([
-                "modifyvm",
-                &vm_name,
-                "--nic1",
-                "bridged",
-            ])
-            .output();
+        run_vbox(&["modifyvm", &vm_name, "--nic1", "bridged", "--nictype1", "82540EM"], "configure bridged NIC");
 
-        // Detect and set host interface (try common names)
-        let interfaces = ["eth0", "eth1", "wlan0", "wlan1", "en0", "en1"];
-        for iface in &interfaces {
-            let result = Command::new("VBoxManage")
-                .args([
-                    "modifyvm",
-                    &vm_name,
-                    "--bridgeadapter1",
-                    iface,
-                ])
-                .output();
-            
-            if let Ok(output) = result {
-                if output.status.success() {
-                    println!("Using network interface: {}", iface);
+        // Detect and set host interface - try dynamic detection first (Debian: enp*, ens*, wlp*, etc.)
+        let mut bridged_ok = false;
+        // First, query VBoxManage list bridgedifs for available interfaces (handles Debian predictable names)
+        if let Ok(output) = Command::new("VBoxManage").args(["list", "bridgedifs"]).output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let mut discovered: Vec<String> = Vec::new();
+                for line in text.lines() {
+                    if let Some(name) = line.strip_prefix("Name:") {
+                        let iface = name.trim().to_string();
+                        if !iface.is_empty() {
+                            discovered.push(iface);
+                        }
+                    }
+                }
+                // Prefer Up interfaces first (check Status: Up)
+                // For simplicity, try all discovered in order
+                for iface in &discovered {
+                    if run_vbox(&["modifyvm", &vm_name, "--bridgeadapter1", iface], &format!("set bridgeadapter1 to {}", iface)) {
+                        println!("Using network interface: {} (auto-detected)", iface);
+                        bridged_ok = true;
+                        break;
+                    }
+                }
+                if !bridged_ok && !discovered.is_empty() {
+                    eprintln!("Warning: Failed to set any auto-detected bridged interface: {:?}", discovered);
+                }
+            }
+        }
+        // Fallback to legacy hard-coded list if auto-detection failed
+        if !bridged_ok {
+            let fallback = ["enp0s3", "enp0s8", "ens33", "enp1s0", "eth0", "eth1", "wlan0", "wlp2s0", "en0", "en1"];
+            for iface in &fallback {
+                if run_vbox(&["modifyvm", &vm_name, "--bridgeadapter1", iface], &format!("set bridgeadapter1 to {}", iface)) {
+                    println!("Using network interface: {} (fallback)", iface);
+                    bridged_ok = true;
                     break;
                 }
             }
         }
+        if !bridged_ok {
+            eprintln!("Warning: Could not configure bridged adapter - VM will have no network.");
+            eprintln!("  Fix manually: VBoxManage modifyvm {} --bridgeadapter1 \"<your-ifname>\"", vm_name);
+            eprintln!("  List adapters: VBoxManage list bridgedifs");
+            eprintln!("  Or use: ./run.sh --qemu");
+        }
 
-        // Configure serial port for console output
-        let _ = Command::new("VBoxManage")
-            .args([
-                "modifyvm",
-                &vm_name,
-                "--uart1",
-                "0x3F8",
-                "4",
-                "--uartmode1",
-                "file",
-                "target/mfk-serial.log",
-            ])
-            .output();
+        // Boot order + firmware
+        run_vbox(&["modifyvm", &vm_name, "--boot1", "disk", "--boot2", "none", "--firmware", "bios"], "set boot order");
+
+        // Configure serial port for console output - use absolute path so file is always at workspace target/mfk-serial.log
+        let serial_log = std::env::current_dir()
+            .map(|p| p.join("target/mfk-serial.log"))
+            .unwrap_or_else(|_| Path::new("target/mfk-serial.log").to_path_buf());
+        let serial_str = serial_log.to_string_lossy().to_string();
+        run_vbox(&["modifyvm", &vm_name, "--uart1", "0x3F8", "4", "--uartmode1", "file", &serial_str], "configure serial port");
+        println!("Serial log: {}", serial_str);
     } else {
         println!("Using existing VM: {}", vm_name);
+        // On reuse, ensure boot disk is fresh VDI (fixes stale kernel boot)
+        if needs_convert {
+            println!("Updating VM boot disk to new VDI...");
+            // Detach old then attach new
+            let _ = Command::new("VBoxManage")
+                .args(["storageattach", &vm_name, "--storagectl", "IDE", "--port", "0", "--device", "0", "--medium", "none"])
+                .output();
+            if !run_vbox(&["storageattach", &vm_name, "--storagectl", "IDE", "--port", "0", "--device", "0", "--type", "hdd", "--medium", &vdi_path], "re-attach boot disk") {
+                eprintln!("Warning: Failed to update boot disk in existing VM. Try:");
+                eprintln!("  VBoxManage unregistervm {} --delete && ./run.sh", vm_name);
+            } else {
+                println!("✓ Boot disk updated");
+            }
+        }
+        // Also refresh data disk if missing
+        if Path::new(data_vdi_path).exists() {
+            // Check if data disk already attached
+            if let Ok(info) = Command::new("VBoxManage").args(["showvminfo", &vm_name, "--machinereadable"]).output() {
+                let info_str = String::from_utf8_lossy(&info.stdout);
+                if !info_str.contains("disk.vdi") && !info_str.contains(data_vdi_path) {
+                    run_vbox(&["storageattach", &vm_name, "--storagectl", "IDE", "--port", "0", "--device", "1", "--type", "hdd", "--medium", data_vdi_path], "re-attach data disk");
+                }
+            }
+        }
     }
 
     // Start the VM
+    let serial_abs = std::env::current_dir()
+        .map(|p| p.join("target/mfk-serial.log"))
+        .unwrap_or_else(|_| Path::new("target/mfk-serial.log").to_path_buf());
     println!("Starting VirtualBox VM: {}", vm_name);
     println!("Networking: Bridged (unrestricted, full Layer 2 access)");
-    println!("Serial console: target/mfk-serial.log");
+    println!("Serial console: {}", serial_abs.display());
     
     let result = Command::new("VBoxManage")
         .args([
@@ -332,12 +386,21 @@ fn run_virtualbox(bios_path: &str, kernel_path: &Path) {
     match result {
         Ok(output) => {
             if !output.status.success() {
-                eprintln!("Error starting VM:");
-                eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("Error starting VM: {}", stderr.trim());
+                if stderr.contains("is already running") || stderr.contains("is running") {
+                    eprintln!("VM appears already running. Access via VirtualBox GUI or:");
+                    eprintln!("  VBoxManage controlvm {} poweroff && ./run.sh", vm_name);
+                } else if stderr.contains("Host network interface") || stderr.contains("bridged") {
+                    eprintln!("Bridged network failed. Try:");
+                    eprintln!("  VBoxManage list bridgedifs");
+                    eprintln!("  VBoxManage modifyvm {} --bridgeadapter1 \"<ifname>\"", vm_name);
+                    eprintln!("  # Or use QEMU: ./run.sh --qemu");
+                }
                 std::process::exit(1);
             }
             println!("VM started successfully!");
-            println!("Serial console output will be written to: target/mfk-serial.log");
+            println!("Serial console output will be written to: {}", serial_abs.display());
         }
         Err(e) => {
             eprintln!("Error: Failed to start VM: {}", e);

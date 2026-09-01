@@ -14,6 +14,7 @@ extern crate alloc;
 
 mod allocator;
 mod drivers;
+mod editor;
 mod fs;
 mod interrupts;
 mod pic;

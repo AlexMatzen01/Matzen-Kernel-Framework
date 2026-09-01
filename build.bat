@@ -7,9 +7,9 @@ setlocal enabledelayedexpansion
 echo Building MFK Kernel Framework...
 echo.
 
-REM Step 1: Build the kernel
+REM Step 1: Build the kernel ( -Zjson-target-spec stabilized since cargo 1.91, removed )
 echo [1/2] Building kernel...
-cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zjson-target-spec -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
+cargo build -p mfk-kernel --target targets/x86_64-mfk.json -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 if errorlevel 1 (
     echo ERROR: Kernel build failed
     exit /b 1

@@ -175,35 +175,38 @@ pub fn handle_interrupt() {
 }
 
 /// Reads a character from serial input buffer (non-blocking)
+/// Uses `without_interrupts` to avoid deadlock with IRQ4 handler (H1).
 pub fn read_char() -> Option<char> {
-    // First try to get from buffer (interrupt-driven)
-    {
-        let mut buffer = INPUT_BUFFER.lock();
-        if let Some(byte) = buffer.pop() {
-            return Some(byte as char);
+    use x86_64::instructions::interrupts;
+    interrupts::without_interrupts(|| {
+        // Check buffered IRQ data first (lock order: INPUT_BUFFER before SERIAL
+        // but inside without_interrupts IRQ cannot interleave -> no deadlock)
+        {
+            let mut buffer = INPUT_BUFFER.lock();
+            if let Some(byte) = buffer.pop() {
+                return Some(byte as char);
+            }
         }
-    }
-
-    // Also poll directly in case interrupts aren't working
-    {
+        // Also poll directly in case interrupts aren't working
         let mut serial = SERIAL.lock();
         if let Some(byte) = serial.read_byte() {
             return Some(byte as char);
         }
-    }
-
-    None
+        None
+    })
 }
 
 /// Checks if there's input available
 pub fn has_input() -> bool {
-    let buffer = INPUT_BUFFER.lock();
-    if buffer.count > 0 {
-        return true;
-    }
-
-    let mut serial = SERIAL.lock();
-    serial.data_available()
+    use x86_64::instructions::interrupts;
+    interrupts::without_interrupts(|| {
+        let buffer = INPUT_BUFFER.lock();
+        if buffer.count > 0 {
+            return true;
+        }
+        let mut serial = SERIAL.lock();
+        serial.data_available()
+    })
 }
 
 /// Prints to the serial port

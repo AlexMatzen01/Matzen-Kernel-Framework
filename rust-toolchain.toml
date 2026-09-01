@@ -2,7 +2,9 @@
 #! Author: Alexander Matzen
 #! Licensed under the MIT license.
 
-
+# Pinned to nightly-2025-09-08: last known good with bootloader 0.11.13 + x86_64 0.15.2/0.15.4
+# Latest nightly (2026-08-31, 1.100) breaks x86_64 Step trait (forward_overflowing) -> use this pin
+# Update after bootloader/x86_64 bump fixes Step impl. On Debian, rustup reads this file automatically.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2025-09-08"
 components = ["rust-src", "llvm-tools-preview"]

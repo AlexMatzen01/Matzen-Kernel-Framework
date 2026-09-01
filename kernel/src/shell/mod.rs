@@ -32,6 +32,11 @@ pub fn get_tick_count() -> u64 {
     TICK_COUNTER.load(Ordering::Relaxed)
 }
 
+/// Increment tick (used by editor which bypasses shell::run loop)
+pub fn increment_tick() {
+    TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Check if Ctrl+C was pressed
 pub fn is_interrupted() -> bool {
     INTERRUPT_FLAG.load(Ordering::Relaxed)
@@ -145,6 +150,7 @@ fn execute_command(cmd: &str) {
         "tcpconnect" => cmd_tcpconnect(parts.1),
         "tcpsend" => cmd_tcpsend(parts.1),
         "tcpclose" => cmd_tcpclose(parts.1),
+        "nano" | "edit" | "mfkedit" => cmd_edit(parts.1),
         "" => {}
         _ => {
             println!(
@@ -183,6 +189,13 @@ fn cmd_help() {
     println!("  cat       - Display file contents (e.g., 'cat test.txt')");
     println!("  write     - Write text to file (e.g., 'write test.txt Hello World')");
     println!("  rm        - Delete a file (e.g., 'rm test.txt')");
+    println!();
+    println!("Editor Commands (nano-like):");
+    println!("  nano/edit  - Text editor (e.g., 'nano file.txt', 'edit --help')");
+    println!("    ^O/^S Write, ^X Exit, ^K Cut, ^U Uncut, ^W WhereIs");
+    println!("    ^C CurPos, ^_ GotoLine, ^J Justify, ^R ReadFile");
+    println!("    ^\\ Replace, ^G Help, ^Z Undo, ^Y Redo, Alt+A Mark");
+    println!("    Arrows/Home/End/PgUp/PgDn navigate, Tab=4sp, $ scroll");
     println!();
     println!("Network Commands:");
     println!("  ifconfig     - Configure network interface (e.g., 'ifconfig 10.0.2.15')");
@@ -1192,4 +1205,51 @@ fn cmd_tcpclose(args: &str) {
         Ok(_) => println!("Closing connection on port {}", port),
         Err(e) => println!("Failed to close connection: {}", e),
     }
+}
+
+// ── Editor helpers (exposed for editor crate) ─────────────
+
+/// Check if filesystem is mounted
+pub fn is_mounted() -> bool {
+    FILESYSTEM.lock().is_some()
+}
+
+/// Read file contents via FS – returns None if not mounted or not found
+pub fn read_file_contents(name: &str, device: &mut dyn crate::drivers::block::BlockDevice) -> Option<alloc::vec::Vec<u8>> {
+    let mut guard = FILESYSTEM.lock();
+    if let Some(ref mut fs) = *guard {
+        match fs.read_file(device, name) {
+            Ok(data) => Some(data),
+            Err(_) => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Write file contents – creates file if needed, returns static error str on failure
+pub fn write_file_contents(name: &str, data: &[u8], device: &mut dyn crate::drivers::block::BlockDevice) -> Result<(), &'static str> {
+    let mut guard = FILESYSTEM.lock();
+    if guard.is_none() {
+        return Err("Filesystem not mounted");
+    }
+    if let Some(ref mut fs) = *guard {
+        // Check if file exists
+        let cur_dir = fs.current_directory();
+        let files = fs.list_directory(device, cur_dir)?;
+        let inode_opt = files.iter().find(|f| f.name == name && !f.is_directory).map(|f| f.inode_number);
+        let inode = if let Some(inum) = inode_opt {
+            inum
+        } else {
+            fs.create_file(device, name)?
+        };
+        fs.write_file_by_inode(device, inode, data)
+    } else {
+        Err("Filesystem not mounted")
+    }
+}
+
+/// Shell edit command – delegates to nano editor
+fn cmd_edit(args: &str) {
+    crate::editor::run(args);
 }

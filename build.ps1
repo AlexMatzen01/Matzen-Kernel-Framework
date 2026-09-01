@@ -4,13 +4,12 @@
 Write-Host "Building MFK Kernel Framework..." -ForegroundColor Cyan
 Write-Host ""
 
-# Step 1: Build the kernel
+# Step 1: Build the kernel ( -Zjson-target-spec stabilized in cargo 1.91+, no longer needed )
 Write-Host "[1/2] Building kernel..." -ForegroundColor Yellow
 $kernelCmd = @(
     "build",
     "-p", "mfk-kernel",
     "--target", "targets/x86_64-mfk.json",
-    "-Zjson-target-spec",
     "-Zbuild-std=core,alloc",
     "-Zbuild-std-features=compiler-builtins-mem"
 )

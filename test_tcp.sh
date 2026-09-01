@@ -1,8 +1,21 @@
-#!/bin/bash
-# Quick TCP connection test
+#!/usr/bin/env bash
+# Quick TCP connection test (Debian/Linux)
+set -euo pipefail
 
-echo "Building kernel with TCP support..."
-./build.sh > /dev/null 2>&1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+echo "Building kernel..."
+if ! ./build.sh; then
+    echo "ERROR: Build failed" >&2
+    exit 1
+fi
+
+KERNEL_BIN="target/x86_64-mfk/debug/mfk-kernel"
+if [[ ! -f "$KERNEL_BIN" ]]; then
+    echo "ERROR: Kernel not found at $KERNEL_BIN" >&2
+    exit 1
+fi
 
 echo ""
 echo "========================================="
@@ -29,4 +42,5 @@ echo ""
 echo "========================================="
 echo ""
 
-./run.sh target/x86_64-mfk/debug/mfk-kernel
+# Auto-fallback to QEMU for test (piping not suitable for VBox GUI)
+exec ./run.sh "$KERNEL_BIN" --qemu
