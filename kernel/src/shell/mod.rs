@@ -15,8 +15,32 @@ use spin::Mutex;
 /// Maximum length of a command line
 const MAX_CMD_LENGTH: usize = 256;
 
-/// Shell prompt string
+/// Shell prompt string (dynamic in code, fallback)
 const PROMPT: &str = "mfk> ";
+
+fn prompt() -> alloc::string::String {
+    // Try to show current path like mfk:/docs> 
+    if let Some(path) = current_path_string() {
+        alloc::format!("mfk:{}> ", path)
+    } else {
+        alloc::string::String::from(PROMPT)
+    }
+}
+
+fn current_path_string() -> Option<alloc::string::String> {
+    let fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_some() {
+        drop(fs_guard);
+        let mut device = crate::drivers::block::AtaBlockDevice::new();
+        let mut guard = FILESYSTEM.lock();
+        if let Some(ref mut fs) = *guard {
+            if let Ok(p) = fs.current_path(&mut device) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
 
 /// Simple tick counter for uptime tracking
 static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -57,7 +81,7 @@ pub fn run() -> ! {
     let mut cmd_buffer: [u8; MAX_CMD_LENGTH] = [0; MAX_CMD_LENGTH];
     let mut cmd_len: usize = 0;
 
-    print!("{}", PROMPT);
+    print!("{}", prompt());
 
     loop {
         // Increment tick counter for basic timing
@@ -74,7 +98,7 @@ pub fn run() -> ! {
                     println!("^C");
                     cmd_len = 0;
                     cmd_buffer = [0; MAX_CMD_LENGTH];
-                    print!("\n{}", PROMPT);
+                    print!("\n{}", prompt());
                 }
                 '\n' | '\r' => {
                     println!();
@@ -85,7 +109,7 @@ pub fn run() -> ! {
                         cmd_buffer = [0; MAX_CMD_LENGTH];
                     }
                     clear_interrupt();
-                    print!("{}", PROMPT);
+                    print!("{}", prompt());
                 }
                 '\x08' | '\x7f' => {
                     // Backspace: move back, clear character, move back again for visual feedback
@@ -139,11 +163,15 @@ fn execute_command(cmd: &str) {
         "diskinfo" => cmd_diskinfo(),
         "mkfs" => cmd_mkfs(),
         "mount" => cmd_mount(),
-        "ls" | "dir" => cmd_ls(),
+        "ls" | "dir" => cmd_ls(parts.1),
         "touch" => cmd_touch(parts.1),
         "cat" => cmd_cat(parts.1),
         "write" => cmd_write(parts.1),
         "rm" => cmd_rm(parts.1),
+        "mkdir" => cmd_mkdir(parts.1),
+        "rmdir" => cmd_rmdir(parts.1),
+        "cd" => cmd_cd(parts.1),
+        "pwd" => cmd_pwd(),
         "ifconfig" => cmd_ifconfig(parts.1),
         "ping" => cmd_ping(parts.1),
         "netstat" => cmd_netstat(),
@@ -184,11 +212,15 @@ fn cmd_help() {
     println!("  diskinfo  - Display disk information");
     println!("  mkfs      - Format the disk with SimplFS");
     println!("  mount     - Mount the filesystem");
-    println!("  ls/dir    - List files in current directory");
-    println!("  touch     - Create a new file (e.g., 'touch test.txt')");
+    println!("  ls/dir [path] - List files (e.g., 'ls', 'ls /docs')");
+    println!("  touch     - Create a new file (e.g., 'touch test.txt', 'touch dir/file.txt')");
     println!("  cat       - Display file contents (e.g., 'cat test.txt')");
     println!("  write     - Write text to file (e.g., 'write test.txt Hello World')");
     println!("  rm        - Delete a file (e.g., 'rm test.txt')");
+    println!("  mkdir     - Create directory (e.g., 'mkdir docs', 'mkdir /a/b')");
+    println!("  rmdir     - Remove empty directory (e.g., 'rmdir docs')");
+    println!("  cd        - Change directory (e.g., 'cd docs', 'cd ..', 'cd /')");
+    println!("  pwd       - Print working directory");
     println!();
     println!("Editor Commands (nano-like):");
     println!("  nano/edit  - Text editor (e.g., 'nano file.txt', 'edit --help')");
@@ -206,14 +238,15 @@ fn cmd_help() {
     println!("  tcpclose     - Close TCP connection (e.g., 'tcpclose <port>')");
 }
 
-/// Clears the screen
+/// Clears the screen - true clear for both VGA and serial, no whitespace trick
 fn cmd_clear() {
     vga::clear_screen();
-    // Print several newlines to scroll content up so the next prompt
-    // appears in a more visible position (near middle of screen)
-    for _ in 0..10 {
-        println!();
-    }
+    // True ANSI clear for serial/QEMU headless (VGA already cleared above)
+    crate::serial_print!("\x1b[2J\x1b[H\x1b[0m");
+    // Sync hardware cursor to where next shell text will appear (bottom row, col 0)
+    // VGA Writer is bottom-anchored (write_byte always at BUFFER_HEIGHT-1), so home is bottom row.
+    vga::set_cursor_pos(crate::drivers::vga::VGA_HEIGHT - 1, 0);
+    vga::show_cursor();
 }
 
 /// Echoes text back to the screen
@@ -676,43 +709,64 @@ fn cmd_mount() {
     }
 }
 
-/// List files in current directory
-fn cmd_ls() {
+/// List files in directory (optional path)
+fn cmd_ls(path: &str) {
     let mut fs_guard = FILESYSTEM.lock();
-
-    if let Some(ref fs) = *fs_guard {
-        let current_dir = fs.current_directory();
-        drop(fs_guard); // Release lock before device access
-
-        let mut device = crate::drivers::block::AtaBlockDevice::new();
-        let mut fs_guard = FILESYSTEM.lock();
-
-        if let Some(ref mut fs) = *fs_guard {
-            match fs.list_directory(&mut device, current_dir) {
-                Ok(files) => {
-                    if files.is_empty() {
-                        println!("(empty directory)");
-                    } else {
-                        println!("Files:");
-                        for file in files {
-                            println!("  {}", file);
-                        }
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    drop(fs_guard);
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut fs_guard = FILESYSTEM.lock();
+    if let Some(ref mut fs) = *fs_guard {
+        // Determine target inode
+        let target = if path.trim().is_empty() {
+            fs.current_directory()
+        } else {
+            match fs.resolve_file_or_dir(&mut device, path.trim()) {
+                Ok(ino) => {
+                    // Must be directory
+                    if !fs.is_dir(ino) {
+                        println!("ls: Not a directory");
+                        return;
                     }
+                    ino
                 }
                 Err(e) => {
-                    println!("Failed to list directory: {}", e);
+                    println!("ls: {}: {}", path, e);
+                    return;
                 }
             }
+        };
+        // Show path header if explicit
+        if !path.trim().is_empty() {
+            let label = path.trim();
+            println!("{}:", label);
         }
-    } else {
-        println!("Filesystem not mounted. Use 'mount' first.");
+        match fs.list_directory(&mut device, target) {
+            Ok(files) => {
+                if files.is_empty() {
+                    println!("(empty directory)");
+                } else {
+                    // Sort: directories first already? Keep order
+                    for file in files {
+                        println!("  {}", file);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Failed to list directory: {}", e);
+            }
+        }
     }
 }
 
-/// Create a new file
-fn cmd_touch(filename: &str) {
-    if filename.is_empty() {
+/// Create a new file (path-aware)
+fn cmd_touch(path: &str) {
+    if path.trim().is_empty() {
         println!("Usage: touch <filename>");
+        println!("  Supports paths: touch dir/file.txt, touch /a/b/file");
         return;
     }
 
@@ -725,9 +779,9 @@ fn cmd_touch(filename: &str) {
     let mut device = crate::drivers::block::AtaBlockDevice::new();
 
     if let Some(ref mut fs) = *fs_guard {
-        match fs.create_file(&mut device, filename) {
+        match fs.create_file(&mut device, path.trim()) {
             Ok(inode_num) => {
-                println!("Created file '{}' (inode {})", filename, inode_num);
+                println!("Created file '{}' (inode {})", path.trim(), inode_num);
             }
             Err(e) => {
                 println!("Failed to create file: {}", e);
@@ -736,9 +790,9 @@ fn cmd_touch(filename: &str) {
     }
 }
 
-/// Display file contents
-fn cmd_cat(filename: &str) {
-    if filename.is_empty() {
+/// Display file contents (path-aware)
+fn cmd_cat(path: &str) {
+    if path.trim().is_empty() {
         println!("Usage: cat <filename>");
         return;
     }
@@ -752,7 +806,7 @@ fn cmd_cat(filename: &str) {
     let mut device = crate::drivers::block::AtaBlockDevice::new();
 
     if let Some(ref mut fs) = *fs_guard {
-        match fs.read_file(&mut device, filename) {
+        match fs.read_file(&mut device, path.trim()) {
             Ok(data) => {
                 if data.is_empty() {
                     println!("(empty file)");
@@ -788,7 +842,7 @@ fn cmd_cat(filename: &str) {
     }
 }
 
-/// Write text to a file
+/// Write text to a file (path-aware)
 fn cmd_write(args: &str) {
     let parts: Vec<&str> = args.splitn(2, ' ').collect();
 
@@ -797,7 +851,7 @@ fn cmd_write(args: &str) {
         return;
     }
 
-    let filename = parts[0];
+    let filename = parts[0].trim();
     let content = parts[1];
 
     let mut fs_guard = FILESYSTEM.lock();
@@ -809,29 +863,27 @@ fn cmd_write(args: &str) {
     let mut device = crate::drivers::block::AtaBlockDevice::new();
 
     if let Some(ref mut fs) = *fs_guard {
-        // Check if file exists, create if it doesn't
-        let files = match fs.list_directory(&mut device, fs.current_directory()) {
-            Ok(f) => f,
-            Err(e) => {
-                println!("Failed to list directory: {}", e);
-                return;
-            }
-        };
-
-        let file_info = files.iter().find(|f| f.name == filename && !f.is_directory);
-        let inode_num = if let Some(info) = file_info {
-            // File exists, use existing inode
-            info.inode_number
-        } else {
-            // File doesn't exist, create it
-            match fs.create_file(&mut device, filename) {
-                Ok(inode) => {
-                    println!("Created new file '{}'", filename);
-                    inode
-                }
-                Err(e) => {
-                    println!("Failed to create file: {}", e);
+        // Try to resolve existing file (path-aware)
+        let existing = fs.resolve_file_or_dir(&mut device, filename);
+        let inode_num = match existing {
+            Ok(ino) => {
+                if !fs.is_file(ino) {
+                    println!("write: '{}' is a directory", filename);
                     return;
+                }
+                ino
+            }
+            Err(_) => {
+                // File doesn't exist, create it (path-aware)
+                match fs.create_file(&mut device, filename) {
+                    Ok(inode) => {
+                        println!("Created new file '{}'", filename);
+                        inode
+                    }
+                    Err(e) => {
+                        println!("Failed to create file: {}", e);
+                        return;
+                    }
                 }
             }
         };
@@ -848,9 +900,9 @@ fn cmd_write(args: &str) {
     }
 }
 
-/// Delete a file
-fn cmd_rm(filename: &str) {
-    if filename.is_empty() {
+/// Delete a file (path-aware)
+fn cmd_rm(path: &str) {
+    if path.trim().is_empty() {
         println!("Usage: rm <filename>");
         return;
     }
@@ -864,13 +916,87 @@ fn cmd_rm(filename: &str) {
     let mut device = crate::drivers::block::AtaBlockDevice::new();
 
     if let Some(ref mut fs) = *fs_guard {
-        match fs.delete_file(&mut device, filename) {
+        match fs.delete_file(&mut device, path.trim()) {
             Ok(()) => {
-                println!("Deleted file '{}'", filename);
+                println!("Deleted file '{}'", path.trim());
             }
             Err(e) => {
                 println!("Failed to delete file: {}", e);
             }
+        }
+    }
+}
+
+/// Create directory
+fn cmd_mkdir(path: &str) {
+    if path.trim().is_empty() {
+        println!("Usage: mkdir <directory>");
+        println!("  Example: mkdir docs, mkdir /a/b, mkdir mydir");
+        return;
+    }
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    if let Some(ref mut fs) = *fs_guard {
+        match fs.create_directory(&mut device, path.trim()) {
+            Ok(ino) => println!("Created directory '{}' (inode {})", path.trim(), ino),
+            Err(e) => println!("mkdir: cannot create directory '{}': {}", path.trim(), e),
+        }
+    }
+}
+
+/// Remove empty directory
+fn cmd_rmdir(path: &str) {
+    if path.trim().is_empty() {
+        println!("Usage: rmdir <directory>");
+        return;
+    }
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    if let Some(ref mut fs) = *fs_guard {
+        match fs.remove_directory(&mut device, path.trim()) {
+            Ok(()) => println!("Removed directory '{}'", path.trim()),
+            Err(e) => println!("rmdir: failed to remove '{}': {}", path.trim(), e),
+        }
+    }
+}
+
+/// Change directory
+fn cmd_cd(path: &str) {
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    if let Some(ref mut fs) = *fs_guard {
+        let target = if path.trim().is_empty() { "/" } else { path.trim() };
+        match fs.change_directory_path(&mut device, target) {
+            Ok(()) => {}
+            Err(e) => println!("cd: {}: {}", target, e),
+        }
+    }
+}
+
+/// Print working directory
+fn cmd_pwd() {
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    if let Some(ref mut fs) = *fs_guard {
+        match fs.current_path(&mut device) {
+            Ok(p) => println!("{}", p),
+            Err(e) => println!("pwd: {}", e),
         }
     }
 }
@@ -1214,7 +1340,7 @@ pub fn is_mounted() -> bool {
     FILESYSTEM.lock().is_some()
 }
 
-/// Read file contents via FS – returns None if not mounted or not found
+/// Read file contents via FS – returns None if not mounted or not found (path-aware)
 pub fn read_file_contents(name: &str, device: &mut dyn crate::drivers::block::BlockDevice) -> Option<alloc::vec::Vec<u8>> {
     let mut guard = FILESYSTEM.lock();
     if let Some(ref mut fs) = *guard {
@@ -1227,21 +1353,22 @@ pub fn read_file_contents(name: &str, device: &mut dyn crate::drivers::block::Bl
     }
 }
 
-/// Write file contents – creates file if needed, returns static error str on failure
+/// Write file contents – creates file if needed, returns static error str on failure (path-aware)
 pub fn write_file_contents(name: &str, data: &[u8], device: &mut dyn crate::drivers::block::BlockDevice) -> Result<(), &'static str> {
     let mut guard = FILESYSTEM.lock();
     if guard.is_none() {
         return Err("Filesystem not mounted");
     }
     if let Some(ref mut fs) = *guard {
-        // Check if file exists
-        let cur_dir = fs.current_directory();
-        let files = fs.list_directory(device, cur_dir)?;
-        let inode_opt = files.iter().find(|f| f.name == name && !f.is_directory).map(|f| f.inode_number);
-        let inode = if let Some(inum) = inode_opt {
-            inum
-        } else {
-            fs.create_file(device, name)?
+        // Resolve existing file if present (path-aware)
+        let inode = match fs.resolve_file_or_dir(device, name) {
+            Ok(ino) => {
+                if !fs.is_file(ino) {
+                    return Err("Is a directory");
+                }
+                ino
+            }
+            Err(_) => fs.create_file(device, name)?,
         };
         fs.write_file_by_inode(device, inode, data)
     } else {

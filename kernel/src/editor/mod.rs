@@ -37,9 +37,12 @@ pub fn run(args: &str) {
     let mut status_msg: Option<(String, bool, u64)> = None; // (msg, is_error, expire_tick)
     let mut status_is_error = false;
 
-    // Take over screen – add diagnostic serial log for QEMU freeze diagnosis (visible via `serial` log)
+    // Take over screen — fullscreen takeover: true clear once, then realtime in-place updates
     crate::serial_println!("editor: enter run args={:?}", args);
     crate::serial_println!("editor: buf lines={} filename={:?}", buf.lines.len(), buf.filename);
+    // One-time true fullscreen clear for both VGA and serial (covers shell history)
+    vga::clear_screen();
+    crate::serial_print!("\x1b[2J\x1b[H\x1b[0m");
     vga::hide_cursor();
     crate::serial_println!("editor: hide_cursor done, before first draw");
     draw_and_position(&buf, &mut vp, &status_msg);

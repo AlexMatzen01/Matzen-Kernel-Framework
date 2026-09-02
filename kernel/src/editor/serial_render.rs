@@ -61,21 +61,22 @@ const EDIT_BG: Color = Color::Black;
 fn build_title(buf: &TextBuffer) -> String {
     let name = buf.filename.clone().unwrap_or_else(|| String::from("New Buffer"));
     let modif = if buf.dirty { " [Modified]" } else { "" };
-    alloc::format!(" GNU nano 7.2  File: {}{}", name, modif)
+    alloc::format!(" MFKEdit  File: {}{}", name, modif)
 }
 
-/// Draw full frame to serial as ANSI.
+/// Draw full frame to serial as ANSI — fullscreen, realtime in-place (no ESC[2J flicker).
 /// Uses `crate::serial_print!` (which already does without_interrupts + SERIAL lock).
+/// Covers full 80x25 by repositioning + erasing per row, not by clearing whitespace then pasting.
 pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>, status_is_error: bool) {
-    // Clear screen, hide cursor during draw to reduce flicker, home cursor
-    crate::serial_print!("\x1b[2J\x1b[H\x1b[?25l");
+    // Home cursor, hide cursor during draw to reduce flicker — NO ESC[2J (realtime in-place)
+    crate::serial_print!("\x1b[H\x1b[?25l");
 
-    // Title bar (row 1)
+    // Title bar (row 1) — fullscreen: erase line then paint full width
     let title = build_title(buf);
     let tbytes = title.as_bytes();
     let start = (SCREEN_WIDTH.saturating_sub(tbytes.len())) / 2;
     // Title bar: black on white, full width
-    crate::serial_print!("\x1b[1;1H"); // row1 col1 (1-indexed for ANSI)
+    crate::serial_print!("\x1b[1;1H\x1b[2K"); // erase line, then paint
     crate::serial_print!("{}{}", ansi_fg(TITLE_FG), ansi_bg(TITLE_BG));
     for _ in 0..start { crate::serial_print!(" "); }
     for &b in tbytes.iter().take(SCREEN_WIDTH - start) {
@@ -87,11 +88,11 @@ pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>
     for _ in used..SCREEN_WIDTH { crate::serial_print!(" "); }
     crate::serial_print!("\x1b[0m");
 
-    // Edit area rows 2..22 (EDIT_HEIGHT=21)
+    // Edit area rows 2..22 (EDIT_HEIGHT=21) — fullscreen reuse: home+erase per row
     for srow in 0..vp.height {
         let buf_row = vp.top_line + srow;
         let screen_row_ansi = EDIT_TOP + srow + 1; // ANSI 1-indexed, EDIT_TOP is 0-indexed 1 => ansi 2
-        crate::serial_print!("\x1b[{};1H", screen_row_ansi);
+        crate::serial_print!("\x1b[{};1H\x1b[2K", screen_row_ansi);
         // default edit colors
         crate::serial_print!("{}{}", ansi_fg(EDIT_FG), ansi_bg(EDIT_BG));
 
@@ -283,12 +284,12 @@ pub fn draw_confirm_ansi(question: &str) {
     crate::serial_print!("\x1b[0m\x1b[{};{}H\x1b[?25h", status_row_ansi, question.len() + 8);
 }
 
-/// Help overlay for serial
+/// Help overlay for serial — fullscreen in-place, no ESC[2J flicker
 pub fn draw_help_ansi(scroll: usize) {
     const HELP_TEXT: &[&str] = &[
-        " GNU nano 7.2  Help Text",
+        " MFKEdit Help Text",
         "",
-        " Nano is a small and friendly text editor. This MFK port mimics nano.",
+        " MFKEdit is a small and friendly text editor. This MFK port mimics nano.",
         "",
         " Shortcuts:",
         "  ^G  (F1) Display this help text",
@@ -311,11 +312,11 @@ pub fn draw_help_ansi(scroll: usize) {
         "",
         " Press any key to continue... (ESC/^G/^X to exit help)",
     ];
-    // Clear and use blue background white text like VGA help
-    crate::serial_print!("\x1b[2J\x1b[H\x1b[37;44m");
-    // Title at 1,1
-    crate::serial_print!("\x1b[1;1H\x1b[37;44m");
-    let title = " MFK nano Help (ESC to exit) ";
+    // Fullscreen: home + set colors, no ESC[2J (prevents whitespace flash)
+    crate::serial_print!("\x1b[H\x1b[37;44m");
+    // Title at 1,1 — erase then paint
+    crate::serial_print!("\x1b[1;1H\x1b[37;44m\x1b[2K");
+    let title = " MFKEdit Help (ESC to exit) ";
     let pad = (SCREEN_WIDTH.saturating_sub(title.len())) / 2;
     for _ in 0..pad { crate::serial_print!(" "); }
     crate::serial_print!("{}", title);

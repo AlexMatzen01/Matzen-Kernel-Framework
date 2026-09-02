@@ -308,9 +308,9 @@ pub fn confirm(question: &str) -> Option<bool> {
 pub fn show_help_overlay() {
     // Clear and show help text
     const HELP_TEXT: &[&str] = &[
-        " GNU nano 7.2  Help Text",
+        " MFKEdit 7.2  Help Text",
         "",
-        " Nano is a small and friendly text editor. This MFK port mimics nano.",
+        " MFKEdit is a small and friendly text editor. This MFK port mimics nano.",
         "",
         " Shortcuts:",
         "  ^G  (F1) Display this help text",
@@ -352,7 +352,7 @@ pub fn show_help_overlay() {
             }
             // Title
             w.fill_rect(0, 0, SCREEN_WIDTH, 1, b' ', Color::White, Color::Blue);
-            let t = b" MFK nano Help (ESC to exit) ";
+            let t = b" MFKEdit Help (ESC to exit) ";
             for (i, &b) in t.iter().enumerate() {
                 w.write_at(0, (SCREEN_WIDTH - t.len())/2 + i, b, Color::White, Color::Blue);
             }
