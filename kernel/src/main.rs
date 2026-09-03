@@ -13,6 +13,7 @@
 extern crate alloc;
 
 mod allocator;
+mod app;
 mod drivers;
 mod editor;
 mod fs;

@@ -7,13 +7,24 @@
 //! A simple command-line shell for the Matzen Kernel Framework.
 
 use crate::drivers::{keyboard, vga};
+use crate::drivers::keyboard::Key;
 use crate::{print, println};
 use alloc::vec::Vec;
+use alloc::string::String;
 use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use spin::Mutex;
 
 /// Maximum length of a command line
 const MAX_CMD_LENGTH: usize = 256;
+
+/// Builtin commands for TAB completion (must match execute_command and help)
+const BUILTINS: &[&str] = &[
+    "help", "clear", "cls", "echo", "about", "version", "uptime", "mem", "memory",
+    "reboot", "halt", "shutdown", "date", "whoami", "cpuinfo", "calc", "color", "test",
+    "diskinfo", "mkfs", "mount", "ls", "dir", "touch", "cat", "write", "rm", "mkdir", "rmdir",
+    "cd", "pwd", "ifconfig", "ping", "netstat", "tcpconnect", "tcpsend", "tcpclose",
+    "nano", "edit", "mfkedit", "run", "exec", "mkapp", "writehex", "ps", "appinfo",
+];
 
 /// Shell prompt string (dynamic in code, fallback)
 const PROMPT: &str = "mfk> ";
@@ -90,9 +101,9 @@ pub fn run() -> ! {
         // Process network packets
         crate::net::process_packets();
 
-        if let Some(c) = keyboard::read_char() {
-            match c {
-                '\x03' => {
+        if let Some(ev) = keyboard::read_key() {
+            match ev.key {
+                Key::Ctrl('C') => {
                     // Ctrl+C detected
                     set_interrupt();
                     println!("^C");
@@ -100,7 +111,7 @@ pub fn run() -> ! {
                     cmd_buffer = [0; MAX_CMD_LENGTH];
                     print!("\n{}", prompt());
                 }
-                '\n' | '\r' => {
+                Key::Enter => {
                     println!();
                     if cmd_len > 0 {
                         let cmd = core::str::from_utf8(&cmd_buffer[..cmd_len]).unwrap_or("");
@@ -111,16 +122,17 @@ pub fn run() -> ! {
                     clear_interrupt();
                     print!("{}", prompt());
                 }
-                '\x08' | '\x7f' => {
-                    // Backspace: move back, clear character, move back again for visual feedback
+                Key::Backspace => {
                     if cmd_len > 0 {
                         cmd_len -= 1;
                         cmd_buffer[cmd_len] = 0;
-                        // Standard backspace sequence: \x08 (backspace), space, \x08 (backspace)
                         print!("\x08 \x08");
                     }
                 }
-                c if c.is_ascii() && !c.is_control() => {
+                Key::Tab => {
+                    handle_tab_completion(&mut cmd_buffer, &mut cmd_len);
+                }
+                Key::Char(c) if c.is_ascii() && !c.is_control() => {
                     if cmd_len < MAX_CMD_LENGTH - 1 {
                         cmd_buffer[cmd_len] = c as u8;
                         cmd_len += 1;
@@ -130,14 +142,13 @@ pub fn run() -> ! {
                 _ => {}
             }
         }
-        // Small yield to prevent busy loop from hogging CPU
-        // We use a spin hint instead of hlt() to ensure we poll frequently
         core::hint::spin_loop();
     }
 }
 
-/// Executes a command
-fn execute_command(cmd: &str) {
+/// Executes a command - public for app interpreter
+/// Returns true if caller should break (reserved for script control)
+pub fn execute_command(cmd: &str) -> bool {
     let cmd = cmd.trim();
     let parts: (&str, &str) = match cmd.find(' ') {
         Some(pos) => (&cmd[..pos], cmd[pos + 1..].trim()),
@@ -179,6 +190,11 @@ fn execute_command(cmd: &str) {
         "tcpsend" => cmd_tcpsend(parts.1),
         "tcpclose" => cmd_tcpclose(parts.1),
         "nano" | "edit" | "mfkedit" => cmd_edit(parts.1),
+        "run" | "exec" => cmd_run(parts.1),
+        "mkapp" => cmd_mkapp(parts.1),
+        "writehex" => cmd_writehex(parts.1),
+        "ps" => cmd_ps(),
+        "appinfo" => cmd_appinfo(parts.1),
         "" => {}
         _ => {
             println!(
@@ -187,11 +203,12 @@ fn execute_command(cmd: &str) {
             );
         }
     }
+    false
 }
 
 /// Displays help information
 fn cmd_help() {
-    println!("Available commands:");
+    println!("Available commands (Tab completes commands & files):");
     println!("  help      - Display this help message");
     println!("  clear/cls - Clear the screen");
     println!("  echo      - Print text to the screen");
@@ -228,6 +245,15 @@ fn cmd_help() {
     println!("    ^C CurPos, ^_ GotoLine, ^J Justify, ^R ReadFile");
     println!("    ^\\ Replace, ^G Help, ^Z Undo, ^Y Redo, Alt+A Mark");
     println!("    Arrows/Home/End/PgUp/PgDn navigate, Tab=4sp, $ scroll");
+    println!();
+    println!("App Commands:");
+    println!("  run/exec      - Run an app (script or MFKE bytecode)");
+    println!("                 e.g., 'run /apps/hello.app', 'run /bin/counter.mfke'");
+    println!("  mkapp         - Create example app (e.g., 'mkapp hello /apps/hello.app')");
+    println!("                 kinds: hello, hello-mfke, counter, calc, filedemo, loop");
+    println!("  writehex      - Write binary from hex (e.g., 'writehex /tmp/a.bin 4D464B45...')");
+    println!("  appinfo       - Show app file info (e.g., 'appinfo /apps/hello.mfke')");
+    println!("  ps            - Show process status (Phase 1: cooperative)");
     println!();
     println!("Network Commands:");
     println!("  ifconfig     - Configure network interface (e.g., 'ifconfig 10.0.2.15')");
@@ -1379,4 +1405,345 @@ pub fn write_file_contents(name: &str, data: &[u8], device: &mut dyn crate::driv
 /// Shell edit command – delegates to nano editor
 fn cmd_edit(args: &str) {
     crate::editor::run(args);
+}
+
+// ── App commands ─────────────────────────────────────
+
+fn cmd_run(args: &str) {
+    if args.trim().is_empty() {
+        println!("Usage: run <app-path> [args...]");
+        println!("  App types:");
+        println!("    .app/.sh/.txt  script (batch of shell commands)");
+        println!("    .mfke/.bin     MFKE bytecode VM");
+        println!("  Examples:");
+        println!("    mkfs; mount; mkapp hello /apps/hello.app; run /apps/hello.app");
+        println!("    mkapp hello-mfke /apps/hello.mfke; run /apps/hello.mfke");
+        println!("    run /apps/hello.app arg1 arg2");
+        println!("  Helpers: mkapp, writehex, appinfo");
+        return;
+    }
+    // split first token as path, rest as args
+    let mut parts: alloc::vec::Vec<&str> = args.split_whitespace().collect();
+    if parts.is_empty() { return; }
+    let path = parts[0];
+    // args for app includes path as $0 plus extra
+    let app_args: alloc::vec::Vec<&str> = parts.clone();
+    // clear interrupt before run
+    clear_interrupt();
+    match crate::app::run(path, &app_args) {
+        Ok(code) => {
+            if code != 0 {
+                println!("[run] app exited with code {}", code);
+            }
+        }
+        Err(e) => {
+            println!("[run] failed: {}", e);
+        }
+    }
+    clear_interrupt();
+}
+
+fn cmd_mkapp(args: &str) {
+    if args.trim().is_empty() {
+        println!("Usage: mkapp <kind> <path>");
+        println!("  Kinds: hello, hello-mfke, counter, calc, filedemo, loop");
+        println!("  Examples:");
+        println!("    mkapp hello /apps/hello.app");
+        println!("    mkapp hello-mfke /apps/hello.mfke");
+        println!("    mkapp counter /apps/counter.mfke");
+        println!("    mkapp calc /apps/calc.app");
+        println!("  Shorthand: mkapp <path>  (defaults to hello)");
+        return;
+    }
+    let tokens: alloc::vec::Vec<&str> = args.split_whitespace().collect();
+    let (kind, path) = if tokens.len() == 1 {
+        ("hello", tokens[0])
+    } else {
+        // first word is kind, last word is path (allows future multi-word kind)
+        let k = tokens[0];
+        let p = tokens[tokens.len() - 1];
+        (k, p)
+    };
+    match crate::app::create_example_app(path, kind) {
+        Ok(()) => println!("mkapp: created '{}' as '{}'", path, kind),
+        Err(e) => println!("mkapp failed: {}", e),
+    }
+}
+
+fn cmd_writehex(args: &str) {
+    let parts: alloc::vec::Vec<&str> = args.splitn(2, ' ').collect();
+    if parts.len() < 2 {
+        println!("Usage: writehex <path> <hex-bytes>");
+        println!("  Example: writehex /tmp/data.bin 4D464B45...");
+        println!("  Writes binary file from hex string (whitespace ignored).");
+        println!("  Useful for injecting MFKE binaries from host.");
+        return;
+    }
+    let path = parts[0].trim();
+    let hex = parts[1];
+    match crate::app::write_hex_file(path, hex) {
+        Ok(n) => println!("writehex: wrote {} bytes to '{}'", n, path),
+        Err(e) => println!("writehex failed: {}", e),
+    }
+}
+
+fn cmd_appinfo(args: &str) {
+    if args.trim().is_empty() {
+        println!("MFK App Runtime v1 (MFKE bytecode + script)");
+        println!("  Syscalls: exit, print_str, print_int, yield, sleep, get_tick");
+        println!("  Opcodes: PUSH,ADD,SUB,MUL,DIV,MOD,EQ,LT,GT,DUP,POP,PRINT_STR,PRINT_INT,PRINT_NL,JMP,JZ,JNZ,SLEEP,YIELD,HALT,EXIT,CALL");
+        println!("  Header: magic MFKE (0x454B4D46), version 1, entry,len");
+        println!("  Use 'run <path>' to execute, 'mkapp --help' to create.");
+        return;
+    }
+    // show file info if path given
+    let path = args.trim();
+    if !is_mounted() {
+        println!("Filesystem not mounted");
+        return;
+    }
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    if let Some(data) = read_file_contents(path, &mut device) {
+        println!("App '{}' ({} bytes)", path, data.len());
+        if data.len() >= 4 && &data[0..4] == &[0x7F, b'E', b'L', b'F'] {
+            println!("  Type: ELF (native) - not yet runnable, needs Phase 2");
+        } else if data.len() >= 4 && u32::from_le_bytes([data[0],data[1],data[2],data[3]]) == crate::app::loader::MFKE_MAGIC {
+            if let Ok(h) = crate::app::loader::validate_header(&data) {
+                let len = unsafe { core::ptr::addr_of!(h.bytecode_len).read_unaligned() };
+                let entry = unsafe { core::ptr::addr_of!(h.entry_offset).read_unaligned() };
+                println!("  Type: MFKE bytecode");
+                println!("  Entry: {}, bytecode len: {}", entry, len);
+                println!("  Runnable: yes (run {})", path);
+            }
+        } else if data.contains(&0) {
+            println!("  Type: unknown binary");
+        } else {
+            println!("  Type: script/text");
+            println!("  Runnable: yes ({} lines)", data.iter().filter(|&&b| b==b'\n').count()+1);
+            // preview first 5 lines
+            if let Ok(s) = core::str::from_utf8(&data) {
+                for (i, line) in s.lines().take(5).enumerate() {
+                    println!("    {}: {}", i+1, line);
+                }
+                if s.lines().count() > 5 { println!("    ..."); }
+            }
+        }
+    } else {
+        println!("Failed to read '{}'", path);
+    }
+}
+
+fn cmd_ps() {
+    println!("Process list (cooperative, single-task Phase 1):");
+    println!("  PID 1  shell  (running)");
+    println!("  Note: Phase 2 will add real scheduler with preemption.");
+    println!("  Apps currently run synchronously: `run` blocks shell until exit.");
+}
+
+// ── TAB completion ───────────────────────────────────
+
+fn handle_tab_completion(cmd_buffer: &mut [u8; MAX_CMD_LENGTH], cmd_len: &mut usize) {
+    let input = match core::str::from_utf8(&cmd_buffer[..*cmd_len]) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    // Decide between command vs path completion
+    // Use trim_start to ignore leading spaces for cmd detection
+    let is_cmd_completion = !input.trim_start().contains(' ');
+    if is_cmd_completion {
+        // Complete command name
+        let prefix = input.trim();
+        // If input empty, list all builtins? For now do nothing to avoid spam
+        if prefix.is_empty() {
+            return;
+        }
+        let mut candidates: Vec<&str> = BUILTINS.iter().cloned().filter(|c| c.starts_with(prefix)).collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() {
+            return;
+        }
+        if candidates.len() == 1 {
+            let full = candidates[0];
+            let tail = &full[prefix.len()..];
+            // Need space for tail + trailing space
+            if *cmd_len + tail.len() + 1 >= MAX_CMD_LENGTH {
+                return;
+            }
+            for b in tail.bytes() {
+                cmd_buffer[*cmd_len] = b;
+                *cmd_len += 1;
+                print!("{}", b as char);
+            }
+            // append space after completed command
+            cmd_buffer[*cmd_len] = b' ';
+            *cmd_len += 1;
+            print!(" ");
+        } else {
+            let lcp = common_prefix(candidates.clone(), prefix);
+            if lcp.len() > prefix.len() {
+                let tail = &lcp[prefix.len()..];
+                if *cmd_len + tail.len() >= MAX_CMD_LENGTH {
+                    return;
+                }
+                for b in tail.bytes() {
+                    cmd_buffer[*cmd_len] = b;
+                    *cmd_len += 1;
+                    print!("{}", b as char);
+                }
+            } else {
+                // No common extension -> list candidates
+                println!();
+                for c in &candidates {
+                    print!("{}  ", c);
+                }
+                println!();
+                print!("{}", prompt());
+                // Reprint current input
+                if let Ok(s) = core::str::from_utf8(&cmd_buffer[..*cmd_len]) {
+                    print!("{}", s);
+                }
+            }
+        }
+        return;
+    }
+
+    // Path completion (after first space, complete last token)
+    // Find last space position
+    let last_space = match input.rfind(' ') {
+        Some(p) => p,
+        None => return, // should not happen because we are in path mode
+    };
+    let before = &input[..=last_space]; // includes space
+    let token = &input[last_space + 1..];
+
+    // Split token into dir_part (with trailing '/') and file_prefix
+    let (dir_part, file_prefix) = if let Some(slash_pos) = token.rfind('/') {
+        (&token[..=slash_pos], &token[slash_pos + 1..])
+    } else {
+        ("", token)
+    };
+
+    // Resolve dir and collect candidates (if FS not mounted, do nothing for path)
+    if !is_mounted() {
+        return;
+    }
+
+    let candidates_opt = get_file_candidates(dir_part, file_prefix);
+    let candidates = match candidates_opt {
+        Some(v) => v,
+        None => return, // resolve error
+    };
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Single candidate -> complete full name + suffix
+    if candidates.len() == 1 {
+        let cand = &candidates[0];
+        let suffix = if cand.is_directory { "/" } else { " " };
+        let new_token = alloc::format!("{}{}{}", dir_part, cand.name, suffix);
+        let tail = &new_token[token.len()..];
+        if *cmd_len + tail.len() >= MAX_CMD_LENGTH {
+            return;
+        }
+        for b in tail.bytes() {
+            cmd_buffer[*cmd_len] = b;
+            *cmd_len += 1;
+            print!("{}", b as char);
+        }
+        return;
+    }
+
+    // Multiple candidates
+    // Compute LCP among candidate names
+    let names: Vec<&str> = candidates.iter().map(|fi| fi.name.as_str()).collect();
+    let lcp = common_prefix(names, file_prefix);
+    if lcp.len() > file_prefix.len() {
+        let new_token = alloc::format!("{}{}", dir_part, lcp);
+        let tail = &new_token[token.len()..];
+        if *cmd_len + tail.len() >= MAX_CMD_LENGTH {
+            return;
+        }
+        for b in tail.bytes() {
+            cmd_buffer[*cmd_len] = b;
+            *cmd_len += 1;
+            print!("{}", b as char);
+        }
+    } else {
+        // List candidates
+        println!();
+        for fi in &candidates {
+            if fi.is_directory {
+                print!("{}/  ", fi.name);
+            } else {
+                print!("{}  ", fi.name);
+            }
+        }
+        println!();
+        print!("{}", prompt());
+        if let Ok(s) = core::str::from_utf8(&cmd_buffer[..*cmd_len]) {
+            print!("{}", s);
+        }
+    }
+}
+
+fn common_prefix(mut candidates: Vec<&str>, prefix: &str) -> String {
+    if candidates.is_empty() {
+        return String::from(prefix);
+    }
+    candidates.sort_unstable();
+    let mut lcp = String::from(candidates[0]);
+    for cand in candidates.iter().skip(1) {
+        let mut len = 0;
+        for (a, b) in lcp.bytes().zip(cand.bytes()) {
+            if a == b {
+                len += 1;
+            } else {
+                break;
+            }
+        }
+        lcp.truncate(len);
+        if lcp.len() <= prefix.len() {
+            break;
+        }
+    }
+    lcp
+}
+
+fn get_file_candidates(dir_part: &str, file_prefix: &str) -> Option<Vec<crate::fs::FileInfo>> {
+    // Returns None if dir cannot be resolved (e.g., not a directory or not mounted)
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut guard = FILESYSTEM.lock();
+    let fs = match guard.as_mut() {
+        Some(f) => f,
+        None => return None,
+    };
+
+    let dir_inode = if dir_part.is_empty() {
+        fs.current_directory()
+    } else {
+        let trimmed = dir_part.trim_end_matches('/');
+        if trimmed.is_empty() {
+            // dir_part was "/" or "///"
+            0
+        } else {
+            match fs.resolve_path(&mut device, trimmed) {
+                Ok(ino) => ino,
+                Err(_) => return Some(Vec::new()), // dir does not exist -> no candidates, not error
+            }
+        }
+    };
+
+    // fs.is_dir check is done inside list_directory, but we ensure dir_inode is dir
+    let entries = match fs.list_directory(&mut device, dir_inode) {
+        Ok(v) => v,
+        Err(_) => return Some(Vec::new()),
+    };
+    let mut filtered: Vec<crate::fs::FileInfo> = entries
+        .into_iter()
+        .filter(|fi| fi.name.starts_with(file_prefix))
+        .collect();
+    filtered.sort_by(|a, b| a.name.cmp(&b.name));
+    Some(filtered)
 }

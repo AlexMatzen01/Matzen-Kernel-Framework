@@ -111,8 +111,12 @@ echo "  Firmware: ${FIRMWARE#--}"
 echo "  Image:    $FIRMWARE_IMAGE"
 echo ""
 
-# Build runner only if it doesn't exist.
-if [[ ! -x "target/release/mfk-runner" ]]; then
+# Rebuild the runner when its source or manifest is newer than the binary.
+RUNNER_BIN="target/release/mfk-runner"
+if [[ ! -x "$RUNNER_BIN" ||
+      "tools/src/main.rs" -nt "$RUNNER_BIN" ||
+      "tools/Cargo.toml" -nt "$RUNNER_BIN" ||
+      "Cargo.lock" -nt "$RUNNER_BIN" ]]; then
     echo "Building MFK runner..."
     cargo build -p mfk-runner --release
 fi
@@ -132,4 +136,4 @@ fi
 
 # Execute runner directly instead of going through Cargo.
 # This avoids Cargo startup/build-check overhead every boot.
-exec ./target/release/mfk-runner "${RUN_ARGS[@]}"
+exec "$RUNNER_BIN" "${RUN_ARGS[@]}"

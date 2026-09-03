@@ -16,7 +16,7 @@ const BUFFER_WIDTH: usize = 80;
 const BUFFER_HEIGHT: usize = 25;
 
 /// VGA text buffer physical address
-const VGA_BUFFER_PHYS: u64 = 0xb8000;
+const VGA_BUFFER_PHYS: u64 = 0xb9000;
 
 /// VGA color codes
 #[allow(dead_code)]

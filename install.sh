@@ -12,7 +12,7 @@ echo ""
 if command -v apt-get >/dev/null 2>&1; then
     echo "[0/4] Checking Debian system dependencies..."
     MISSING_PKGS=()
-    for pkg in build-essential pkg-config; do
+    for pkg in build-essential pkg-config ovmf; do
         if ! dpkg -s "$pkg" >/dev/null 2>&1; then
             MISSING_PKGS+=("$pkg")
         fi

@@ -1,0 +1,14 @@
+#! Copyright (c) Alexander Matzen. All rights reserved.
+#! Author: Alexander Matzen
+#! Licensed under the MIT license.
+
+[package]
+name = "mfk-hello-app"
+version = "0.1.0"
+edition = "2021"
+# App crates are no_std binaries that target the MFKE bytecode VM
+# For native ELF apps (Phase 2), switch to target x86_64-mfk-app.json
+
+[dependencies]
+# Minimal; apps should not depend on std
+# For helper to build MFKE bytecode from Rust macros, see sdk/mfk-abi

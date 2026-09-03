@@ -205,10 +205,15 @@ qemu-system-x86_64 -drive file=mfk-kernel-bios.img,format=raw
 
 ### UEFI Boot
 ```bash
+# Use the OVMF_CODE path installed by your distribution.
 qemu-system-x86_64 \
   -drive file=mfk-kernel-uefi.img,format=raw \
-  -bios /usr/share/OVMF/OVMF_CODE.fd
+  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd
 ```
+
+If OVMF is installed at a different path, set `OVMF_CODE` when using
+`./run.sh --qemu --uefi`, or replace the path above with the result of
+`find /usr/share -iname 'OVMF_CODE*.fd' 2>/dev/null`.
 
 ### Real Hardware
 You can write the BIOS image to a USB stick:

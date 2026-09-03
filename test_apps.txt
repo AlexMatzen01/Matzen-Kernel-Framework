@@ -1,0 +1,20 @@
+# App runtime smoke test
+mkfs
+mount
+# script app via mkapp
+mkapp hello /apps/hello.app
+ls /apps
+cat /apps/hello.app
+run /apps/hello.app
+appinfo /apps/hello.app
+# bytecode app
+mkapp hello-mfke /apps/hello.mfke
+appinfo /apps/hello.mfke
+run /apps/hello.mfke
+mkapp counter /apps/counter.mfke
+run /apps/counter.mfke
+# writehex + run (hex for hello.mfke generated via python tools/mfke_asm.py)
+# Example: writehex /tmp/test.mfke 464B4D46...
+# run /tmp/test.mfke
+ps
+echo App tests done

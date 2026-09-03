@@ -101,6 +101,8 @@ impl AtaDrive {
     /// Initialize and identify the drive
     pub fn init(&mut self) -> Result<(), &'static str> {
         unsafe {
+            self.exists = false;
+
             // Select drive
             let drive_select = match self.drive_type {
                 DriveType::Master => 0xA0,
@@ -109,51 +111,74 @@ impl AtaDrive {
             self.drive_port.write(drive_select);
             self.wait_400ns();
 
-            // Send IDENTIFY command
-            self.command_port.write(commands::IDENTIFY);
-            self.wait_400ns();
-
-            // Check if drive exists
+            // An absent ATA device returns either zero or floating-bus 0xFF.
+            // Do this check before issuing IDENTIFY so probing one empty slot
+            // cannot leave the controller in a misleading state.
             let status = self.status_port.read();
-            if status == 0 {
+            if status == 0 || status == 0xFF {
                 return Err("Drive does not exist");
             }
 
-            // Wait for drive to be ready or check for error
-            if let Err(e) = self.wait_not_busy() {
-                return Err(e);
+            // A device can still be completing a previous command after the
+            // select operation. Wait for it before sending IDENTIFY.
+            if status & status::BSY != 0 {
+                self.wait_not_busy()?;
             }
 
-            // Check if this is an ATAPI device (we only want ATA hard disks)
-            let lba_mid = self.lba_mid_port.read();
-            let lba_high = self.lba_high_port.read();
-            
-            // ATAPI signature is 0x14, 0xEB or 0x69, 0x96
-            if (lba_mid == 0x14 && lba_high == 0xEB) || (lba_mid == 0x69 && lba_high == 0x96) {
-                return Err("ATAPI device (not ATA)");
+            // Some IDE devices can still be settling immediately after the
+            // select operation. Retry IDENTIFY once if the first command does
+            // not produce a usable response.
+            for attempt in 0..2 {
+                self.command_port.write(commands::IDENTIFY);
+                self.wait_400ns();
+
+                // Check that the device responded to IDENTIFY.
+                let status = self.status_port.read();
+                if status == 0 || status == 0xFF {
+                    if attempt == 0 {
+                        self.drive_port.write(drive_select);
+                        self.wait_400ns();
+                        continue;
+                    }
+                    return Err("Drive does not exist");
+                }
+
+                // Wait for drive to be ready or report an ATA error.
+                self.wait_not_busy()?;
+
+                // Check if this is an ATAPI device (we only want ATA hard disks)
+                let lba_mid = self.lba_mid_port.read();
+                let lba_high = self.lba_high_port.read();
+
+                // ATAPI signature is 0x14, 0xEB or 0x69, 0x96
+                if (lba_mid == 0x14 && lba_high == 0xEB)
+                    || (lba_mid == 0x69 && lba_high == 0x96)
+                {
+                    return Err("ATAPI device (not ATA)");
+                }
+
+                // For ATA devices, these should be 0, but be lenient for QEMU.
+                let status = self.status_port.read();
+                if status & status::ERR != 0 {
+                    return Err("Device error during IDENTIFY");
+                }
+
+                // Wait for data to be ready.
+                self.wait_drq()?;
+
+                // Read identification data.
+                let mut identify_data = [0u16; 256];
+                for word in identify_data.iter_mut() {
+                    *word = self.data_port.read();
+                }
+
+                // Check if LBA48 is supported (word 83, bit 10).
+                self.lba48_supported = (identify_data[83] & (1 << 10)) != 0;
+                self.exists = true;
+                return Ok(());
             }
-            
-            // For ATA devices, these should be 0, but be lenient for QEMU
-            // If status shows errors, abort
-            let status = self.status_port.read();
-            if status & status::ERR != 0 {
-                return Err("Device error during IDENTIFY");
-            }
 
-            // Wait for data to be ready
-            self.wait_drq()?;
-
-            // Read identification data
-            let mut identify_data = [0u16; 256];
-            for word in identify_data.iter_mut() {
-                *word = self.data_port.read();
-            }
-
-            // Check if LBA48 is supported (word 83, bit 10)
-            self.lba48_supported = (identify_data[83] & (1 << 10)) != 0;
-
-            self.exists = true;
-            Ok(())
+            Err("Drive does not exist")
         }
     }
 

@@ -186,6 +186,7 @@ impl E1000 {
         let rx_desc_virt = self.rx_descriptors.as_ptr() as u64;
         // Kernel heap is identity-mapped
         let rx_desc_phys = rx_desc_virt;
+        
         self.write_reg(REG_RXDESCLO, (rx_desc_phys & 0xFFFFFFFF) as u32);
         self.write_reg(REG_RXDESCHI, (rx_desc_phys >> 32) as u32);
         self.write_reg(REG_RXDESCLEN, (RX_DESC_COUNT * 16) as u32);
