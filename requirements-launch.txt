@@ -1,0 +1,4 @@
+# Optional TUI deps for tools/mfk_launch.py.
+# The launcher works with stdlib alone; install these for nicer UI.
+rich>=13
+textual>=0.86

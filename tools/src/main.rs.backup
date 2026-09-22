@@ -67,9 +67,15 @@ fn main() {
 
     let no_run = args.iter().any(|a| a == "--no-run");
     let force = args.iter().any(|a| a == "--force");
-    let bundle = args.iter().any(|a| {
-        a == "--bundle-apps" || a == "--with-apps"
-    });
+    let bundle = args
+        .iter()
+        .any(|a| a == "--bundle-apps" || a == "--with-apps");
+
+    // --xhci-kbd: attach a modern xHCI controller + USB keyboard to QEMU.
+    // The emulated usb-kbd intentionally overrides PS/2 (like the Mac, where
+    // USB is the only input path), so all guest key input flows through the
+    // kernel's xHCI driver. Serial stdio stays available as a backdoor.
+    let xhci_kbd = args.iter().any(|a| a == "--xhci-kbd");
 
     // ------------------------------------------------------------
     // Create disk image paths
@@ -121,9 +127,7 @@ fn main() {
                 disk_raw.display()
             );
 
-            if let Err(e) =
-                simplfs_host::bundle_examples(disk_raw, examples)
-            {
+            if let Err(e) = simplfs_host::bundle_examples(disk_raw, examples) {
                 eprintln!("Bundle failed: {}", e);
             }
         } else if !disk_raw.exists() {
@@ -149,6 +153,9 @@ fn main() {
     println!("  Hypervisor: {}", hypervisor);
     println!("  Firmware:   {}", firmware.name());
     println!("  Boot image: {}", boot_image);
+    if xhci_kbd {
+        println!("  Input:      xHCI USB keyboard (PS/2 overridden)");
+    }
     println!();
 
     if no_run {
@@ -185,9 +192,7 @@ fn main() {
     if selected_hypervisor == "qemu" {
         if !command_exists("qemu-system-x86_64") {
             eprintln!("ERROR: qemu-system-x86_64 not found.");
-            eprintln!(
-                "Install: sudo apt-get install qemu-system-x86 qemu-utils"
-            );
+            eprintln!("Install: sudo apt-get install qemu-system-x86 qemu-utils");
             std::process::exit(1);
         }
     } else if !command_exists("VBoxManage") {
@@ -201,18 +206,14 @@ fn main() {
 
     match selected_hypervisor {
         "qemu" => match firmware {
-            Firmware::Bios => run_qemu_bios(&bios_path, bundle),
-            Firmware::Uefi => run_qemu_uefi(&uefi_path, bundle),
+            Firmware::Bios => run_qemu_bios(&bios_path, bundle, xhci_kbd),
+            Firmware::Uefi => run_qemu_uefi(&uefi_path, bundle, xhci_kbd),
         },
 
         "vbox" => match firmware {
-            Firmware::Bios => {
-                run_virtualbox(&bios_path, kernel_path, Firmware::Bios, force)
-            }
+            Firmware::Bios => run_virtualbox(&bios_path, kernel_path, Firmware::Bios, force),
 
-            Firmware::Uefi => {
-                run_virtualbox(&uefi_path, kernel_path, Firmware::Uefi, force)
-            }
+            Firmware::Uefi => run_virtualbox(&uefi_path, kernel_path, Firmware::Uefi, force),
         },
 
         _ => {
@@ -250,9 +251,7 @@ fn find_ovmf() -> PathBuf {
             return path;
         }
 
-        eprintln!(
-            "ERROR: OVMF_CODE was set but does not exist:"
-        );
+        eprintln!("ERROR: OVMF_CODE was set but does not exist:");
         eprintln!("  {}", path.display());
         std::process::exit(1);
     }
@@ -305,10 +304,7 @@ fn find_ovmf() -> PathBuf {
                 .unwrap_or_default()
                 .to_ascii_uppercase();
 
-            if path.is_file()
-                && name.starts_with("OVMF_CODE")
-                && name.ends_with(".FD")
-            {
+            if path.is_file() && name.starts_with("OVMF_CODE") && name.ends_with(".FD") {
                 return path;
             }
         }
@@ -335,12 +331,7 @@ fn find_ovmf() -> PathBuf {
 // VirtualBox
 // ------------------------------------------------------------
 
-fn run_virtualbox(
-    boot_image: &str,
-    kernel_path: &Path,
-    firmware: Firmware,
-    force: bool,
-) {
+fn run_virtualbox(boot_image: &str, kernel_path: &Path, firmware: Firmware, force: bool) {
     let firmware_name = firmware.name();
 
     // Use a different VDI and VM for BIOS vs UEFI.
@@ -367,12 +358,7 @@ fn run_virtualbox(
             println!("--force: removing stale VDI {}", vdi_path);
 
             let _ = Command::new("VBoxManage")
-                .args([
-                    "closemedium",
-                    "disk",
-                    &vdi_path,
-                    "--delete",
-                ])
+                .args(["closemedium", "disk", &vdi_path, "--delete"])
                 .output();
 
             let _ = std::fs::remove_file(&vdi_path);
@@ -384,9 +370,7 @@ fn run_virtualbox(
             .and_then(|m| m.modified())
             .ok();
 
-        let vdi_mtime = std::fs::metadata(&vdi_path)
-            .and_then(|m| m.modified())
-            .ok();
+        let vdi_mtime = std::fs::metadata(&vdi_path).and_then(|m| m.modified()).ok();
 
         match (image_mtime, vdi_mtime) {
             (Some(image), Some(vdi)) if image > vdi => {
@@ -396,12 +380,7 @@ fn run_virtualbox(
                 );
 
                 let _ = Command::new("VBoxManage")
-                    .args([
-                        "closemedium",
-                        "disk",
-                        &vdi_path,
-                        "--delete",
-                    ])
+                    .args(["closemedium", "disk", &vdi_path, "--delete"])
                     .output();
 
                 let _ = std::fs::remove_file(&vdi_path);
@@ -440,13 +419,8 @@ fn run_virtualbox(
         match result {
             Ok(output) => {
                 if !output.status.success() {
-                    eprintln!(
-                        "Warning: VBoxManage convertfromraw failed"
-                    );
-                    eprintln!(
-                        "stderr: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
+                    eprintln!("Warning: VBoxManage convertfromraw failed");
+                    eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
                     std::process::exit(1);
                 }
 
@@ -454,10 +428,7 @@ fn run_virtualbox(
             }
 
             Err(e) => {
-                eprintln!(
-                    "Error: Failed to run VBoxManage: {}",
-                    e
-                );
+                eprintln!("Error: Failed to run VBoxManage: {}", e);
                 std::process::exit(1);
             }
         }
@@ -472,10 +443,7 @@ fn run_virtualbox(
     let data_vdi_path = "target/disk.vdi";
 
     if !Path::new(data_vdi_path).exists() {
-        println!(
-            "Creating data disk VDI: {}",
-            data_vdi_path
-        );
+        println!("Creating data disk VDI: {}", data_vdi_path);
 
         let result = Command::new("VBoxManage")
             .args([
@@ -495,21 +463,13 @@ fn run_virtualbox(
         match result {
             Ok(output) => {
                 if !output.status.success() {
-                    eprintln!(
-                        "Warning: Failed to create data disk VDI"
-                    );
-                    eprintln!(
-                        "stderr: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
+                    eprintln!("Warning: Failed to create data disk VDI");
+                    eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
                 }
             }
 
             Err(e) => {
-                eprintln!(
-                    "Warning: Failed to create data disk: {}",
-                    e
-                );
+                eprintln!("Warning: Failed to create data disk: {}", e);
             }
         }
     }
@@ -533,28 +493,20 @@ fn run_virtualbox(
     // --------------------------------------------------------
 
     let run_vbox = |args: &[&str], desc: &str| -> bool {
-        match Command::new("VBoxManage")
-            .args(args)
-            .output()
-        {
+        match Command::new("VBoxManage").args(args).output() {
             Ok(output) if output.status.success() => true,
 
             Ok(output) => {
                 eprintln!(
                     "Warning: {} failed: {}",
                     desc,
-                    String::from_utf8_lossy(&output.stderr)
-                        .trim()
+                    String::from_utf8_lossy(&output.stderr).trim()
                 );
                 false
             }
 
             Err(e) => {
-                eprintln!(
-                    "Warning: {} failed to execute VBoxManage: {}",
-                    desc,
-                    e
-                );
+                eprintln!("Warning: {} failed to execute VBoxManage: {}", desc, e);
                 false
             }
         }
@@ -590,10 +542,7 @@ fn run_virtualbox(
             }
 
             Err(e) => {
-                eprintln!(
-                    "Error: Failed to run VBoxManage createvm: {}",
-                    e
-                );
+                eprintln!("Error: Failed to run VBoxManage createvm: {}", e);
                 std::process::exit(1);
             }
         }
@@ -614,9 +563,7 @@ fn run_virtualbox(
             ],
             "modifyvm memory",
         ) {
-            eprintln!(
-                "VM created but memory configuration failed."
-            );
+            eprintln!("VM created but memory configuration failed.");
         }
 
         // IDE controller
@@ -633,9 +580,7 @@ fn run_virtualbox(
             ],
             "create IDE controller",
         ) {
-            eprintln!(
-                "Error: Failed to create IDE controller"
-            );
+            eprintln!("Error: Failed to create IDE controller");
             std::process::exit(1);
         }
 
@@ -657,9 +602,7 @@ fn run_virtualbox(
             ],
             "attach boot disk",
         ) {
-            eprintln!(
-                "Error: Failed to attach boot disk"
-            );
+            eprintln!("Error: Failed to attach boot disk");
             std::process::exit(1);
         }
 
@@ -707,8 +650,7 @@ fn run_virtualbox(
             .output()
         {
             if output.status.success() {
-                let text =
-                    String::from_utf8_lossy(&output.stdout);
+                let text = String::from_utf8_lossy(&output.stdout);
 
                 let mut discovered = Vec::new();
 
@@ -724,21 +666,10 @@ fn run_virtualbox(
 
                 for iface in &discovered {
                     if run_vbox(
-                        &[
-                            "modifyvm",
-                            &vm_name,
-                            "--bridgeadapter1",
-                            iface,
-                        ],
-                        &format!(
-                            "set bridgeadapter1 to {}",
-                            iface
-                        ),
+                        &["modifyvm", &vm_name, "--bridgeadapter1", iface],
+                        &format!("set bridgeadapter1 to {}", iface),
                     ) {
-                        println!(
-                            "Using network interface: {} (auto-detected)",
-                            iface
-                        );
+                        println!("Using network interface: {} (auto-detected)", iface);
 
                         bridged_ok = true;
                         break;
@@ -758,35 +689,16 @@ fn run_virtualbox(
         // Fallback interface names
         if !bridged_ok {
             let fallback = [
-                "enp0s3",
-                "enp0s8",
-                "ens33",
-                "enp1s0",
-                "eth0",
-                "eth1",
-                "wlan0",
-                "wlp2s0",
-                "en0",
+                "enp0s3", "enp0s8", "ens33", "enp1s0", "eth0", "eth1", "wlan0", "wlp2s0", "en0",
                 "en1",
             ];
 
             for iface in &fallback {
                 if run_vbox(
-                    &[
-                        "modifyvm",
-                        &vm_name,
-                        "--bridgeadapter1",
-                        iface,
-                    ],
-                    &format!(
-                        "set bridgeadapter1 to {}",
-                        iface
-                    ),
+                    &["modifyvm", &vm_name, "--bridgeadapter1", iface],
+                    &format!("set bridgeadapter1 to {}", iface),
                 ) {
-                    println!(
-                        "Using network interface: {} (fallback)",
-                        iface
-                    );
+                    println!("Using network interface: {} (fallback)", iface);
 
                     bridged_ok = true;
                     break;
@@ -795,15 +707,9 @@ fn run_virtualbox(
         }
 
         if !bridged_ok {
-            eprintln!(
-                "Warning: Could not configure bridged adapter."
-            );
-            eprintln!(
-                "  List adapters: VBoxManage list bridgedifs"
-            );
-            eprintln!(
-                "  Or use QEMU: ./run.sh --qemu"
-            );
+            eprintln!("Warning: Could not configure bridged adapter.");
+            eprintln!("  List adapters: VBoxManage list bridgedifs");
+            eprintln!("  Or use QEMU: ./run.sh --qemu");
         }
 
         // ----------------------------------------------------
@@ -828,21 +734,15 @@ fn run_virtualbox(
             ],
             "set boot order and firmware",
         ) {
-            eprintln!(
-                "Warning: Could not configure VirtualBox firmware."
-            );
+            eprintln!("Warning: Could not configure VirtualBox firmware.");
         }
 
         // Serial console
         let serial_log = std::env::current_dir()
             .map(|p| p.join("target/mfk-serial.log"))
-            .unwrap_or_else(|_| {
-                Path::new("target/mfk-serial.log")
-                    .to_path_buf()
-            });
+            .unwrap_or_else(|_| Path::new("target/mfk-serial.log").to_path_buf());
 
-        let serial_str =
-            serial_log.to_string_lossy().to_string();
+        let serial_str = serial_log.to_string_lossy().to_string();
 
         run_vbox(
             &[
@@ -904,13 +804,8 @@ fn run_virtualbox(
                 ],
                 "re-attach boot disk",
             ) {
-                eprintln!(
-                    "Warning: Failed to update boot disk."
-                );
-                eprintln!(
-                    "Try: VBoxManage unregistervm {} --delete",
-                    vm_name
-                );
+                eprintln!("Warning: Failed to update boot disk.");
+                eprintln!("Try: VBoxManage unregistervm {} --delete", vm_name);
             } else {
                 println!("✓ Boot disk updated");
             }
@@ -945,19 +840,12 @@ fn run_virtualbox(
 
         if Path::new(data_vdi_path).exists() {
             if let Ok(info) = Command::new("VBoxManage")
-                .args([
-                    "showvminfo",
-                    &vm_name,
-                    "--machinereadable",
-                ])
+                .args(["showvminfo", &vm_name, "--machinereadable"])
                 .output()
             {
-                let info_str =
-                    String::from_utf8_lossy(&info.stdout);
+                let info_str = String::from_utf8_lossy(&info.stdout);
 
-                if !info_str.contains("disk.vdi")
-                    && !info_str.contains(data_vdi_path)
-                {
+                if !info_str.contains("disk.vdi") && !info_str.contains(data_vdi_path) {
                     run_vbox(
                         &[
                             "storageattach",
@@ -986,74 +874,36 @@ fn run_virtualbox(
 
     let serial_abs = std::env::current_dir()
         .map(|p| p.join("target/mfk-serial.log"))
-        .unwrap_or_else(|_| {
-            Path::new("target/mfk-serial.log")
-                .to_path_buf()
-        });
+        .unwrap_or_else(|_| Path::new("target/mfk-serial.log").to_path_buf());
 
     println!();
     println!("Starting VirtualBox VM: {}", vm_name);
-    println!(
-        "Firmware: {}",
-        firmware_name.to_uppercase()
-    );
-    println!(
-        "Boot image: {}",
-        boot_image
-    );
-    println!(
-        "Networking: Bridged (E1000/82540EM)"
-    );
-    println!(
-        "Serial console: {}",
-        serial_abs.display()
-    );
+    println!("Firmware: {}", firmware_name.to_uppercase());
+    println!("Boot image: {}", boot_image);
+    println!("Networking: Bridged (E1000/82540EM)");
+    println!("Serial console: {}", serial_abs.display());
 
     let result = Command::new("VBoxManage")
-        .args([
-            "startvm",
-            &vm_name,
-            "--type",
-            "gui",
-        ])
+        .args(["startvm", &vm_name, "--type", "gui"])
         .output();
 
     match result {
         Ok(output) => {
             if !output.status.success() {
-                let stderr =
-                    String::from_utf8_lossy(&output.stderr);
+                let stderr = String::from_utf8_lossy(&output.stderr);
 
-                eprintln!(
-                    "Error starting VM: {}",
-                    stderr.trim()
-                );
+                eprintln!("Error starting VM: {}", stderr.trim());
 
-                if stderr.contains("is already running")
-                    || stderr.contains("is running")
-                {
-                    eprintln!(
-                        "VM appears already running."
-                    );
+                if stderr.contains("is already running") || stderr.contains("is running") {
+                    eprintln!("VM appears already running.");
 
-                    eprintln!(
-                        "Access via VirtualBox GUI or:"
-                    );
+                    eprintln!("Access via VirtualBox GUI or:");
 
-                    eprintln!(
-                        "  VBoxManage controlvm {} poweroff",
-                        vm_name
-                    );
-                } else if stderr.contains("Host network interface")
-                    || stderr.contains("bridged")
-                {
-                    eprintln!(
-                        "Bridged network failed."
-                    );
+                    eprintln!("  VBoxManage controlvm {} poweroff", vm_name);
+                } else if stderr.contains("Host network interface") || stderr.contains("bridged") {
+                    eprintln!("Bridged network failed.");
 
-                    eprintln!(
-                        "  VBoxManage list bridgedifs"
-                    );
+                    eprintln!("  VBoxManage list bridgedifs");
 
                     eprintln!(
                         "  VBoxManage modifyvm {} \
@@ -1066,17 +916,11 @@ fn run_virtualbox(
             }
 
             println!("VM started successfully!");
-            println!(
-                "Serial console output: {}",
-                serial_abs.display()
-            );
+            println!("Serial console output: {}", serial_abs.display());
         }
 
         Err(e) => {
-            eprintln!(
-                "Error: Failed to start VirtualBox: {}",
-                e
-            );
+            eprintln!("Error: Failed to start VirtualBox: {}", e);
             std::process::exit(1);
         }
     }
@@ -1086,10 +930,7 @@ fn run_virtualbox(
 // QEMU BIOS
 // ------------------------------------------------------------
 
-fn run_qemu_bios(
-    bios_path: &str,
-    bundle: bool,
-) {
+fn run_qemu_bios(bios_path: &str, bundle: bool, xhci_kbd: bool) {
     let disk_path = "target/disk.img";
 
     create_qemu_data_disk(disk_path);
@@ -1102,64 +943,60 @@ fn run_qemu_bios(
     println!("Running MFK in QEMU...");
     println!("Firmware: BIOS");
     println!("Boot image: {}", bios_path);
-    println!(
-        "Networking: E1000 + user-mode NAT"
-    );
+    println!("Networking: E1000 + user-mode NAT");
+    if xhci_kbd {
+        println!("Input: xHCI USB keyboard (PS/2 overridden)");
+    }
 
     let mut qemu = Command::new("qemu-system-x86_64");
 
     qemu.args([
+        "-cpu",
+        "max",
         "-drive",
-        &format!(
-            "file={},format=raw,if=ide,index=0,media=disk",
-            bios_path
-        ),
-
+        &format!("file={},format=raw,if=ide,index=0,media=disk", bios_path),
         "-drive",
         &format!(
             "file={},format=raw,if=ide,index=1,media=disk,cache=none,readonly=off",
             disk_path
         ),
-
         "-serial",
         "stdio",
-
         "-display",
-        "none",
-
+        "gtk",
         "-no-reboot",
         "-no-shutdown",
-
         "-m",
         "128M",
-
         // Intel E1000 emulation.
         "-device",
         "e1000,netdev=net0",
-
         "-netdev",
         "user,id=net0,restrict=off,\
          hostfwd=udp::5555-:5555,\
-         hostfwd=tcp::49152-:49152",
+         hostfwd=tcp::49152-:49152, \
+         hostfwd=tcp::12345-:12345",
     ]);
 
-    let mut child = qemu
-        .spawn()
-        .expect("Failed to start QEMU");
+    if xhci_kbd {
+        qemu.args([
+            "-device",
+            "qemu-xhci,id=xhci",
+            "-device",
+            "usb-kbd,bus=xhci.0",
+        ]);
+    }
 
-    child
-        .wait()
-        .expect("Failed to wait on QEMU");
+    let mut child = qemu.spawn().expect("Failed to start QEMU");
+
+    child.wait().expect("Failed to wait on QEMU");
 }
 
 // ------------------------------------------------------------
 // QEMU UEFI
 // ------------------------------------------------------------
 
-fn run_qemu_uefi(
-    uefi_path: &str,
-    bundle: bool,
-) {
+fn run_qemu_uefi(uefi_path: &str, bundle: bool, xhci_kbd: bool) {
     let ovmf = find_ovmf();
 
     let disk_path = "target/disk.img";
@@ -1175,148 +1012,110 @@ fn run_qemu_uefi(
     println!("Firmware: UEFI / OVMF");
     println!("OVMF: {}", ovmf.display());
     println!("Boot image: {}", uefi_path);
-    println!(
-        "Networking: E1000 + user-mode NAT"
-    );
+    println!("Networking: E1000 + user-mode NAT");
+
+    if xhci_kbd {
+        println!("Input: xHCI USB keyboard ONLY");
+    } else {
+        println!("Input: PS/2 keyboard");
+    }
 
     let mut qemu = Command::new("qemu-system-x86_64");
-    let ovmf_drive = format!(
-        "if=pflash,format=raw,readonly=on,file={}",
-        ovmf.display()
-    );
+
+    let ovmf_drive = format!("if=pflash,format=raw,readonly=on,file={}", ovmf.display());
 
     qemu.args([
-        // Use the legacy PC machine because the kernel's disk driver uses
-        // the legacy ATA PIO ports; Q35 exposes AHCI instead.
+        "-cpu",
+        "max",
         "-machine",
         "pc",
-
         "-m",
         "128M",
-
-        // IMPORTANT:
-        //
-        // The UEFI image itself is attached here.
-        //
-        // We are NOT passing the kernel to QEMU with -kernel.
-        // OVMF must discover and execute:
-        //
-        // EFI/BOOT/BOOTX64.EFI
-        //
         "-drive",
-        &format!(
-            "file={},format=raw,if=ide,index=0,media=disk",
-            uefi_path
-        ),
-
+        &format!("file={},format=raw,if=ide,index=0,media=disk", uefi_path),
         "-drive",
         &format!(
             "file={},format=raw,if=ide,index=1,media=disk,cache=none,readonly=off",
             disk_path
         ),
-
-        // OVMF_CODE is a flash image, not a legacy PC BIOS image.
         "-drive",
         &ovmf_drive,
-
+        // Headless
+        "-display",
+        "none",
+        // Serial output only.
+        // stdin is NOT connected to the guest serial port.
         "-serial",
         "stdio",
-
-        "-display",
-        "gtk",
-
+        "-monitor",
+        "none",
         "-no-reboot",
         "-no-shutdown",
-
-        // Intel E1000.
+        // Network
         "-device",
         "e1000,netdev=net0",
-
         "-netdev",
         "user,id=net0,restrict=off,\
          hostfwd=udp::5555-:5555,\
          hostfwd=tcp::49152-:49152",
     ]);
 
-    let mut child = qemu
-        .spawn()
-        .expect("Failed to start QEMU with OVMF");
+    if xhci_kbd {
+        // USB 3 controller
+        qemu.args([
+            "-device",
+            "qemu-xhci,id=xhci",
+            // USB HID keyboard attached to xHCI
+            "-device",
+            "usb-kbd,bus=xhci.0",
+        ]);
+    }
 
-    child
-        .wait()
-        .expect("Failed to wait on QEMU");
+    let mut child = qemu.spawn().expect("Failed to start QEMU with OVMF");
+
+    child.wait().expect("Failed to wait on QEMU");
 }
 
 // ------------------------------------------------------------
 // QEMU data disk
 // ------------------------------------------------------------
 
-fn create_qemu_data_disk(
-    disk_path: &str,
-) {
+fn create_qemu_data_disk(disk_path: &str) {
     if !Path::new(disk_path).exists() {
-        println!(
-            "Creating virtual data disk: {}",
-            disk_path
-        );
+        println!("Creating virtual data disk: {}", disk_path);
 
         let result = Command::new("qemu-img")
-            .args([
-                "create",
-                "-f",
-                "raw",
-                disk_path,
-                "10M",
-            ])
+            .args(["create", "-f", "raw", disk_path, "10M"])
             .output();
 
         match result {
             Ok(output) => {
                 if !output.status.success() {
-                    eprintln!(
-                        "Warning: Failed to create data disk."
-                    );
+                    eprintln!("Warning: Failed to create data disk.");
 
-                    eprintln!(
-                        "stderr: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
+                    eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
                 }
             }
 
             Err(e) => {
-                eprintln!(
-                    "Warning: Failed to execute qemu-img: {}",
-                    e
-                );
+                eprintln!("Warning: Failed to execute qemu-img: {}", e);
             }
         }
     } else {
-        println!(
-            "Using existing data disk: {}",
-            disk_path
-        );
+        println!("Using existing data disk: {}", disk_path);
     }
 }
 
-fn bundle_qemu_examples(
-    disk_path: &str,
-) {
+fn bundle_qemu_examples(disk_path: &str) {
     let examples = Path::new("apps/examples");
 
     if !examples.exists() {
         return;
     }
 
-    println!(
-        "Bundling example apps into {}...",
-        disk_path
-    );
+    println!("Bundling example apps into {}...", disk_path);
 
-    if let Err(e) = simplfs_host::bundle_examples(
-        Path::new(disk_path),
-        examples,
-    ) {
+    if let Err(e) = simplfs_host::bundle_examples(Path::new(disk_path), examples) {
         eprintln!("Bundle failed: {}", e);
     }
 }
@@ -1326,46 +1125,33 @@ fn bundle_qemu_examples(
 // ------------------------------------------------------------
 
 fn print_usage(program: &str) {
-    eprintln!(
-        "Usage: {} <kernel-binary-path> [OPTIONS]",
-        program
-    );
+    eprintln!("Usage: {} <kernel-binary-path> [OPTIONS]", program);
 
     eprintln!();
 
     eprintln!("OPTIONS:");
 
-    eprintln!(
-        "  --vbox, --virtualbox     Run in VirtualBox (default)"
-    );
+    eprintln!("  --vbox, --virtualbox     Run in VirtualBox (default)");
 
-    eprintln!(
-        "  --qemu                   Run in QEMU"
-    );
+    eprintln!("  --qemu                   Run in QEMU");
 
-    eprintln!(
-        "  --bios                   Use BIOS firmware (default)"
-    );
+    eprintln!("  --bios                   Use BIOS firmware (default)");
 
-    eprintln!(
-        "  --uefi                   Use UEFI firmware"
-    );
+    eprintln!("  --uefi                   Use UEFI firmware");
 
-    eprintln!(
-        "  --no-run                 Only create disk images"
-    );
+    eprintln!("  --no-run                 Only create disk images");
 
-    eprintln!(
-        "  --force                  Force rebuild VDI/VM"
-    );
+    eprintln!("  --force                  Force rebuild VDI/VM");
 
-    eprintln!(
-        "  --bundle-apps, --with-apps"
-    );
+    eprintln!("  --bundle-apps, --with-apps");
 
-    eprintln!(
-        "                           Bundle apps/examples into target/disk.img"
-    );
+    eprintln!("                           Bundle apps/examples into target/disk.img");
+
+    eprintln!("  --xhci-kbd               Attach qemu-xhci + usb-kbd to QEMU");
+
+    eprintln!("                           (USB keyboard overrides PS/2; exercises");
+
+    eprintln!("                           the kernel xHCI driver)");
 
     eprintln!();
 
@@ -1397,25 +1183,21 @@ fn print_usage(program: &str) {
     );
 
     eprintln!(
-        "  {} target/x86_64-mfk/debug/mfk-kernel --no-run",
+        "  {} target/x86_64-mfk/debug/mfk-kernel --qemu --uefi --xhci-kbd",
         program
     );
+
+    eprintln!("  {} target/x86_64-mfk/debug/mfk-kernel --no-run", program);
 
     eprintln!();
 
     eprintln!("UEFI:");
 
-    eprintln!(
-        "  Install OVMF on Debian/Ubuntu:"
-    );
+    eprintln!("  Install OVMF on Debian/Ubuntu:");
 
-    eprintln!(
-        "    sudo apt install ovmf"
-    );
+    eprintln!("    sudo apt install ovmf");
 
-    eprintln!(
-        "  Or specify firmware manually:"
-    );
+    eprintln!("  Or specify firmware manually:");
 
     eprintln!(
         "    OVMF_CODE=/path/to/OVMF_CODE.fd {} target/x86_64-mfk/debug/mfk-kernel --qemu --uefi",

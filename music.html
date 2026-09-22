@@ -1,0 +1,195 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Note Player</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #111;
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+
+        .container {
+            width: 500px;
+            padding: 30px;
+            background: #222;
+            border-radius: 12px;
+        }
+
+        input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 12px;
+            font-size: 18px;
+            margin: 10px 0;
+            border-radius: 6px;
+            border: none;
+        }
+
+        button {
+            padding: 12px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            border: none;
+            border-radius: 6px;
+        }
+
+        #status {
+            margin-top: 15px;
+            color: #aaa;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+    <h1>Note Player</h1>
+
+    <p>Enter notes like:</p>
+    <code>a5 d5 a5 d5</code>
+
+    <input
+        id="notesInput"
+        type="text"
+        placeholder="a5 d5 a5 d5"
+    >
+
+    <button onclick="playNotes()">Play</button>
+
+    <div id="status"></div>
+</div>
+
+<script>
+    const duration = 0.5;
+
+    const A4_FREQ = 440.0;
+    const SEMITONE_RATIO = Math.pow(2, 1 / 12);
+
+    const noteOffsets = {
+        "c": -9,
+        "c#": -8,
+        "d": -7,
+        "d#": -6,
+        "e": -5,
+        "f": -4,
+        "f#": -3,
+        "g": -2,
+        "g#": -1,
+        "a": 0,
+        "a#": 1,
+        "b": 2
+    };
+
+    const notes = {};
+
+    // Generate notes from octave 1 through 998
+    for (let octave = 1; octave < 999; octave++) {
+        for (const [note, offset] of Object.entries(noteOffsets)) {
+
+            const noteName = `${note}${octave}`;
+
+            const frequency =
+                A4_FREQ *
+                Math.pow(
+                    SEMITONE_RATIO,
+                    offset + (octave - 4) * 12
+                );
+
+            notes[noteName] = frequency;
+        }
+    }
+
+
+    // Create an AudioContext
+    const audioContext =
+        new (window.AudioContext || window.webkitAudioContext)();
+
+
+    function playTone(frequency, duration) {
+        return new Promise(resolve => {
+
+            const oscillator = audioContext.createOscillator();
+            const gain = audioContext.createGain();
+
+            oscillator.type = "sine";
+            oscillator.frequency.value = frequency;
+
+            oscillator.connect(gain);
+            gain.connect(audioContext.destination);
+
+            oscillator.start();
+
+            setTimeout(() => {
+                oscillator.stop();
+                resolve();
+            }, duration * 1000);
+        });
+    }
+
+
+    async function playNotes() {
+
+        // Browsers require audio to start from a user interaction
+        if (audioContext.state === "suspended") {
+            await audioContext.resume();
+        }
+
+        const text =
+            document.getElementById("notesInput")
+                .value
+                .toLowerCase()
+                .trim();
+
+        const status =
+            document.getElementById("status");
+
+        if (!text) {
+            status.textContent = "Enter some notes first.";
+            return;
+        }
+
+        if (text === "quit") {
+            status.textContent = "Quit.";
+            return;
+        }
+
+        const noteList = text.split(/\s+/);
+
+        for (const note of noteList) {
+
+            if (notes[note] !== undefined) {
+
+                status.textContent =
+                    `Playing ${note} (${notes[note].toFixed(2)} Hz)`;
+
+                await playTone(
+                    notes[note],
+                    duration
+                );
+
+            } else {
+
+                status.textContent =
+                    `Invalid note: ${note}. Use a format like c4 or g#5.`;
+
+                break;
+            }
+        }
+
+        status.textContent += " — Done";
+    }
+</script>
+
+</body>
+</html>
+
