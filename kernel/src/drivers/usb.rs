@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::drivers::pci::{PCI_VENDOR_INTEL, PciDevice};
+use crate::drivers::pci::{PciDevice, PCI_VENDOR_INTEL};
 use crate::drivers::xhci::XhciController;
 
 // ---------------------------------------------------------------------------
@@ -228,9 +228,11 @@ struct Qtd {
     buf4: u32,
 }
 
-struct KeyboardEp {
+/// One claimed HID interrupt endpoint (keyboard or boot mouse). The poll
+/// loops route by which vec owns the entry.
+struct HidEp {
     addr: u8,
-    /// Root port this keyboard was claimed on (for hotplug rescan tracking).
+    /// Root port this endpoint was claimed on (for hotplug rescan tracking).
     port: u8,
     qh_virt: u64,
     qh_phys: u64,
@@ -241,7 +243,7 @@ struct KeyboardEp {
     maxpacket: u16,
 }
 
-unsafe impl Send for KeyboardEp {}
+unsafe impl Send for HidEp {}
 
 struct EhciController {
     pci_bus: u8,
@@ -256,7 +258,9 @@ struct EhciController {
     async_qh_virt: u64,
     async_qh_phys: u64,
     next_addr: u8,
-    keyboards: Vec<KeyboardEp>,
+    keyboards: Vec<HidEp>,
+    /// Claimed boot-mouse endpoints (polled like keyboards, parsed as mice).
+    mice: Vec<HidEp>,
 }
 
 unsafe impl Send for EhciController {}
@@ -413,12 +417,14 @@ pub fn init(phys_mem_offset: u64) {
             Ok(mut ctl) => {
                 ctl.enumerate_all();
                 let kbd = ctl.keyboards.len();
+                let ptr = ctl.mice.len();
                 crate::println!(
-                    "[usb] EHCI {:02x}:{:02x}.{} ready, {} keyboard(s)",
+                    "[usb] EHCI {:02x}:{:02x}.{} ready, {} keyboard(s), {} mouse(s)",
                     bus,
                     dev,
                     func,
-                    kbd
+                    kbd,
+                    ptr
                 );
                 STATE.lock().controllers.push(ctl);
             }
@@ -440,6 +446,7 @@ pub fn init(phys_mem_offset: u64) {
         .iter()
         .map(|c| c.keyboards.len())
         .sum();
+    let ehci_ptr: usize = STATE.lock().controllers.iter().map(|c| c.mice.len()).sum();
 
     // Bring up xHCI controllers (Phase 1: running + proven rings, Phase 2:
     // enumeration, Phase 3: HID claiming + interrupt-IN polling).
@@ -464,16 +471,20 @@ pub fn init(phys_mem_offset: u64) {
         match XhciController::new(dev_copy, phys_mem_offset) {
             Ok(mut ctl) => {
                 // Phase 2: enumerate ports to configured devices, then
-                // Phase 3: claim HID keyboards and prime interrupt endpoints.
+                // Phase 3: claim HID keyboards + mice/tablets and prime
+                // interrupt endpoints.
                 ctl.enumerate();
                 ctl.claim_hid_keyboards();
+                ctl.claim_hid_pointers();
                 let claimed = ctl.hid_keyboard_count();
+                let pointers = ctl.hid_pointer_count();
                 crate::println!(
-                    "[usb] xHCI {:02x}:{:02x}.{} running, polling ({} HID kbd)",
+                    "[usb] xHCI {:02x}:{:02x}.{} running, polling ({} HID kbd, {} HID ptr)",
                     bus,
                     dev,
                     func,
-                    claimed
+                    claimed,
+                    pointers
                 );
                 STATE.lock().xhci.push(ctl);
             }
@@ -489,12 +500,22 @@ pub fn init(phys_mem_offset: u64) {
         }
     }
 
-    let xhci_kbd: usize = STATE.lock().xhci.iter().map(|c| c.hid_keyboard_count()).sum();
+    let xhci_kbd: usize = STATE
+        .lock()
+        .xhci
+        .iter()
+        .map(|c| c.hid_keyboard_count())
+        .sum();
     let total_kbd = ehci_kbd + xhci_kbd;
-    if total_kbd == 0 {
-        crate::println!("[usb] HID transport pending (no boot keyboards claimed)");
+    let total_ptr = hid_pointer_count();
+    if total_kbd == 0 && total_ptr == 0 {
+        crate::println!("[usb] HID transport pending (no boot HID devices claimed)");
     } else {
-        crate::println!("[usb] HID ready: {} keyboard(s), polling", total_kbd);
+        crate::println!(
+            "[usb] HID ready: {} keyboard(s), {} pointer(s), polling",
+            total_kbd,
+            total_ptr
+        );
     }
     STATE.lock().ready = true;
 }
@@ -574,23 +595,31 @@ pub fn probe_report() {
     {
         let state = STATE.lock();
         let ehci_kbd: usize = state.controllers.iter().map(|c| c.keyboards.len()).sum();
+        let ehci_ptr: usize = state.controllers.iter().map(|c| c.mice.len()).sum();
         let xhci_kbd: usize = state.xhci.iter().map(|c| c.hid_keyboard_count()).sum();
+        let xhci_ptr: usize = state.xhci.iter().map(|c| c.hid_pointer_count()).sum();
         crate::println!(
-            "[usb] status: EHCI x{} ({} kbd), xHCI x{} ({} kbd), PS/2 kbd active",
+            "[usb] status: EHCI x{} ({} kbd, {} ptr), xHCI x{} ({} kbd, {} ptr), PS/2 kbd active",
             state.controllers.len(),
             ehci_kbd,
+            ehci_ptr,
             state.xhci.len(),
             xhci_kbd,
+            xhci_ptr,
         );
     }
     {
         let present = crate::drivers::mouse::is_present();
         let (mx, my) = crate::drivers::mouse::position();
+        let (usb_mice, usb_tablets) = crate::drivers::mouse::mouse_usb_stats();
         crate::println!(
-            "[input] PS/2 mouse: {} at ({}, {})",
+            "[input] mouse: {} at ({}, {}), buttons {:#05b} (PS/2 + USB: {} rel + {} abs reports)",
             if present { "ready" } else { "absent" },
             mx,
             my,
+            crate::drivers::mouse::buttons(),
+            usb_mice,
+            usb_tablets,
         );
     }
 }
@@ -598,8 +627,31 @@ pub fn probe_report() {
 /// Number of claimed USB HID keyboards (EHCI + xHCI).
 pub fn hid_keyboard_count() -> usize {
     let state = STATE.lock();
-    state.controllers.iter().map(|c| c.keyboards.len()).sum::<usize>()
-        + state.xhci.iter().map(|c| c.hid_keyboard_count()).sum::<usize>()
+    state
+        .controllers
+        .iter()
+        .map(|c| c.keyboards.len())
+        .sum::<usize>()
+        + state
+            .xhci
+            .iter()
+            .map(|c| c.hid_keyboard_count())
+            .sum::<usize>()
+}
+
+/// Number of claimed USB HID pointers (EHCI boot mice + xHCI mice/tablets).
+pub fn hid_pointer_count() -> usize {
+    let state = STATE.lock();
+    state
+        .controllers
+        .iter()
+        .map(|c| c.mice.len())
+        .sum::<usize>()
+        + state
+            .xhci
+            .iter()
+            .map(|c| c.hid_pointer_count())
+            .sum::<usize>()
 }
 
 /// Number of live controllers by type (ehci, xhci).
@@ -621,6 +673,7 @@ pub fn poll() {
     let mut state = STATE.lock();
     for ctl in state.controllers.iter_mut() {
         ctl.poll_keyboards();
+        ctl.poll_mice();
     }
     for ctl in state.xhci.iter_mut() {
         ctl.poll();
@@ -655,11 +708,17 @@ impl EhciController {
         match pci.pm_info() {
             Some((cap, st)) => crate::println!(
                 "[usb] EHCI {:02x}:{:02x}.{} PM cap {:#x} state D{}",
-                pci.bus, pci.device, pci.function, cap, st
+                pci.bus,
+                pci.device,
+                pci.function,
+                cap,
+                st
             ),
             None => crate::println!(
                 "[usb] EHCI {:02x}:{:02x}.{} no PM cap",
-                pci.bus, pci.device, pci.function
+                pci.bus,
+                pci.device,
+                pci.function
             ),
         }
 
@@ -682,7 +741,12 @@ impl EhciController {
         let cmd = pci.read_config(0x04);
         if cmd & 0x02 == 0 {
             pci.write_config(0x04, cmd | 0x02);
-            crate::serial_println!("[usb] EHCI {:02x}:{:02x}.{} COMMAND mem-enable set", pci.bus, pci.device, pci.function);
+            crate::serial_println!(
+                "[usb] EHCI {:02x}:{:02x}.{} COMMAND mem-enable set",
+                pci.bus,
+                pci.device,
+                pci.function
+            );
         }
 
         let caplength = unsafe { mmio_r8(mmio_virt, CAP_CAPLENGTH) } as usize;
@@ -691,7 +755,13 @@ impl EhciController {
             let cmd = pci.read_config(0x04);
             crate::println!(
                 "[usb] EHCI {:02x}:{:02x}.{} BAD CAPLENGTH {} BAR0={:#x} CMD={:#x} phys={:#x}",
-                pci.bus, pci.device, pci.function, caplength, pci.bar0, cmd, mmio_phys
+                pci.bus,
+                pci.device,
+                pci.function,
+                caplength,
+                pci.bar0,
+                cmd,
+                mmio_phys
             );
             return Err("bad CAPLENGTH");
         }
@@ -775,7 +845,9 @@ impl EhciController {
         if !reset_done {
             crate::println!(
                 "[usb] EHCI {:02x}:{:02x}.{} HCRESET stuck",
-                pci.bus, pci.device, pci.function
+                pci.bus,
+                pci.device,
+                pci.function
             );
             return Err("reset timeout");
         }
@@ -791,7 +863,11 @@ impl EhciController {
                 if legsup & (1 << 16) != 0 || legsup & 0xFF00_0000 != 0 {
                     crate::println!(
                         "[usb] EHCI {:02x}:{:02x}.{} re-handoff LEGSUP={:#x} CTLSTS={:#x}",
-                        pci.bus, pci.device, pci.function, legsup, ctlsts
+                        pci.bus,
+                        pci.device,
+                        pci.function,
+                        legsup,
+                        ctlsts
                     );
                 }
                 mmio_w32(mmio_virt, eecp, (legsup & 0x00FF_FFFF) | (1 << 24));
@@ -888,7 +964,11 @@ impl EhciController {
             let cmd = unsafe { mmio_r32(op_base, OP_USBCMD) };
             crate::println!(
                 "[usb] EHCI {:02x}:{:02x}.{} start timeout CMD={:#x} STS={:#x}",
-                pci.bus, pci.device, pci.function, cmd, sts
+                pci.bus,
+                pci.device,
+                pci.function,
+                cmd,
+                sts
             );
             return Err("start timeout");
         }
@@ -908,6 +988,7 @@ impl EhciController {
             async_qh_phys: qh_phys,
             next_addr: 1,
             keyboards: Vec::new(),
+            mice: Vec::new(),
         })
     }
 
@@ -971,7 +1052,8 @@ impl EhciController {
             // let the hub probe decide instead of failing here.
             crate::println!(
                 "[usb] EHCI port{} connected, not enabled ({:#x}), trying hub probe",
-                port, s2
+                port,
+                s2
             );
             return true;
         }
@@ -1016,8 +1098,15 @@ impl EhciController {
             }
             crate::println!(
                 "[usb] EHCI {:02x}:{:02x}.{} re-started, STS={:#x} {}",
-                self.pci_bus, self.pci_dev, self.pci_func, sts,
-                if sts & STS_HCHALTED == 0 { "RUN" } else { "HALTED" }
+                self.pci_bus,
+                self.pci_dev,
+                self.pci_func,
+                sts,
+                if sts & STS_HCHALTED == 0 {
+                    "RUN"
+                } else {
+                    "HALTED"
+                }
             );
         }
         let cmd = unsafe { mmio_r32(self.op_base, OP_USBCMD) };
@@ -1186,10 +1275,13 @@ impl EhciController {
             return self.enumerate_hub(port, addr, maxpacket0, eps, cflag, &cfg);
         }
 
-        // Find HID boot keyboard interface + interrupt IN endpoint.
-        let (iface, ep, ep_max) = match find_hid_keyboard(&cfg) {
-            Some(v) => v,
-            None => return false,
+        // Find HID boot keyboard or mouse interface + interrupt IN endpoint.
+        let (iface, ep, ep_max, is_mouse) = match find_hid_keyboard(&cfg) {
+            Some((iface, ep, max)) => (iface, ep, max, false),
+            None => match find_hid_mouse(&cfg) {
+                Some((iface, ep, max)) => (iface, ep, max, true),
+                None => return false,
+            },
         };
 
         // SET_CONFIGURATION (first config value).
@@ -1202,7 +1294,7 @@ impl EhciController {
             return false;
         }
 
-        // SET_PROTOCOL boot (0).
+        // SET_PROTOCOL boot (0). Valid for keyboards and mice alike.
         let setup_proto = setup_packet(0x21, 0x0B, 0, iface as u16, 0);
         if self
             .control_transfer(addr, maxpacket0, eps, cflag, hub, setup_proto, None, 0)
@@ -1212,7 +1304,7 @@ impl EhciController {
         }
 
         // SET_IDLE (0, report only on change) — like the xHCI claim path;
-        // continue on failure, most keyboards default sensibly.
+        // continue on failure, most devices default sensibly.
         let setup_idle = setup_packet(0x21, 0x0A, 0, iface as u16, 0);
         if self
             .control_transfer(addr, maxpacket0, eps, cflag, hub, setup_idle, None, 0)
@@ -1221,14 +1313,25 @@ impl EhciController {
             crate::println!("[usb] HID SET_IDLE failed, continuing");
         }
 
-        self.start_interrupt_poll(port, addr, ep, ep_max.min(8), eps, cflag, hub);
-        crate::println!(
-            "[usb] HID keyboard addr={} ep={:#x} max={} claimed (port{})",
-            addr,
-            ep,
-            ep_max,
-            port
-        );
+        if is_mouse {
+            self.start_mouse_poll(port, addr, ep, ep_max.min(8), eps, cflag, hub);
+            crate::println!(
+                "[usb] HID mouse addr={} ep={:#x} max={} claimed (port{})",
+                addr,
+                ep,
+                ep_max,
+                port
+            );
+        } else {
+            self.start_interrupt_poll(port, addr, ep, ep_max.min(8), eps, cflag, hub);
+            crate::println!(
+                "[usb] HID keyboard addr={} ep={:#x} max={} claimed (port{})",
+                addr,
+                ep,
+                ep_max,
+                port
+            );
+        }
         true
     }
 
@@ -1341,9 +1444,12 @@ impl EhciController {
         let setup_cfg = setup_packet(0x80, 6, 0x0200, 0, total as u16);
         let cfg = self.control_transfer_hub(addr, maxpacket0, eps, cflag, hub, setup_cfg, total);
         let Some(cfg) = cfg else { return false };
-        let (iface, ep, ep_max) = match find_hid_keyboard(&cfg) {
-            Some(v) => v,
-            None => return false,
+        let (iface, ep, ep_max, is_mouse) = match find_hid_keyboard(&cfg) {
+            Some((iface, ep, max)) => (iface, ep, max, false),
+            None => match find_hid_mouse(&cfg) {
+                Some((iface, ep, max)) => (iface, ep, max, true),
+                None => return false,
+            },
         };
         let cfg_value = cfg.get(5).copied().unwrap_or(1);
         let setup_setcfg = setup_packet(0x00, 9, cfg_value as u16, 0, 0);
@@ -1355,13 +1461,23 @@ impl EhciController {
         }
         let setup_proto = setup_packet(0x21, 0x0B, 0, iface as u16, 0);
         let _ = self.control_transfer_hub(addr, maxpacket0, eps, cflag, hub, setup_proto, 0);
-        self.start_interrupt_poll_hub(root_port, addr, ep, ep_max.min(8), eps, hub);
-        crate::println!(
-            "[usb] HID keyboard addr={} via hub {} port {} claimed",
-            addr,
-            hub_addr,
-            hub_port
-        );
+        if is_mouse {
+            self.start_interrupt_poll_hub(root_port, addr, ep, ep_max.min(8), eps, hub, true);
+            crate::println!(
+                "[usb] HID mouse addr={} via hub {} port {} claimed",
+                addr,
+                hub_addr,
+                hub_port
+            );
+        } else {
+            self.start_interrupt_poll_hub(root_port, addr, ep, ep_max.min(8), eps, hub, false);
+            crate::println!(
+                "[usb] HID keyboard addr={} via hub {} port {} claimed",
+                addr,
+                hub_addr,
+                hub_port
+            );
+        }
         true
     }
 
@@ -1650,7 +1766,23 @@ impl EhciController {
         cflag: u32,
         hub: Option<(u8, u8)>,
     ) {
-        self.start_interrupt_poll_hub(port, addr, ep, maxpacket, eps, hub);
+        self.start_interrupt_poll_hub(port, addr, ep, maxpacket, eps, hub, false);
+        let _ = cflag;
+    }
+
+    /// Claim a boot-mouse interrupt endpoint (same machinery as keyboards,
+    /// tracked in `mice` so the poll loop parses reports as mice).
+    fn start_mouse_poll(
+        &mut self,
+        port: u8,
+        addr: u8,
+        ep: u8,
+        maxpacket: u16,
+        eps: u8,
+        cflag: u32,
+        hub: Option<(u8, u8)>,
+    ) {
+        self.start_interrupt_poll_hub(port, addr, ep, maxpacket, eps, hub, true);
         let _ = cflag;
     }
 
@@ -1662,6 +1794,7 @@ impl EhciController {
         maxpacket: u16,
         eps: u8,
         hub: Option<(u8, u8)>,
+        is_mouse: bool,
     ) {
         let (qh_virt, qh_phys, qh_ptr) = match dma_page() {
             Some(v) => v,
@@ -1725,7 +1858,7 @@ impl EhciController {
                 mmio_w32(self.op_base, OP_USBCMD, cmd | CMD_PSE);
             }
         }
-        self.keyboards.push(KeyboardEp {
+        let ep_entry = HidEp {
             addr,
             port,
             qh_virt,
@@ -1735,7 +1868,12 @@ impl EhciController {
             buf_virt,
             buf_phys,
             maxpacket: maxpacket.min(8),
-        });
+        };
+        if is_mouse {
+            self.mice.push(ep_entry);
+        } else {
+            self.keyboards.push(ep_entry);
+        }
     }
 
     fn poll_keyboards(&mut self) {
@@ -1762,7 +1900,35 @@ impl EhciController {
         }
     }
 
-    fn reprime(kbd: &KeyboardEp) {
+    fn poll_mice(&mut self) {
+        for mouse in self.mice.iter() {
+            unsafe {
+                let qtd = &*(mouse.qtd_virt as *const Qtd);
+                let tok = core::ptr::read_volatile(&qtd.token);
+                if tok & TOK_ACTIVE != 0 {
+                    continue;
+                }
+                if tok & (TOK_HALTED | TOK_BUFERR | TOK_BABBLE | TOK_XACTERR) != 0 {
+                    // Re-prime on error to avoid stuck endpoint.
+                    Self::reprime(mouse);
+                    continue;
+                }
+                // Completed IN transfer: boot mouse report
+                // (buttons, dx, dy [, wheel]). HID Y is screen-positive-down.
+                let report_ptr = mouse.buf_virt as *const u8;
+                let mut report = [0u8; 8];
+                core::ptr::copy_nonoverlapping(report_ptr, report.as_mut_ptr(), 8);
+                crate::drivers::mouse::push_usb_mouse(
+                    report[0],
+                    report[1] as i8 as i16,
+                    report[2] as i8 as i16,
+                );
+                Self::reprime(mouse);
+            }
+        }
+    }
+
+    fn reprime(kbd: &HidEp) {
         unsafe {
             let qtd = &mut *(kbd.qtd_virt as *mut Qtd);
             core::ptr::write_volatile(&mut qtd.next, TERM);
@@ -1832,15 +1998,280 @@ pub(crate) fn find_hid_keyboard(cfg: &[u8]) -> Option<(u8, u8, u16)> {
     None
 }
 
-/// USB-mouse hook (future work, PS/2 covers QEMU/VBox for now).
+/// Pointer-device kinds a single HID interrupt endpoint can serve. One
+/// xHCI slot (and one EHCI QH) carries exactly one claimed endpoint, so a
+/// composite keyboard+mouse device claims across separate interfaces only
+/// when they live on separate endpoints — the common QEMU case (usb-kbd
+/// and usb-tablet are separate devices/slots).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HidPointerKind {
+    /// Boot-protocol mouse: 3-byte (buttons, dx, dy) or 4-byte (+wheel).
+    BootMouse,
+    /// Absolute tablet/pointer (e.g. QEMU usb-tablet): buttons + LE X/Y.
+    Tablet,
+}
+
+/// Absolute-tablet report layout decoded from its HID report descriptor.
+/// All offsets/sizes in bytes and bits; X/Y are unsigned little-endian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TabletLayout {
+    /// Byte offset of the button byte (low 3 bits are buttons 1-3).
+    pub buttons_at: usize,
+    /// Byte offset of the 16-bit LE absolute X field.
+    pub x_at: usize,
+    /// Byte offset of the 16-bit LE absolute Y field.
+    pub y_at: usize,
+    /// Logical maximum of X (device units).
+    pub x_max: u32,
+    /// Logical maximum of Y (device units).
+    pub y_max: u32,
+    /// Total input report length in bytes.
+    pub report_len: usize,
+}
+
+impl TabletLayout {
+    /// QEMU usb-tablet fallback: [buttons, Xlo, Xhi, Ylo, Yhi], 0..32767.
+    /// Used when the report descriptor is missing or unparseable; the
+    /// descriptor dump in the claim log shows whether it applied.
+    pub(crate) const fn qm_fallback() -> Self {
+        Self {
+            buttons_at: 0,
+            x_at: 1,
+            y_at: 3,
+            x_max: 32767,
+            y_max: 32767,
+            report_len: 5,
+        }
+    }
+}
+
+/// Detects a HID pointer interface (boot mouse or absolute tablet) with an
+/// interrupt-IN endpoint. Returns (interface, endpoint, maxpacket, kind).
+/// Boot mice (subclass 1, protocol 2) match first; otherwise a subclass 0 /
+/// protocol 0 HID interface with an interrupt-IN endpoint is treated as a
+/// tablet candidate (its report descriptor is parsed at claim time, with a
+/// QEMU-layout fallback).
+pub(crate) fn find_hid_pointer(cfg: &[u8]) -> Option<(u8, u8, u16, HidPointerKind)> {
+    // Pass 1: boot-protocol mouse (deterministic layout, preferred).
+    if let Some((iface, ep, max)) = find_hid_mouse(cfg) {
+        return Some((iface, ep, max, HidPointerKind::BootMouse));
+    }
+    // Pass 2: subclass-0/protocol-0 HID interface + interrupt-IN endpoint.
+    let mut i = 0;
+    let mut cur_iface: Option<u8> = None;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        let dtype = cfg[i + 1];
+        if len == 0 || i + len > cfg.len() {
+            break;
+        }
+        if dtype == 4 && len >= 9 {
+            if cfg[i + 5] == 3 && cfg[i + 6] == 0 && cfg[i + 7] == 0 {
+                cur_iface = Some(cfg[i + 2]);
+            } else {
+                cur_iface = None;
+            }
+        } else if dtype == 5 && len >= 7 {
+            if let Some(iface) = cur_iface {
+                let ep_addr = cfg[i + 2];
+                let attr = cfg[i + 3];
+                let max = (cfg[i + 4] as u16) | ((cfg[i + 5] as u16) << 8);
+                if ep_addr & 0x80 != 0 && attr & 0x03 == 0x03 {
+                    return Some((iface, ep_addr, max.max(8), HidPointerKind::Tablet));
+                }
+            }
+        }
+        i += len;
+    }
+    None
+}
+
+/// Minimal HID report-descriptor walker for absolute tablets.
 ///
+/// Tracks Global items (Logical Minimum/Maximum, Report Size/Count, Usage
+/// Page) and finds the first two 16-bit Generic-Desktop X (0x30) / Y (0x31)
+/// fields plus the leading button byte. Returns None when no absolute X/Y
+/// pair is found; callers fall back to [`TabletLayout::qemu_fallback`].
+/// Short items only (QEMU emits no long items); bounded by descriptor len.
+pub(crate) fn parse_tablet_layout(desc: &[u8]) -> Option<TabletLayout> {
+    let mut usage_page: u32 = 0;
+    let mut log_min: i32 = 0;
+    let mut log_max: i32 = 0;
+    let mut report_size: u32 = 0;
+    let mut report_count: u32 = 0;
+    // Byte offset accumulator for the input report under construction.
+    let mut bit_offset: u32 = 0;
+    let mut buttons_at: Option<usize> = None;
+    let mut x_at: Option<usize> = None;
+    let mut y_at: Option<usize> = None;
+    let mut x_max: u32 = 0;
+    let mut y_max: u32 = 0;
+    // Pending local usages for the next Input/Main item.
+    let mut usages: [u32; 8] = [0; 8];
+    let mut n_usages: usize = 0;
+    let mut usage_min: u32 = 0;
+    let mut have_usage_min = false;
+
+    let mut i = 0;
+    while i < desc.len() {
+        let prefix = desc[i];
+        i += 1;
+        if prefix == 0xFE {
+            // Long item: skip (length byte + tag + payload).
+            if i + 2 > desc.len() {
+                break;
+            }
+            let len = desc[i] as usize;
+            i += 2 + len;
+            if i > desc.len() {
+                break;
+            }
+            continue;
+        }
+        let size_code = prefix & 0x03;
+        let typ = (prefix >> 2) & 0x03;
+        let tag = (prefix >> 4) & 0x0F;
+        let data_len = match size_code {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+        if i + data_len > desc.len() {
+            break;
+        }
+        let mut data: u32 = 0;
+        for k in 0..data_len {
+            data |= (desc[i + k] as u32) << (8 * k);
+        }
+        i += data_len;
+
+        match (typ, tag) {
+            // Global items.
+            (1, 0x0) => {
+                // Usage Page
+                usage_page = data;
+            }
+            (1, 0x1) => {
+                // Logical Minimum (sign-extend by size).
+                log_min = match data_len {
+                    1 => (data as u8) as i8 as i32,
+                    2 => (data as u16) as i16 as i32,
+                    _ => data as i32,
+                };
+            }
+            (1, 0x2) => {
+                // Logical Maximum (sign-extend by size).
+                log_max = match data_len {
+                    1 => (data as u8) as i8 as i32,
+                    2 => (data as u16) as i16 as i32,
+                    _ => data as i32,
+                };
+            }
+            (1, 0x7) => report_size = data,
+            (1, 0x9) => report_count = data.max(1),
+            // Local items: Usage / Usage Minimum / Usage Maximum.
+            (2, 0x0) => {
+                let usage = if data_len == 4 {
+                    // Extended usage: high 16 = page.
+                    if (data >> 16) != 0 {
+                        usage_page = data >> 16;
+                    }
+                    data & 0xFFFF
+                } else {
+                    data
+                };
+                if n_usages < usages.len() {
+                    usages[n_usages] = (usage_page << 16) | usage;
+                    n_usages += 1;
+                }
+                have_usage_min = false;
+            }
+            (2, 0x1) => {
+                usage_min = (usage_page << 16) | data;
+                have_usage_min = true;
+                n_usages = 0;
+            }
+            (2, 0x2) => {
+                let umax = (usage_page << 16) | data;
+                n_usages = 0;
+                // Expand button ranges (0x90001..=0x90003) explicitly; other
+                // ranges are recorded by endpoints below.
+                if usage_page == 0x09 && have_usage_min {
+                    let lo = usage_min & 0xFFFF;
+                    let hi = umax & 0xFFFF;
+                    if lo <= 0x03 && hi >= 0x01 && buttons_at.is_none() {
+                        buttons_at = Some((bit_offset / 8) as usize);
+                    }
+                }
+            }
+            // Main: Input (0x8).
+            (0, 0x8) => {
+                let is_variable = data & 0x02 != 0;
+                let is_relative = data & 0x04 != 0;
+                let is_constant = data & 0x01 != 0;
+                let bits = report_size * report_count;
+                if !is_constant && is_variable && !is_relative {
+                    // Absolute data fields: match usages in order.
+                    let mut field_bit = bit_offset;
+                    for u in 0..n_usages {
+                        let page = usages[u] >> 16;
+                        let id = usages[u] & 0xFFFF;
+                        let fsize = report_size;
+                        if page == 0x01 && id == 0x30 && x_at.is_none() && fsize == 16 {
+                            x_at = Some((field_bit / 8) as usize);
+                            x_max = (log_max.max(0)) as u32;
+                        } else if page == 0x01 && id == 0x31 && y_at.is_none() && fsize == 16 {
+                            y_at = Some((field_bit / 8) as usize);
+                            y_max = (log_max.max(0)) as u32;
+                        } else if page == 0x09 && buttons_at.is_none() {
+                            // Button usages without explicit min/max pair.
+                            buttons_at = Some((field_bit / 8) as usize);
+                        }
+                        field_bit += fsize;
+                    }
+                    // Single-usage fields spanning the whole item (e.g. one
+                    // X usage with count 2 is handled by callers pairing
+                    // consecutive 16-bit halves; nothing extra here).
+                    let _ = log_min;
+                }
+                bit_offset += bits;
+                n_usages = 0;
+                have_usage_min = false;
+            }
+            // Main: Collection / End Collection / Feature / Output.
+            (0, _) => {
+                n_usages = 0;
+                have_usage_min = false;
+                if tag == 0xC {
+                    // End Collection: nothing to reset globally.
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let (x_at, y_at) = (x_at?, y_at?);
+    if x_max == 0 || y_max == 0 {
+        return None;
+    }
+    let report_len = ((bit_offset + 7) / 8)
+        .max((y_at as u32) + 2)
+        .max((x_at as u32) + 2) as usize;
+    Some(TabletLayout {
+        buttons_at: buttons_at.unwrap_or(0),
+        x_at,
+        y_at,
+        x_max,
+        y_max,
+        report_len: report_len.min(64),
+    })
+}
+
 /// Detects a HID boot-protocol mouse interface (class 3, subclass 1,
 /// protocol 2) with an interrupt-IN endpoint, mirroring
-/// [`find_hid_keyboard`]. The caller does not claim it yet: turning this
-/// into a live mouse needs HID report parsing plus polling in
-/// `xhci.rs`/`usb.rs`, which is intentionally out of scope for the
-/// PS/2-first desktop milestone.
-#[allow(dead_code)]
+/// [`find_hid_keyboard`]. Claimed by the xHCI/EHCI pointer paths; reports
+/// flow to [`crate::drivers::mouse::push_usb_mouse`].
 pub(crate) fn find_hid_mouse(cfg: &[u8]) -> Option<(u8, u8, u16)> {
     let mut i = 0;
     let mut cur_iface: Option<u8> = None;

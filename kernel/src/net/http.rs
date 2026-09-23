@@ -19,7 +19,7 @@ pub(crate) const MAX_HEADER: usize = 8192;
 pub(crate) const CONNECT_TIMEOUT_MS: u64 = 5000;
 
 pub(crate) fn now_ms() -> u64 {
-    crate::shell::get_tick_count()
+    crate::shell::monotonic_ms()
 }
 
 pub(crate) fn interrupted() -> bool {
@@ -28,6 +28,8 @@ pub(crate) fn interrupted() -> bool {
 
 pub(crate) fn pump() {
     crate::net::process_packets();
+    // Keep deadlines progressing even on machines without a working IRQ0.
+    crate::shell::increment_tick();
     for _ in 0..2000 {
         core::hint::spin_loop();
     }

@@ -1,9 +1,9 @@
-use x86_64::structures::paging::{FrameAllocator, Size4KiB, PhysFrame};
-use x86_64::PhysAddr;
-use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
-use spin::Mutex;
-use lazy_static::lazy_static;
 use alloc::vec::Vec;
+use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
+use lazy_static::lazy_static;
+use spin::Mutex;
+use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
+use x86_64::PhysAddr;
 
 lazy_static! {
     static ref FRAME_ALLOCATOR: Mutex<BootFrameAllocator> = Mutex::new(BootFrameAllocator::new());
@@ -17,14 +17,18 @@ pub struct BootFrameAllocator {
 
 impl BootFrameAllocator {
     fn new() -> Self {
-        Self { regions: Vec::new(), current_region: 0, current_addr: 0 }
+        Self {
+            regions: Vec::new(),
+            current_region: 0,
+            current_addr: 0,
+        }
     }
-    
+
     pub fn init_from_memory_map(&mut self, memory_regions: &[MemoryRegion]) {
         self.regions.clear();
         self.current_region = 0;
         self.current_addr = 0;
-        
+
         for region in memory_regions {
             if region.kind == MemoryRegionKind::Usable {
                 let start = (region.start + 0xFFF) & !0xFFF;
@@ -37,7 +41,10 @@ impl BootFrameAllocator {
         if let Some((start, _)) = self.regions.first() {
             self.current_addr = *start;
         }
-        crate::serial_println!("[mem] Frame allocator initialized with {} usable region(s)", self.regions.len());
+        crate::serial_println!(
+            "[mem] Frame allocator initialized with {} usable region(s)",
+            self.regions.len()
+        );
     }
 }
 

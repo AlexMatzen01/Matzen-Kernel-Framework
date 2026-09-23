@@ -71,6 +71,74 @@ fn main() {
         a == "--bundle-apps" || a == "--with-apps"
     });
 
+    // Keyboard transport: --kbd=<ps2|xhci|ehci|uhci> (from mfk_launch.py)
+    // or legacy --xhci-kbd. xhci attaches qemu-xhci + usb-kbd; the emulated
+    // usb-kbd overrides PS/2 so guest input flows through the xHCI driver.
+    // Serial stdio stays available as a backdoor.
+    let kbd_arg = args.iter().find_map(|a| {
+        a.strip_prefix("--kbd=")
+            .map(|v| v.to_ascii_lowercase())
+    });
+    let xhci_kbd = args.iter().any(|a| a == "--xhci-kbd")
+        || kbd_arg.as_deref() == Some("xhci");
+
+    // Extra drives from mfk_launch.py: --data-disk-size=10M plus repeatable
+    // --extra-disk=<path> --extra-disk-size=<size> pairs in order, with an
+    // optional --boot-extra-disk[=N] (1-based among extras, bare = first).
+    // QEMU legacy IDE only has room for 2 extras (index 2/secondary-master
+    // and index 3/secondary-slave); more need a virtio-blk guest driver.
+    let data_disk_size: String = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--data-disk-size="))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "10M".to_string());
+    let mut extra_paths: Vec<String> = Vec::new();
+    let mut extra_sizes: Vec<String> = Vec::new();
+    for a in args.iter() {
+        if let Some(p) = a.strip_prefix("--extra-disk=") {
+            extra_paths.push(p.to_string());
+        } else if let Some(s) = a.strip_prefix("--extra-disk-size=") {
+            extra_sizes.push(s.to_string());
+        }
+    }
+    let mut extra_disks: Vec<(String, String)> = extra_paths
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let s = extra_sizes
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| "64M".to_string());
+            (p, s)
+        })
+        .collect();
+    if extra_disks.len() > 2 {
+        eprintln!(
+            "Warning: {} extra disks given, only 2 IDE slots (index 2-3); ignoring the rest.",
+            extra_disks.len()
+        );
+        extra_disks.truncate(2);
+    }
+    let boot_extra: Option<usize> = args.iter().find_map(|a| {
+        if a == "--boot-extra-disk" {
+            Some(0)
+        } else if let Some(n) = a.strip_prefix("--boot-extra-disk=") {
+            n.parse::<usize>().ok().map(|v| v.saturating_sub(1))
+        } else {
+            None
+        }
+    });
+
+    // VNC / Web UI
+    let vnc_port: u16 = args.iter().find_map(|a| a.strip_prefix("--vnc-port="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5900);
+    let web_ui = args.iter().any(|a| a == "--web-ui");
+    let vnc = web_ui || args.iter().any(|a| a == "--vnc");
+    let web_ui_port: u16 = args.iter().find_map(|a| a.strip_prefix("--web-ui-port="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8084);
+
     // ------------------------------------------------------------
     // Create disk image paths
     // ------------------------------------------------------------
@@ -149,6 +217,29 @@ fn main() {
     println!("  Hypervisor: {}", hypervisor);
     println!("  Firmware:   {}", firmware.name());
     println!("  Boot image: {}", boot_image);
+    if xhci_kbd {
+        println!("  Input:      xHCI USB keyboard + absolute tablet");
+    }
+    println!("  Data disk:  target/disk.img ({})", data_disk_size);
+    for (i, (p, s)) in extra_disks.iter().enumerate() {
+        println!(
+            "  Extra #{}:   {} ({}){}",
+            i + 1,
+            p,
+            s,
+            if boot_extra == Some(i) { " [boot]" } else { "" }
+        );
+    }
+    if vnc || web_ui {
+        println!(
+            "  VNC:        enabled (TCP port {}, WebSocket port {})",
+            qemu_vnc_tcp_port(vnc_port),
+            vnc_port
+        );
+    }
+    if web_ui {
+        println!("  Web UI:     enabled (port {})", web_ui_port);
+    }
     println!();
 
     if no_run {
@@ -201,8 +292,28 @@ fn main() {
 
     match selected_hypervisor {
         "qemu" => match firmware {
-            Firmware::Bios => run_qemu_bios(&bios_path, bundle),
-            Firmware::Uefi => run_qemu_uefi(&uefi_path, bundle),
+            Firmware::Bios => run_qemu_bios(
+                &bios_path,
+                bundle,
+                xhci_kbd,
+                &data_disk_size,
+                &extra_disks,
+                vnc,
+                vnc_port,
+                web_ui,
+                web_ui_port,
+            ),
+            Firmware::Uefi => run_qemu_uefi(
+                &uefi_path,
+                bundle,
+                xhci_kbd,
+                &data_disk_size,
+                &extra_disks,
+                vnc,
+                vnc_port,
+                web_ui,
+                web_ui_port,
+            ),
         },
 
         "vbox" => match firmware {
@@ -1086,13 +1197,27 @@ fn run_virtualbox(
 // QEMU BIOS
 // ------------------------------------------------------------
 
+/// Select the other default VNC port so the TCP and WebSocket listeners do
+/// not attempt to bind the same port when the WebSocket port is 5900/5901.
+fn qemu_vnc_tcp_port(websocket_port: u16) -> u16 {
+    if websocket_port == 5900 { 5901 } else { 5900 }
+}
+
 fn run_qemu_bios(
     bios_path: &str,
     bundle: bool,
+    xhci_kbd: bool,
+    data_disk_size: &str,
+    extra_disks: &[(String, String)],
+    vnc: bool,
+    vnc_port: u16,
+    web_ui: bool,
+    web_ui_port: u16,
 ) {
     let disk_path = "target/disk.img";
 
-    create_qemu_data_disk(disk_path);
+    create_qemu_data_disk(disk_path, data_disk_size);
+    ensure_extra_disks(extra_disks);
 
     if bundle {
         bundle_qemu_examples(disk_path);
@@ -1105,10 +1230,16 @@ fn run_qemu_bios(
     println!(
         "Networking: E1000 + user-mode NAT"
     );
+    if xhci_kbd {
+        println!("Input: xHCI USB keyboard + absolute tablet (PS/2 overridden)");
+    }
 
     let mut qemu = Command::new("qemu-system-x86_64");
 
     qemu.args([
+        "-cpu",
+        "max",
+
         "-drive",
         &format!(
             "file={},format=raw,if=ide,index=0,media=disk",
@@ -1125,7 +1256,7 @@ fn run_qemu_bios(
         "stdio",
 
         "-display",
-        "none",
+        "gtk",
 
         "-no-reboot",
         "-no-shutdown",
@@ -1143,13 +1274,76 @@ fn run_qemu_bios(
          hostfwd=tcp::49152-:49152",
     ]);
 
+    if vnc {
+        let tcp_port = qemu_vnc_tcp_port(vnc_port);
+        let display = tcp_port - 5900;
+        qemu.args([
+            "-vnc",
+            &format!(":{},websocket={}", display, vnc_port),
+        ]);
+    }
+
+    // Extra data disks on the secondary IDE channel (index 2/3).
+    for (i, (path, _)) in extra_disks.iter().enumerate() {
+        qemu.args([
+            "-drive",
+            &format!(
+                "file={},format=raw,if=ide,index={},media=disk,cache=none,readonly=off",
+                path,
+                2 + i
+            ),
+        ]);
+    }
+
+    if xhci_kbd {
+        qemu.args([
+            "-device",
+            "qemu-xhci,id=xhci",
+            "-device",
+            "usb-kbd,bus=xhci.0",
+            // Absolute pointer: host cursor maps 1:1, no GTK grab needed.
+            // The guest claims it like a USB tablet (see xhci/usb drivers).
+            "-device",
+            "usb-tablet,bus=xhci.0",
+        ]);
+    }
+
+    // Spawn web proxy before QEMU if web UI is enabled
+    let mut web_proxy_child = None;
+    if web_ui {
+        let proxy_bin = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("target/release/mfk_web_proxy");
+        if proxy_bin.exists() {
+            println!(
+                "Starting web proxy on port {} (QEMU VNC websocket: 127.0.0.1:{}, raw VNC TCP: {})...",
+                web_ui_port,
+                vnc_port,
+                qemu_vnc_tcp_port(vnc_port)
+            );
+            web_proxy_child = Some(
+                Command::new(&proxy_bin)
+                    .arg(web_ui_port.to_string())
+                    .arg(vnc_port.to_string())
+                    .spawn()
+                    .expect("Failed to start mfk_web_proxy")
+            );
+        } else {
+            eprintln!("Warning: mfk_web_proxy not found at {}. Run 'cargo build --release -p mfk-runner' to build it.", proxy_bin.display());
+        }
+    }
+
     let mut child = qemu
         .spawn()
         .expect("Failed to start QEMU");
 
-    child
-        .wait()
-        .expect("Failed to wait on QEMU");
+    child.wait().expect("Failed to wait on QEMU");
+
+    // Clean up web proxy when QEMU exits
+    if let Some(mut proxy) = web_proxy_child {
+        let _ = proxy.kill();
+        let _ = proxy.wait();
+    }
 }
 
 // ------------------------------------------------------------
@@ -1159,12 +1353,20 @@ fn run_qemu_bios(
 fn run_qemu_uefi(
     uefi_path: &str,
     bundle: bool,
+    xhci_kbd: bool,
+    data_disk_size: &str,
+    extra_disks: &[(String, String)],
+    vnc: bool,
+    vnc_port: u16,
+    web_ui: bool,
+    web_ui_port: u16,
 ) {
     let ovmf = find_ovmf();
 
     let disk_path = "target/disk.img";
 
-    create_qemu_data_disk(disk_path);
+    create_qemu_data_disk(disk_path, data_disk_size);
+    ensure_extra_disks(extra_disks);
 
     if bundle {
         bundle_qemu_examples(disk_path);
@@ -1178,6 +1380,11 @@ fn run_qemu_uefi(
     println!(
         "Networking: E1000 + user-mode NAT"
     );
+    if xhci_kbd {
+        println!("Input: xHCI USB keyboard + absolute tablet ONLY");
+    } else {
+        println!("Input: PS/2 keyboard");
+    }
 
     let mut qemu = Command::new("qemu-system-x86_64");
     let ovmf_drive = format!(
@@ -1186,6 +1393,9 @@ fn run_qemu_uefi(
     );
 
     qemu.args([
+        "-cpu",
+        "max",
+
         // Use the legacy PC machine because the kernel's disk driver uses
         // the legacy ATA PIO ports; Q35 exposes AHCI instead.
         "-machine",
@@ -1238,13 +1448,75 @@ fn run_qemu_uefi(
          hostfwd=tcp::49152-:49152",
     ]);
 
+    if vnc {
+        let tcp_port = qemu_vnc_tcp_port(vnc_port);
+        let display = tcp_port - 5900;
+        qemu.args([
+            "-vnc",
+            &format!(":{},websocket={}", display, vnc_port),
+        ]);
+    }
+
+    // Extra data disks on the secondary IDE channel (index 2/3).
+    for (i, (path, _)) in extra_disks.iter().enumerate() {
+        qemu.args([
+            "-drive",
+            &format!(
+                "file={},format=raw,if=ide,index={},media=disk,cache=none,readonly=off",
+                path,
+                2 + i
+            ),
+        ]);
+    }
+
+    if xhci_kbd {
+        qemu.args([
+            "-device",
+            "qemu-xhci,id=xhci",
+            "-device",
+            "usb-kbd,bus=xhci.0",
+            // Absolute pointer: host cursor maps 1:1, no GTK grab needed.
+            "-device",
+            "usb-tablet,bus=xhci.0",
+        ]);
+    }
+
+    // Spawn web proxy before QEMU if web UI is enabled
+    let mut web_proxy_child = None;
+    if web_ui {
+        let proxy_bin = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("target/release/mfk_web_proxy");
+        if proxy_bin.exists() {
+            println!(
+                "Starting web proxy on port {} (QEMU VNC websocket: 127.0.0.1:{}, raw VNC TCP: {})...",
+                web_ui_port,
+                vnc_port,
+                qemu_vnc_tcp_port(vnc_port)
+            );
+            web_proxy_child = Some(
+                Command::new(&proxy_bin)
+                    .arg(web_ui_port.to_string())
+                    .arg(vnc_port.to_string())
+                    .spawn()
+                    .expect("Failed to start mfk_web_proxy")
+            );
+        } else {
+            eprintln!("Warning: mfk_web_proxy not found at {}. Run 'cargo build --release -p mfk-runner' to build it.", proxy_bin.display());
+        }
+    }
+
     let mut child = qemu
         .spawn()
         .expect("Failed to start QEMU with OVMF");
 
-    child
-        .wait()
-        .expect("Failed to wait on QEMU");
+    child.wait().expect("Failed to wait on QEMU");
+
+    // Clean up web proxy when QEMU exits
+    if let Some(mut proxy) = web_proxy_child {
+        let _ = proxy.kill();
+        let _ = proxy.wait();
+    }
 }
 
 // ------------------------------------------------------------
@@ -1253,11 +1525,13 @@ fn run_qemu_uefi(
 
 fn create_qemu_data_disk(
     disk_path: &str,
+    size: &str,
 ) {
     if !Path::new(disk_path).exists() {
         println!(
-            "Creating virtual data disk: {}",
-            disk_path
+            "Creating virtual data disk: {} ({})",
+            disk_path,
+            size
         );
 
         let result = Command::new("qemu-img")
@@ -1266,7 +1540,7 @@ fn create_qemu_data_disk(
                 "-f",
                 "raw",
                 disk_path,
-                "10M",
+                size,
             ])
             .output();
 
@@ -1296,6 +1570,63 @@ fn create_qemu_data_disk(
             "Using existing data disk: {}",
             disk_path
         );
+    }
+}
+
+/// Creates missing extra data disks (secondary IDE channel). Existing files
+/// are reused regardless of the requested size.
+fn ensure_extra_disks(extra_disks: &[(String, String)]) {
+    for (i, (path, size)) in extra_disks.iter().enumerate() {
+        if Path::new(path).exists() {
+            println!(
+                "Using existing extra disk #{}: {}",
+                i + 1,
+                path
+            );
+            continue;
+        }
+
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+
+        println!(
+            "Creating extra disk #{}: {} ({})",
+            i + 1,
+            path,
+            size
+        );
+
+        match Command::new("qemu-img")
+            .args([
+                "create",
+                "-f",
+                "raw",
+                path,
+                size.as_str(),
+            ])
+            .output()
+        {
+            Ok(output) => {
+                if !output.status.success() {
+                    eprintln!(
+                        "Warning: Failed to create extra disk {}: {}",
+                        path,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to execute qemu-img for {}: {}",
+                    path,
+                    e
+                );
+            }
+        }
     }
 }
 
@@ -1367,6 +1698,46 @@ fn print_usage(program: &str) {
         "                           Bundle apps/examples into target/disk.img"
     );
 
+    eprintln!(
+        "  --kbd=<ps2|xhci>          QEMU keyboard transport (default ps2)"
+    );
+
+    eprintln!(
+        "  --xhci-kbd               Attach qemu-xhci + usb-kbd to QEMU"
+    );
+
+    eprintln!(
+        "  --data-disk-size=<size>   Size for target/disk.img (default 10M)"
+    );
+
+    eprintln!(
+        "  --extra-disk=<path>       Extra IDE data disk (repeatable, max 2)"
+    );
+
+    eprintln!(
+        "  --extra-disk-size=<size>  Size for preceding --extra-disk (default 64M)"
+    );
+
+    eprintln!(
+        "  --boot-extra-disk[=N]     Boot extra disk N (1-based, bare = first)"
+    );
+
+    eprintln!(
+        "  --vnc                    Enable QEMU VNC server"
+    );
+
+    eprintln!(
+        "  --vnc-port=<port>         VNC WebSocket port (default 5900)"
+    );
+
+    eprintln!(
+        "  --web-ui                 Launch noVNC web UI (implies --vnc)"
+    );
+
+    eprintln!(
+        "  --web-ui-port=<port>      Web UI HTTP port (default 8084)"
+    );
+
     eprintln!();
 
     eprintln!("Examples:");
@@ -1393,6 +1764,16 @@ fn print_usage(program: &str) {
 
     eprintln!(
         "  {} target/x86_64-mfk/debug/mfk-kernel --qemu --uefi --bundle-apps",
+        program
+    );
+
+    eprintln!(
+        "  {} target/x86_64-mfk/debug/mfk-kernel --qemu --uefi --kbd=xhci",
+        program
+    );
+
+    eprintln!(
+        "  {} target/x86_64-mfk/debug/mfk-kernel --qemu --uefi --vnc --web-ui",
         program
     );
 

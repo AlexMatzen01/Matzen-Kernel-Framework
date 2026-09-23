@@ -107,7 +107,8 @@ pub fn cmd_server(args: &str) {
         crate::println!("  e.g. speedtest-server fra.speedtest.clouvider.net:80 /backend/");
         crate::println!("  e.g. speedtest-server 10.0.2.2:8080 /");
         crate::println!("  e.g. speedtest-server http://10.0.2.2/backend/");
-        crate::println!("HTTP or TLS 1.3 HTTPS. Needs backend/empty.php");
+        crate::println!("HTTP works by default; HTTPS requires a net_tls-enabled build.");
+        crate::println!("Needs backend/empty.php");
         crate::println!("and backend/garbage.php (LibreSpeed PHP backend).");
         return;
     }
@@ -805,7 +806,7 @@ pub fn cmd_run(args: &str) {
     if args == "--help" || args == "-h" || args == "help" {
         crate::println!("Usage: speedtest [-d|--debug] [server]");
         crate::println!("  Runs latency + download + upload against a LibreSpeed");
-        crate::println!("  backend over HTTP or TLS 1.3 HTTPS (no browser needed).");
+        crate::println!("  LibreSpeed backend over HTTP (HTTPS requires net_tls build feature).");
         crate::println!("  server: <host>[:port][/base/], e.g.:");
         crate::println!("    speedtest");
         crate::println!("    speedtest fra.speedtest.clouvider.net");

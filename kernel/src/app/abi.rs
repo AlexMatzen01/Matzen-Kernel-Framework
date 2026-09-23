@@ -56,7 +56,9 @@ pub struct SyscallTable {
 }
 
 extern "C" fn syscall_print(ptr: *const u8, len: usize) {
-    if ptr.is_null() || len == 0 { return; }
+    if ptr.is_null() || len == 0 {
+        return;
+    }
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
     if let Ok(s) = core::str::from_utf8(bytes) {
         crate::print!("{}", s);
@@ -74,7 +76,9 @@ extern "C" fn syscall_exit(code: i32) -> ! {
     // Return to caller by not diverging - we need a longjmp. For now halt.
     // Native apps will be rewritten to use this table inside VM only.
     // This entry should not be used for bytecode VM (handled inline).
-    loop { x86_64::instructions::hlt(); }
+    loop {
+        x86_64::instructions::hlt();
+    }
 }
 
 extern "C" fn syscall_yield_now() {

@@ -26,13 +26,16 @@ pub fn resolve_ipv4(name: &str) -> Result<[u8; 4], &'static str> {
     query.extend_from_slice(&[0, 0, 1, 0, 1]);
 
     crate::net::udp::send_packet(DNS_SERVER, LOCAL_PORT, DNS_PORT, &query)?;
-    let start = crate::shell::get_tick_count();
-    while crate::shell::get_tick_count().saturating_sub(start) < 3000 {
+    let start = crate::shell::monotonic_ms();
+    let poll_limit = 3_000_000u64;
+    let mut polls = 0u64;
+    while polls < poll_limit && crate::shell::monotonic_ms().saturating_sub(start) < 3000 {
         crate::net::process_packets();
-        if let Some(response) = crate::net::udp::receive(DNS_SERVER, DNS_PORT, LOCAL_PORT) {
+        if let Some(response) = crate::net::udp::receive_from(LOCAL_PORT, DNS_SERVER, DNS_PORT) {
             return parse_response(&response, id);
         }
         crate::shell::increment_tick();
+        polls += 1;
         core::hint::spin_loop();
     }
     Err("DNS query timed out")

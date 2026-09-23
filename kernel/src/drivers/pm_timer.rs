@@ -7,7 +7,7 @@
 //! Standard I/O port from FADT PM_TIMER_BLOCK. 3.58 MHz counter,
 //! 24-bit or 32-bit. Read-only access — no hardware state modification.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use x86_64::instructions::port::Port;
 
 use crate::drivers::acpi::{try_fallback_pm_timer_addrs, FadtInfo};
@@ -34,12 +34,18 @@ pub fn init_from_fadt(fadt: &FadtInfo) -> bool {
     }
 
     if !validate_address(addr) {
-        crate::serial_println!("[pm_timer] FADT address 0x{:04x} invalid, trying fallbacks", addr);
+        crate::serial_println!(
+            "[pm_timer] FADT address 0x{:04x} invalid, trying fallbacks",
+            addr
+        );
         return try_fallback_init();
     }
 
     PM_TIMER_ADDR.store(addr as u32, Ordering::Relaxed);
-    IS_32BIT.store(if fadt.pm_timer_len == 4 { 2 } else { 1 }, Ordering::Relaxed);
+    IS_32BIT.store(
+        if fadt.pm_timer_len == 4 { 2 } else { 1 },
+        Ordering::Relaxed,
+    );
     LAST_READ.store(read_raw(addr as u32), Ordering::Relaxed);
     OVERFLOW_COUNT.store(0, Ordering::Relaxed);
 
@@ -54,12 +60,15 @@ pub fn init_from_fadt(fadt: &FadtInfo) -> bool {
 /// Tries fallback addresses if FADT init fails.
 pub fn try_fallback_init() -> bool {
     if let Some(addr) = super::acpi::try_fallback_pm_timer_addrs() {
-PM_TIMER_ADDR.store(addr as u32, Ordering::Relaxed);
+        PM_TIMER_ADDR.store(addr as u32, Ordering::Relaxed);
         // Assume 24-bit for fallbacks (safe default)
         IS_32BIT.store(1, Ordering::Relaxed);
-LAST_READ.store(read_raw(addr as u32), Ordering::Relaxed);
+        LAST_READ.store(read_raw(addr as u32), Ordering::Relaxed);
         OVERFLOW_COUNT.store(0, Ordering::Relaxed);
-        crate::serial_println!("[pm_timer] initialized from fallback at 0x{:04x} (assuming 24-bit)", addr);
+        crate::serial_println!(
+            "[pm_timer] initialized from fallback at 0x{:04x} (assuming 24-bit)",
+            addr
+        );
         return true;
     }
     crate::serial_println!("[pm_timer] all fallback addresses failed");

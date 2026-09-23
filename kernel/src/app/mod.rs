@@ -13,14 +13,14 @@
 //! Future: isolated user mode + scheduler (Phase 2/3).
 
 pub mod abi;
-pub mod loader;
 pub mod interpreter;
+pub mod loader;
 
-use alloc::vec::Vec;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// ELF magic
-const ELF_MAGIC: &[u8;4] = &[0x7F, b'E', b'L', b'F'];
+const ELF_MAGIC: &[u8; 4] = &[0x7F, b'E', b'L', b'F'];
 
 /// Run app at `path` with optional args slice (args[0] = app name conventionally)
 /// Returns exit code or error string printed to console.
@@ -57,7 +57,12 @@ pub fn run(path: &str, args: &[&str]) -> Result<i32, &'static str> {
             let elapsed = crate::shell::get_tick_count().wrapping_sub(start);
             match res {
                 Ok(code) => {
-                    crate::println!("\n[app '{}' exited code {} in {} ticks]", path, code, elapsed);
+                    crate::println!(
+                        "\n[app '{}' exited code {} in {} ticks]",
+                        path,
+                        code,
+                        elapsed
+                    );
                     return Ok(code);
                 }
                 Err(e) => {
@@ -71,8 +76,14 @@ pub fn run(path: &str, args: &[&str]) -> Result<i32, &'static str> {
     // Heuristic: if file contains NUL byte, maybe binary but not MFKE -> try script fallback with warning
     let is_text = is_probably_text(&data);
     if !is_text {
-        crate::println!("[run] '{}' looks binary but not MFKE ({} bytes)", path, data.len());
-        crate::println!("  Try 'writehex' for hex-encoded binaries or 'mkapp' to generate a valid MFKE.");
+        crate::println!(
+            "[run] '{}' looks binary but not MFKE ({} bytes)",
+            path,
+            data.len()
+        );
+        crate::println!(
+            "  Try 'writehex' for hex-encoded binaries or 'mkapp' to generate a valid MFKE."
+        );
         return Err("Unknown binary format");
     }
 
@@ -93,9 +104,15 @@ pub fn run(path: &str, args: &[&str]) -> Result<i32, &'static str> {
 fn is_probably_text(data: &[u8]) -> bool {
     // allow high-utf8 but no NUL
     for &b in data {
-        if b == 0 { return false; }
-        if b < 0x09 { return false; }
-        if b > 0x7E && b < 0xA0 && b != b'\n' as u8 && b != b'\r' as u8 && b != b'\t' as u8 { return false; }
+        if b == 0 {
+            return false;
+        }
+        if b < 0x09 {
+            return false;
+        }
+        if b > 0x7E && b < 0xA0 && b != b'\n' as u8 && b != b'\r' as u8 && b != b'\t' as u8 {
+            return false;
+        }
     }
     // must be valid utf8 or mostly ascii
     core::str::from_utf8(data).is_ok()
@@ -121,11 +138,16 @@ pub fn create_example_app(name: &str, kind: &str) -> Result<(), &'static str> {
 
 fn to_lowercase(s: &str) -> String {
     let mut out = String::new();
-    for c in s.chars() { out.push(c.to_ascii_lowercase()); }
+    for c in s.chars() {
+        out.push(c.to_ascii_lowercase());
+    }
     out
 }
 
-fn create_hello_script(name: &str, device: &mut dyn crate::drivers::block::BlockDevice) -> Result<(), &'static str> {
+fn create_hello_script(
+    name: &str,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) -> Result<(), &'static str> {
     let content = r#"# MFK script app - hello
 echo === Hello from MFK App: $0 ===
 echo Args: $@
@@ -142,7 +164,10 @@ echo App finished. Exit code 0.
     Ok(())
 }
 
-fn create_calc_script(name: &str, device: &mut dyn crate::drivers::block::BlockDevice) -> Result<(), &'static str> {
+fn create_calc_script(
+    name: &str,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) -> Result<(), &'static str> {
     let content = r#"# Calculator demo
 echo Calculator demo
 calc 42 + 58
@@ -155,7 +180,10 @@ echo Done
     Ok(())
 }
 
-fn create_filedemo_script(name: &str, device: &mut dyn crate::drivers::block::BlockDevice) -> Result<(), &'static str> {
+fn create_filedemo_script(
+    name: &str,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) -> Result<(), &'static str> {
     let content = r#"# File demo - creates and reads a file
 echo Creating demo file...
 write /tmp/demo.txt Hello from app file demo!
@@ -168,7 +196,10 @@ echo Done
     Ok(())
 }
 
-fn create_hello_mfke(name: &str, device: &mut dyn crate::drivers::block::BlockDevice) -> Result<(), &'static str> {
+fn create_hello_mfke(
+    name: &str,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) -> Result<(), &'static str> {
     // Bytecode: print "Hello from MFKE bytecode!\n", print int 42, halt
     let mut bc = Vec::new();
     // PRINT_STR "Hello from MFKE bytecode! "
@@ -190,11 +221,19 @@ fn create_hello_mfke(name: &str, device: &mut dyn crate::drivers::block::BlockDe
     bc.push(loader::opcode::HALT);
     let file = loader::build_mfke(&bc);
     crate::shell::write_file_contents(name, &file, device)?;
-    crate::println!("Created MFKE bytecode app '{}' ({} bytes, bytecode {} bytes)", name, file.len(), bc.len());
+    crate::println!(
+        "Created MFKE bytecode app '{}' ({} bytes, bytecode {} bytes)",
+        name,
+        file.len(),
+        bc.len()
+    );
     Ok(())
 }
 
-fn create_counter_mfke(name: &str, device: &mut dyn crate::drivers::block::BlockDevice) -> Result<(), &'static str> {
+fn create_counter_mfke(
+    name: &str,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) -> Result<(), &'static str> {
     // Loop: counter 0..5 print
     // Pseudocode:
     // PUSH 0 (counter)
@@ -220,7 +259,7 @@ fn create_counter_mfke(name: &str, device: &mut dyn crate::drivers::block::Block
     let jz_pos = bc.len();
     bc.push(loader::opcode::JZ);
     bc.extend_from_slice(&0i16.to_le_bytes()); // placeholder
-    // JMP back to loop
+                                               // JMP back to loop
     let jmp_pos = bc.len();
     bc.push(loader::opcode::JMP);
     bc.extend_from_slice(&0i16.to_le_bytes()); // placeholder
@@ -238,11 +277,11 @@ fn create_counter_mfke(name: &str, device: &mut dyn crate::drivers::block::Block
     // pc after JZ opcode is at jz_pos+3 (opcode + 2 byte offset)
     let jz_next = jz_pos + 3;
     let jz_offset = (end_pos as isize - jz_next as isize) as i16;
-    bc[jz_pos+1..jz_pos+3].copy_from_slice(&jz_offset.to_le_bytes());
+    bc[jz_pos + 1..jz_pos + 3].copy_from_slice(&jz_offset.to_le_bytes());
 
     let jmp_next = jmp_pos + 3;
     let jmp_offset = (loop_start as isize - jmp_next as isize) as i16;
-    bc[jmp_pos+1..jmp_pos+3].copy_from_slice(&jmp_offset.to_le_bytes());
+    bc[jmp_pos + 1..jmp_pos + 3].copy_from_slice(&jmp_offset.to_le_bytes());
 
     let file = loader::build_mfke(&bc);
     crate::shell::write_file_contents(name, &file, device)?;
@@ -250,7 +289,10 @@ fn create_counter_mfke(name: &str, device: &mut dyn crate::drivers::block::Block
     Ok(())
 }
 
-fn create_loop_mfke(name: &str, device: &mut dyn crate::drivers::block::BlockDevice) -> Result<(), &'static str> {
+fn create_loop_mfke(
+    name: &str,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) -> Result<(), &'static str> {
     // Infinite-ish loop that yields and checks tick
     // PUSH 0, loop: DUP PRINT_INT, SLEEP 500, PUSH 1 ADD, DUP PUSH 10 LT JZ end, JMP loop
     let mut bc = Vec::new();
@@ -276,10 +318,12 @@ fn create_loop_mfke(name: &str, device: &mut dyn crate::drivers::block::BlockDev
     bc.push(loader::opcode::POP);
     bc.push(loader::opcode::HALT);
 
-    let jz_next = jz_pos+3;
-    bc[jz_pos+1..jz_pos+3].copy_from_slice(&((end_pos as isize - jz_next as isize) as i16).to_le_bytes());
-    let jmp_next = jmp_pos+3;
-    bc[jmp_pos+1..jmp_pos+3].copy_from_slice(&((loop_start as isize - jmp_next as isize) as i16).to_le_bytes());
+    let jz_next = jz_pos + 3;
+    bc[jz_pos + 1..jz_pos + 3]
+        .copy_from_slice(&((end_pos as isize - jz_next as isize) as i16).to_le_bytes());
+    let jmp_next = jmp_pos + 3;
+    bc[jmp_pos + 1..jmp_pos + 3]
+        .copy_from_slice(&((loop_start as isize - jmp_next as isize) as i16).to_le_bytes());
 
     let file = loader::build_mfke(&bc);
     crate::shell::write_file_contents(name, &file, device)?;
@@ -289,16 +333,20 @@ fn create_loop_mfke(name: &str, device: &mut dyn crate::drivers::block::BlockDev
 /// Write file from hex string (for host-injected binaries)
 pub fn write_hex_file(path: &str, hex: &str) -> Result<usize, &'static str> {
     let hex = hex.trim();
-    if hex.is_empty() { return Err("Empty hex"); }
+    if hex.is_empty() {
+        return Err("Empty hex");
+    }
     let clean: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
-    if clean.len() % 2 != 0 { return Err("Hex length must be even"); }
-    let mut bytes = Vec::with_capacity(clean.len()/2);
+    if clean.len() % 2 != 0 {
+        return Err("Hex length must be even");
+    }
+    let mut bytes = Vec::with_capacity(clean.len() / 2);
     let mut chars = clean.chars();
     while let Some(hi) = chars.next() {
         let lo = chars.next().ok_or("Odd hex")?;
         let hv = hi.to_digit(16).ok_or("Invalid hex digit")? as u8;
         let lv = lo.to_digit(16).ok_or("Invalid hex digit")? as u8;
-        bytes.push((hv<<4)|lv);
+        bytes.push((hv << 4) | lv);
     }
     let len = bytes.len();
     let mut device = crate::drivers::block::AtaBlockDevice::new();

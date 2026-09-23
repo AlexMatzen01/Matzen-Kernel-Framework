@@ -42,7 +42,7 @@ lazy_static! {
         idt[41].set_handler_fn(irq9_handler);
         idt[42].set_handler_fn(irq10_handler);
         idt[43].set_handler_fn(irq11_handler);
-        idt[44].set_handler_fn(irq12_handler);
+        idt[44].set_handler_fn(mouse_interrupt_handler);
         idt[45].set_handler_fn(irq13_handler);
         idt[46].set_handler_fn(irq14_handler);
         idt[47].set_handler_fn(irq15_handler);
@@ -92,7 +92,8 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 ) {
     serial_println!(
         "EXCEPTION: GENERAL PROTECTION FAULT (code {:#x})\n{:#?}",
-        error_code, stack_frame,
+        error_code,
+        stack_frame,
     );
     panic!("EXCEPTION: GENERAL PROTECTION FAULT");
 }
@@ -103,7 +104,8 @@ extern "x86-interrupt" fn segment_not_present_handler(
 ) {
     serial_println!(
         "EXCEPTION: SEGMENT NOT PRESENT (code {:#x})\n{:#?}",
-        error_code, stack_frame,
+        error_code,
+        stack_frame,
     );
     panic!("EXCEPTION: SEGMENT NOT PRESENT");
 }
@@ -114,7 +116,8 @@ extern "x86-interrupt" fn stack_segment_fault_handler(
 ) {
     serial_println!(
         "EXCEPTION: STACK SEGMENT FAULT (code {:#x})\n{:#?}",
-        error_code, stack_frame,
+        error_code,
+        stack_frame,
     );
     panic!("EXCEPTION: STACK SEGMENT FAULT");
 }
@@ -142,7 +145,8 @@ extern "x86-interrupt" fn page_fault_handler(
 // Hardware Interrupt Handlers
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // Timer tick - just acknowledge
+    crate::time::tick();
+    crate::shell::timer_tick();
     unsafe {
         super::pic::PICS
             .lock()
@@ -165,6 +169,32 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
         super::pic::PICS
             .lock()
             .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+}
+
+extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    use x86_64::instructions::port::Port;
+
+    // Drain all pending i8042 output bytes. Bit 5 of the status register
+    // marks aux (mouse) data; anything else is routed to the keyboard
+    // driver so shared-controller bytes are never lost.
+    for _ in 0..8 {
+        let mut status = Port::<u8>::new(0x64);
+        let st: u8 = unsafe { status.read() };
+        if st & 0x01 == 0 {
+            break;
+        }
+        let mut data = Port::<u8>::new(0x60);
+        let byte: u8 = unsafe { data.read() };
+        if st & 0x20 != 0 {
+            crate::drivers::mouse::handle_byte(byte);
+        } else {
+            crate::drivers::keyboard::handle_interrupt(byte);
+        }
+    }
+
+    unsafe {
+        super::pic::PICS.lock().notify_end_of_interrupt(44);
     }
 }
 
@@ -201,7 +231,7 @@ unused_irq_handler!(irq8_handler, 40);
 unused_irq_handler!(irq9_handler, 41);
 unused_irq_handler!(irq10_handler, 42);
 unused_irq_handler!(irq11_handler, 43);
-unused_irq_handler!(irq12_handler, 44);
+
 unused_irq_handler!(irq13_handler, 45);
 unused_irq_handler!(irq14_handler, 46);
 unused_irq_handler!(irq15_handler, 47);

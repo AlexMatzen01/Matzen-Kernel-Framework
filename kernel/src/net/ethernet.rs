@@ -36,15 +36,16 @@ pub fn process_packet(packet: &[u8]) {
         return;
     }
 
-    let frame = unsafe {
-        core::ptr::read_unaligned(packet.as_ptr() as *const EthernetFrame)
-    };
+    let frame = unsafe { core::ptr::read_unaligned(packet.as_ptr() as *const EthernetFrame) };
 
-    crate::serial_println!("Ethernet: Received frame, ethertype={:#x}, len={}",
-        frame.get_ethertype(), packet.len());
+    crate::serial_println!(
+        "Ethernet: Received frame, ethertype={:#x}, len={}",
+        frame.get_ethertype(),
+        packet.len()
+    );
 
     let payload = &packet[14..];
-    
+
     match frame.get_ethertype() {
         ETHERTYPE_ARP => {
             crate::net::arp::process_packet(payload, frame.src_mac);
@@ -60,10 +61,11 @@ pub fn process_packet(packet: &[u8]) {
 
 pub fn send_frame(dst_mac: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<(), &'static str> {
     let src_mac = crate::drivers::e1000::mac_address().ok_or("No MAC address")?;
-    
-    let mut packet = Vec::with_capacity(14 + payload.len());
+
+    let frame_len = core::cmp::max(14 + payload.len(), 60);
+    let mut packet = Vec::with_capacity(frame_len);
     let frame = EthernetFrame::new(dst_mac, src_mac, ethertype);
-    
+
     // Copy frame header
     unsafe {
         let frame_bytes = core::slice::from_raw_parts(
@@ -72,8 +74,9 @@ pub fn send_frame(dst_mac: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<()
         );
         packet.extend_from_slice(frame_bytes);
     }
-    
+
     packet.extend_from_slice(payload);
-    
+    packet.resize(frame_len, 0);
+
     crate::net::send_packet(&packet)
 }

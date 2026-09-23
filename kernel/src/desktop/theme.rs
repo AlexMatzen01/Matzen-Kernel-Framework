@@ -70,9 +70,18 @@ pub struct ThemeFonts {
 impl ThemeFonts {
     pub const fn default() -> Self {
         Self {
-            ui: FontSpec { name: "ui", size: 14 },
-            mono: FontSpec { name: "mono", size: 12 },
-            title: FontSpec { name: "title", size: 16 },
+            ui: FontSpec {
+                name: "ui",
+                size: 14,
+            },
+            mono: FontSpec {
+                name: "mono",
+                size: 12,
+            },
+            title: FontSpec {
+                name: "title",
+                size: 16,
+            },
         }
     }
 }
@@ -139,13 +148,28 @@ impl Theme {
             layout: ThemeLayout::default(),
         }
     }
-    
+
+    /// Apply personalization knobs (background + accent) to a theme.
+    ///
+    /// The accent color drives buttons, titlebars and the taskbar line so
+    /// one swatch visibly re-themes the desktop. Hover/press states are
+    /// derived by blending toward white/black.
+    pub fn personalize(&mut self, bg: u32, accent: u32) {
+        let (bg, accent) = (bg & 0xFFFFFF, accent & 0xFFFFFF);
+        self.colors.bg = bg;
+        self.colors.accent = accent;
+        self.colors.button_bg = accent;
+        self.colors.title_active = accent;
+        self.colors.button_hover = Self::alpha_blend(accent, 0xFFFFFF, 40);
+        self.colors.button_press = Self::alpha_blend(accent, 0x000000, 60);
+    }
+
     /// Convert a u32 color (0xRRGGBB) to VGA Color enum approximation.
     pub fn to_vga_color(color: u32) -> Color {
         let r = ((color >> 16) & 0xFF) as u8;
         let g = ((color >> 8) & 0xFF) as u8;
         let b = (color & 0xFF) as u8;
-        
+
         // Simple nearest-match to VGA 16 colors
         match (r, g, b) {
             (0..=85, 0..=85, 0..=85) => Color::Black,
@@ -167,7 +191,7 @@ impl Theme {
             _ => Color::White,
         }
     }
-    
+
     /// Alpha blend two colors (0-255 alpha).
     pub fn alpha_blend(fg: u32, bg: u32, alpha: u8) -> u32 {
         let fg_r = ((fg >> 16) & 0xFF) as u16;
@@ -178,11 +202,11 @@ impl Theme {
         let bg_b = (bg & 0xFF) as u16;
         let a = alpha as u16;
         let inv_a = 255 - a;
-        
+
         let r = (fg_r * a + bg_r * inv_a) / 255;
         let g = (fg_g * a + bg_g * inv_a) / 255;
         let b = (fg_b * a + bg_b * inv_a) / 255;
-        
+
         ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
     }
 }
@@ -199,14 +223,10 @@ pub fn init_theme() {
 
 /// Get the current theme (panics if not initialized).
 pub fn current_theme() -> &'static Theme {
-    unsafe {
-        CURRENT_THEME.as_ref().expect("Theme not initialized")
-    }
+    unsafe { CURRENT_THEME.as_ref().expect("Theme not initialized") }
 }
 
 /// Get a mutable reference to the current theme (for hot-reload).
 pub fn current_theme_mut() -> &'static mut Theme {
-    unsafe {
-        CURRENT_THEME.as_mut().expect("Theme not initialized")
-    }
+    unsafe { CURRENT_THEME.as_mut().expect("Theme not initialized") }
 }

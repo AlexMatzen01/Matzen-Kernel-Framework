@@ -132,11 +132,18 @@ impl TextBuffer {
         out
     }
 
-    pub fn line_count(&self) -> usize { self.lines.len() }
-    pub fn is_dirty(&self) -> bool { self.dirty }
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
 
     pub fn current_line_len(&self) -> usize {
-        self.lines.get(self.cursor_row).map(|l| l.len()).unwrap_or(0)
+        self.lines
+            .get(self.cursor_row)
+            .map(|l| l.len())
+            .unwrap_or(0)
     }
 
     // ── Cursor movement ─────────────────────────────────────
@@ -185,7 +192,10 @@ impl TextBuffer {
     pub fn move_home(&mut self) {
         // Nano home: toggle between column 0 and first non-blank
         let line = &self.lines[self.cursor_row];
-        let first_nonblank = line.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(0);
+        let first_nonblank = line
+            .iter()
+            .position(|&b| b != b' ' && b != b'\t')
+            .unwrap_or(0);
         if self.cursor_col == first_nonblank {
             self.cursor_col = 0;
         } else {
@@ -210,7 +220,9 @@ impl TextBuffer {
     }
 
     pub fn goto_line(&mut self, line_one_based: usize) {
-        if line_one_based == 0 { return; }
+        if line_one_based == 0 {
+            return;
+        }
         let row = (line_one_based - 1).min(self.lines.len().saturating_sub(1));
         self.cursor_row = row;
         self.cursor_col = 0;
@@ -264,7 +276,8 @@ impl TextBuffer {
         self.last_action_was_cut = false;
     }
 
-    pub fn delete_prev(&mut self) { // Backspace
+    pub fn delete_prev(&mut self) {
+        // Backspace
         if self.cursor_col > 0 {
             let row = self.cursor_row;
             let col = self.cursor_col - 1;
@@ -288,7 +301,8 @@ impl TextBuffer {
         self.last_action_was_cut = false;
     }
 
-    pub fn delete_next(&mut self) { // Delete key
+    pub fn delete_next(&mut self) {
+        // Delete key
         let row = self.cursor_row;
         let col = self.cursor_col;
         let len = self.lines[row].len();
@@ -312,7 +326,9 @@ impl TextBuffer {
     // Behavior: consecutive Ctrl+K appends to clipboard; first cut replaces clipboard.
 
     pub fn cut_current_line(&mut self) {
-        if self.lines.is_empty() { return; }
+        if self.lines.is_empty() {
+            return;
+        }
         let row = self.cursor_row;
         let line = self.lines[row].clone();
         if !self.last_action_was_cut {
@@ -340,7 +356,9 @@ impl TextBuffer {
     // Cut selection if mark set, else cut line
     pub fn cut_selection_or_line(&mut self) -> bool {
         if let Some((mr, mc)) = self.mark {
-            if self.cut_selection(mr, mc) { return true; }
+            if self.cut_selection(mr, mc) {
+                return true;
+            }
         }
         self.cut_current_line();
         true
@@ -353,7 +371,9 @@ impl TextBuffer {
         } else {
             (self.cursor_row, self.cursor_col, mr, mc)
         };
-        if sr == er && sc == ec { return false; }
+        if sr == er && sc == ec {
+            return false;
+        }
         // Extract
         let mut cut_data: Vec<Vec<u8>> = Vec::new();
         if sr == er {
@@ -370,7 +390,7 @@ impl TextBuffer {
             let start_head = self.lines[sr][..sc].to_vec();
             // Collect middle
             cut_data.push(self.lines[sr][sc..].to_vec());
-            for r in (sr+1)..er {
+            for r in (sr + 1)..er {
                 cut_data.push(self.lines[r].clone());
             }
             cut_data.push(self.lines[er][..ec].to_vec());
@@ -379,7 +399,7 @@ impl TextBuffer {
             self.lines[sr].extend_from_slice(&end_tail);
             // Remove intermediate lines
             for _ in 0..(er - sr) {
-                self.lines.remove(sr+1);
+                self.lines.remove(sr + 1);
             }
             self.cursor_row = sr;
             self.cursor_col = sc;
@@ -400,13 +420,17 @@ impl TextBuffer {
             } else {
                 (self.cursor_row, self.cursor_col, mr, mc)
             };
-            if sr == er && sc == ec { return false; }
+            if sr == er && sc == ec {
+                return false;
+            }
             let mut data: Vec<Vec<u8>> = Vec::new();
             if sr == er {
                 data.push(self.lines[sr][sc..ec].to_vec());
             } else {
                 data.push(self.lines[sr][sc..].to_vec());
-                for r in sr+1..er { data.push(self.lines[r].clone()); }
+                for r in sr + 1..er {
+                    data.push(self.lines[r].clone());
+                }
                 data.push(self.lines[er][..ec].to_vec());
             }
             self.clipboard = data;
@@ -419,7 +443,9 @@ impl TextBuffer {
     }
 
     pub fn uncut(&mut self) {
-        if self.clipboard.is_empty() { return; }
+        if self.clipboard.is_empty() {
+            return;
+        }
         if self.clipboard_is_lines {
             // Insert each clipboard line after current row
             let row = self.cursor_row;
@@ -450,7 +476,10 @@ impl TextBuffer {
                     let first_len = first.len();
                     let first_clone = first.clone();
                     self.lines[insert_at] = new_first;
-                    self.push_undo(EditAction::InsertLine { row: insert_at, line: first_clone });
+                    self.push_undo(EditAction::InsertLine {
+                        row: insert_at,
+                        line: first_clone,
+                    });
                     self.cursor_col = first_len;
                 } else {
                     // Multiple lines: first line is prefix+first, last line gets suffix, middle lines verbatim
@@ -515,12 +544,21 @@ impl TextBuffer {
     }
 
     // ── Search ────────────────────────────────────────────
-    pub fn find_next(&self, needle: &[u8], start_row: usize, start_col: usize) -> Option<(usize, usize)> {
-        if needle.is_empty() { return None; }
+    pub fn find_next(
+        &self,
+        needle: &[u8],
+        start_row: usize,
+        start_col: usize,
+    ) -> Option<(usize, usize)> {
+        if needle.is_empty() {
+            return None;
+        }
         for r in start_row..self.lines.len() {
             let line = &self.lines[r];
             let search_start = if r == start_row { start_col } else { 0 };
-            if search_start > line.len() { continue; }
+            if search_start > line.len() {
+                continue;
+            }
             if let Some(pos) = find_subslice(&line[search_start..], needle) {
                 return Some((r, search_start + pos));
             }
@@ -528,8 +566,14 @@ impl TextBuffer {
         // Wrap: search from start to start_row
         for r in 0..=start_row {
             let line = &self.lines[r];
-            let end = if r == start_row { start_col } else { line.len() };
-            if end == 0 { continue; }
+            let end = if r == start_row {
+                start_col
+            } else {
+                line.len()
+            };
+            if end == 0 {
+                continue;
+            }
             if let Some(pos) = find_subslice(&line[..end], needle) {
                 return Some((r, pos));
             }
@@ -537,19 +581,25 @@ impl TextBuffer {
         None
     }
 
-    pub fn replace_next(&mut self, needle: &[u8], replacement: &[u8], start_row: usize, start_col: usize) -> Option<(usize, usize)> {
-        if let Some((r,c)) = self.find_next(needle, start_row, start_col) {
+    pub fn replace_next(
+        &mut self,
+        needle: &[u8],
+        replacement: &[u8],
+        start_row: usize,
+        start_col: usize,
+    ) -> Option<(usize, usize)> {
+        if let Some((r, c)) = self.find_next(needle, start_row, start_col) {
             // Delete needle, insert replacement
             let line = &mut self.lines[r];
-            line.drain(c..c+needle.len());
-            for (i,&b) in replacement.iter().enumerate() {
-                line.insert(c+i, b);
+            line.drain(c..c + needle.len());
+            for (i, &b) in replacement.iter().enumerate() {
+                line.insert(c + i, b);
             }
             self.cursor_row = r;
             self.cursor_col = c + replacement.len();
             self.desired_col = self.cursor_col;
             self.dirty = true;
-            return Some((r,c));
+            return Some((r, c));
         }
         None
     }
@@ -557,7 +607,9 @@ impl TextBuffer {
     // ── Word-wise (for Ctrl+Arrow) ────────────────────────
     pub fn move_word_left(&mut self) {
         // Skip spaces, then skip word, then skip spaces again? Simple: move to start of previous word
-        if self.cursor_col == 0 && self.cursor_row == 0 { return; }
+        if self.cursor_col == 0 && self.cursor_row == 0 {
+            return;
+        }
         // If at start of line, go to prev line end
         if self.cursor_col == 0 {
             self.move_left();
@@ -566,9 +618,13 @@ impl TextBuffer {
         let line = &self.lines[row];
         let mut col = self.cursor_col;
         // Skip trailing spaces
-        while col > 0 && is_space(line[col-1]) { col -= 1; }
+        while col > 0 && is_space(line[col - 1]) {
+            col -= 1;
+        }
         // Skip word chars
-        while col > 0 && !is_space(line[col-1]) { col -= 1; }
+        while col > 0 && !is_space(line[col - 1]) {
+            col -= 1;
+        }
         self.cursor_col = col;
         self.desired_col = col;
         self.last_action_was_cut = false;
@@ -589,9 +645,13 @@ impl TextBuffer {
             return;
         }
         // Skip word
-        while col < len && !is_space(line[col]) { col += 1; }
+        while col < len && !is_space(line[col]) {
+            col += 1;
+        }
         // Skip spaces
-        while col < len && is_space(line[col]) { col += 1; }
+        while col < len && is_space(line[col]) {
+            col += 1;
+        }
         self.cursor_col = col;
         self.desired_col = col;
         self.last_action_was_cut = false;
@@ -601,23 +661,35 @@ impl TextBuffer {
     pub fn justify_paragraph(&mut self, width: usize) {
         // Find paragraph bounds: consecutive non-empty lines from cursor
         let mut start = self.cursor_row;
-        while start > 0 && !self.lines[start-1].is_empty() { start -= 1; }
+        while start > 0 && !self.lines[start - 1].is_empty() {
+            start -= 1;
+        }
         let mut end = self.cursor_row;
-        while end + 1 < self.lines.len() && !self.lines[end+1].is_empty() { end += 1; }
+        while end + 1 < self.lines.len() && !self.lines[end + 1].is_empty() {
+            end += 1;
+        }
         // Extract words
         let mut words: Vec<Vec<u8>> = Vec::new();
         for r in start..=end {
             let line = &self.lines[r];
             let mut i = 0;
             while i < line.len() {
-                while i < line.len() && is_space(line[i]) { i+=1; }
-                if i >= line.len() { break; }
+                while i < line.len() && is_space(line[i]) {
+                    i += 1;
+                }
+                if i >= line.len() {
+                    break;
+                }
                 let s = i;
-                while i < line.len() && !is_space(line[i]) { i+=1; }
+                while i < line.len() && !is_space(line[i]) {
+                    i += 1;
+                }
                 words.push(line[s..i].to_vec());
             }
         }
-        if words.is_empty() { return; }
+        if words.is_empty() {
+            return;
+        }
         // Rebuild lines
         let mut new_lines: Vec<Vec<u8>> = Vec::new();
         let mut cur: Vec<u8> = Vec::new();
@@ -635,7 +707,9 @@ impl TextBuffer {
         new_lines.push(cur);
         // Replace range start..=end with new_lines
         let drain_len = end - start + 1;
-        for _ in 0..drain_len { self.lines.remove(start); }
+        for _ in 0..drain_len {
+            self.lines.remove(start);
+        }
         for (i, nl) in new_lines.into_iter().enumerate() {
             self.lines.insert(start + i, nl);
         }
@@ -670,7 +744,7 @@ impl TextBuffer {
                 EditAction::InsertNewline { row, col } => {
                     // Merge
                     if row + 1 < self.lines.len() {
-                        let right = self.lines.remove(row+1);
+                        let right = self.lines.remove(row + 1);
                         self.lines[row].extend_from_slice(&right);
                         self.cursor_row = row;
                         self.cursor_col = col;
@@ -683,16 +757,20 @@ impl TextBuffer {
                     // Insertion: split at col
                     let col = act_col(&act);
                     let right = self.lines[row].split_off(col);
-                    self.lines.insert(row+1, right);
-                    self.cursor_row = row+1;
+                    self.lines.insert(row + 1, right);
+                    self.cursor_row = row + 1;
                     self.cursor_col = 0;
                 }
                 EditAction::DeleteLine { row, line } => {
                     self.lines.insert(row, line);
                 }
                 EditAction::InsertLine { row, .. } => {
-                    if row < self.lines.len() { self.lines.remove(row); }
-                    if self.lines.is_empty() { self.lines.push(Vec::new()); }
+                    if row < self.lines.len() {
+                        self.lines.remove(row);
+                    }
+                    if self.lines.is_empty() {
+                        self.lines.push(Vec::new());
+                    }
                 }
             }
             self.redo_stack.push(act);
@@ -720,18 +798,22 @@ impl TextBuffer {
                 EditAction::InsertNewline { row, col } => {
                     if row < self.lines.len() {
                         let right = self.lines[row].split_off(col);
-                        self.lines.insert(row+1, right);
+                        self.lines.insert(row + 1, right);
                     }
                 }
                 EditAction::DeleteNewline { row, .. } => {
-                    if row +1 < self.lines.len() {
-                        let right = self.lines.remove(row+1);
+                    if row + 1 < self.lines.len() {
+                        let right = self.lines.remove(row + 1);
                         self.lines[row].extend_from_slice(&right);
                     }
                 }
                 EditAction::DeleteLine { row, .. } => {
-                    if row < self.lines.len() { self.lines.remove(row); }
-                    if self.lines.is_empty() { self.lines.push(Vec::new()); }
+                    if row < self.lines.len() {
+                        self.lines.remove(row);
+                    }
+                    if self.lines.is_empty() {
+                        self.lines.push(Vec::new());
+                    }
                 }
                 EditAction::InsertLine { row, line } => {
                     self.lines.insert(row, line);
@@ -777,9 +859,13 @@ fn act_col(a: &EditAction) -> usize {
     }
 }
 
-fn is_space(b: u8) -> bool { b == b' ' || b == b'\t' }
+fn is_space(b: u8) -> bool {
+    b == b' ' || b == b'\t'
+}
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.len() > haystack.len() { return None; }
+    if needle.len() > haystack.len() {
+        return None;
+    }
     haystack.windows(needle.len()).position(|w| w == needle)
 }

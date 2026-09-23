@@ -53,13 +53,28 @@ pub struct KeyEvent {
 
 impl KeyEvent {
     pub fn new(key: Key) -> Self {
-        Self { key, shift: false, alt: false, ctrl: false }
+        Self {
+            key,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        }
     }
     pub fn ctrl(c: char) -> Self {
-        Self { key: Key::Ctrl(c), shift: false, alt: false, ctrl: true }
+        Self {
+            key: Key::Ctrl(c),
+            shift: false,
+            alt: false,
+            ctrl: true,
+        }
     }
     pub fn char(c: char) -> Self {
-        Self { key: Key::Char(c), shift: false, alt: false, ctrl: false }
+        Self {
+            key: Key::Char(c),
+            shift: false,
+            alt: false,
+            ctrl: false,
+        }
     }
 }
 
@@ -125,6 +140,62 @@ lazy_static! {
     static ref MOD_STATE: Mutex<ModState> = Mutex::new(ModState::new());
 }
 
+/// Last USB HID boot-protocol report for press-edge detection.
+static LAST_HID_REPORT: Mutex<[u8; 8]> = Mutex::new([0; 8]);
+
+/// HID usage ID -> (unshifted, shifted) ASCII, for printable keys.
+fn hid_to_ascii(usage: u8) -> Option<(char, char)> {
+    Some(match usage {
+        0x04..=0x1D => {
+            let l = (b'a' + (usage - 0x04)) as char;
+            (l, (l as u8 - b'a' + b'A') as char)
+        }
+        0x1E..=0x27 => {
+            const PLAIN: [char; 10] = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
+            const SHIFT: [char; 10] = ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')'];
+            let i = (usage - 0x1E) as usize;
+            (PLAIN[i], SHIFT[i])
+        }
+        0x2C => (' ', ' '),
+        0x2D => ('-', '_'),
+        0x2E => ('=', '+'),
+        0x2F => ('[', '{'),
+        0x30 => (']', '}'),
+        0x31 => ('\\', '|'),
+        0x33 => (';', ':'),
+        0x34 => ('\'', '"'),
+        0x35 => ('`', '~'),
+        0x36 => (',', '<'),
+        0x37 => ('.', '>'),
+        0x38 => ('/', '?'),
+        _ => return None,
+    })
+}
+
+/// HID usage ID -> non-printable Key.
+fn hid_to_key(usage: u8) -> Option<Key> {
+    Some(match usage {
+        0x28 => Key::Enter,
+        0x29 => Key::Esc,
+        0x2A => Key::Backspace,
+        0x2B => Key::Tab,
+        0x39 => return None, // CapsLock: ignore
+        0x3A..=0x45 => Key::F(usage - 0x3A + 1),
+        0x46..=0x48 => return None, // PrintScreen/ScrollLock/Pause: ignore
+        0x49 => Key::Insert,
+        0x4A => Key::Home,
+        0x4B => Key::PageUp,
+        0x4C => Key::Delete,
+        0x4D => Key::End,
+        0x4E => Key::PageDown,
+        0x4F => Key::ArrowRight,
+        0x50 => Key::ArrowLeft,
+        0x51 => Key::ArrowDown,
+        0x52 => Key::ArrowUp,
+        _ => return None,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ModState {
     ctrl: bool,
@@ -133,7 +204,13 @@ struct ModState {
 }
 
 impl ModState {
-    const fn new() -> Self { Self { ctrl: false, shift: false, alt: false } }
+    const fn new() -> Self {
+        Self {
+            ctrl: false,
+            shift: false,
+            alt: false,
+        }
+    }
 }
 
 /// Map pc_keyboard KeyCode -> our Key (for RawKey)
@@ -156,12 +233,18 @@ fn map_keycode(code: KeyCode) -> Option<Key> {
         KeyCode::LControl | KeyCode::RControl => None, // modifier
         KeyCode::LShift | KeyCode::RShift => None,
         KeyCode::LAlt | KeyCode::RAltGr => None,
-        KeyCode::F1 => Some(Key::F(1)), KeyCode::F2 => Some(Key::F(2)),
-        KeyCode::F3 => Some(Key::F(3)), KeyCode::F4 => Some(Key::F(4)),
-        KeyCode::F5 => Some(Key::F(5)), KeyCode::F6 => Some(Key::F(6)),
-        KeyCode::F7 => Some(Key::F(7)), KeyCode::F8 => Some(Key::F(8)),
-        KeyCode::F9 => Some(Key::F(9)), KeyCode::F10 => Some(Key::F(10)),
-        KeyCode::F11 => Some(Key::F(11)), KeyCode::F12 => Some(Key::F(12)),
+        KeyCode::F1 => Some(Key::F(1)),
+        KeyCode::F2 => Some(Key::F(2)),
+        KeyCode::F3 => Some(Key::F(3)),
+        KeyCode::F4 => Some(Key::F(4)),
+        KeyCode::F5 => Some(Key::F(5)),
+        KeyCode::F6 => Some(Key::F(6)),
+        KeyCode::F7 => Some(Key::F(7)),
+        KeyCode::F8 => Some(Key::F(8)),
+        KeyCode::F9 => Some(Key::F(9)),
+        KeyCode::F10 => Some(Key::F(10)),
+        KeyCode::F11 => Some(Key::F(11)),
+        KeyCode::F12 => Some(Key::F(12)),
         _ => None,
     }
 }
@@ -217,33 +300,94 @@ pub fn handle_interrupt(scancode: u8) {
                     let mut buffer = BUFFER.lock();
                     if mods.ctrl && character.is_ascii_alphabetic() {
                         let ctrl_char = (character.to_ascii_uppercase() as u8) as char;
-                        let _ = buffer.push(KeyEvent { key: Key::Ctrl(ctrl_char), shift: mods.shift, alt: mods.alt, ctrl: true });
+                        if ctrl_char == 'C' {
+                            crate::shell::request_interrupt();
+                        }
+                        let _ = buffer.push(KeyEvent {
+                            key: Key::Ctrl(ctrl_char),
+                            shift: mods.shift,
+                            alt: mods.alt,
+                            ctrl: true,
+                        });
                     } else if (character as u32) < 32 {
                         // Control char directly from serial / fallback (e.g., 0x03 for Ctrl+C, 0x1C for Ctrl+\)
                         // Map 0x01..0x1F to Ctrl+char (adds 64 => '@'..'_')
                         if (1..=31).contains(&(character as u8)) {
                             let ctrl_char = ((character as u8) + 64) as char;
-                            let _ = buffer.push(KeyEvent { key: Key::Ctrl(ctrl_char), shift: mods.shift, alt: mods.alt, ctrl: true });
+                            if ctrl_char == 'C' {
+                                crate::shell::request_interrupt();
+                            }
+                            let _ = buffer.push(KeyEvent {
+                                key: Key::Ctrl(ctrl_char),
+                                shift: mods.shift,
+                                alt: mods.alt,
+                                ctrl: true,
+                            });
                         } else {
                             // e.g., Enter already handled via RawKey; but handle \r \n, Backspace, etc.
                             match character {
-                                '\n' | '\r' => { let _ = buffer.push(KeyEvent{ key: Key::Enter, shift: mods.shift, alt: mods.alt, ctrl: mods.ctrl }); }
-                                '\x08' | '\x7f' => { let _ = buffer.push(KeyEvent{ key: Key::Backspace, shift: mods.shift, alt: mods.alt, ctrl: mods.ctrl }); }
-                                '\x09' => { let _ = buffer.push(KeyEvent{ key: Key::Tab, shift: mods.shift, alt: mods.alt, ctrl: mods.ctrl }); }
-                                '\x1b' => { let _ = buffer.push(KeyEvent{ key: Key::Esc, shift: mods.shift, alt: mods.alt, ctrl: mods.ctrl }); }
-                                _ => { let _ = buffer.push(KeyEvent{ key: Key::Char(character), shift: mods.shift, alt: mods.alt, ctrl: mods.ctrl}); }
+                                '\n' | '\r' => {
+                                    let _ = buffer.push(KeyEvent {
+                                        key: Key::Enter,
+                                        shift: mods.shift,
+                                        alt: mods.alt,
+                                        ctrl: mods.ctrl,
+                                    });
+                                }
+                                '\x08' | '\x7f' => {
+                                    let _ = buffer.push(KeyEvent {
+                                        key: Key::Backspace,
+                                        shift: mods.shift,
+                                        alt: mods.alt,
+                                        ctrl: mods.ctrl,
+                                    });
+                                }
+                                '\x09' => {
+                                    let _ = buffer.push(KeyEvent {
+                                        key: Key::Tab,
+                                        shift: mods.shift,
+                                        alt: mods.alt,
+                                        ctrl: mods.ctrl,
+                                    });
+                                }
+                                '\x1b' => {
+                                    let _ = buffer.push(KeyEvent {
+                                        key: Key::Esc,
+                                        shift: mods.shift,
+                                        alt: mods.alt,
+                                        ctrl: mods.ctrl,
+                                    });
+                                }
+                                _ => {
+                                    let _ = buffer.push(KeyEvent {
+                                        key: Key::Char(character),
+                                        shift: mods.shift,
+                                        alt: mods.alt,
+                                        ctrl: mods.ctrl,
+                                    });
+                                }
                             }
                         }
                     } else {
                         // Regular char – if alt held, mark alt
-                        let _ = buffer.push(KeyEvent{ key: Key::Char(character), shift: mods.shift, alt: mods.alt, ctrl: mods.ctrl});
+                        let _ = buffer.push(KeyEvent {
+                            key: Key::Char(character),
+                            shift: mods.shift,
+                            alt: mods.alt,
+                            ctrl: mods.ctrl,
+                        });
                     }
                 }
                 DecodedKey::RawKey(keycode) => {
                     // Check modifier-only keys already handled above – ignore extra
                     if let Some(k) = map_keycode(keycode) {
                         let mut buffer = BUFFER.lock();
-                        let _ = buffer.push(KeyEvent{ key: k, shift: mods.shift, alt: mods.alt, ctrl: mods.ctrl });
+                        let _ = buffer.push(KeyEvent {
+                            key: k,
+                            shift: mods.shift,
+                            alt: mods.alt,
+                            ctrl: mods.ctrl,
+                        });
                     } else {
                         // For letter keys with Ctrl/Alt: if Ctrl held, map to Ctrl
                         // pc_keyboard RawKey for letters gives KeyCode like KeyCode::A etc – not yet mapped
@@ -265,17 +409,38 @@ fn try_parse_serial_byte(b: u8) -> Option<KeyEvent> {
     let mut state = SERIAL_ESC_STATE.lock();
     match *state {
         0 => {
-            if b == 0x1B { *state = 1; return None; }
-            if b == b'\r' || b == b'\n' { return Some(KeyEvent::new(Key::Enter)); }
-            if b == 0x7F || b == 0x08 { return Some(KeyEvent::new(Key::Backspace)); }
-            if b == 0x09 { return Some(KeyEvent::new(Key::Tab)); }
-            if b >= 1 && b <= 26 { return Some(KeyEvent::ctrl((b + 64) as char)); }
-            if b == 0x1B { return Some(KeyEvent::new(Key::Esc)); }
-            if b.is_ascii() && !b.is_ascii_control() { return Some(KeyEvent::char(b as char)); }
+            if b == 0x1B {
+                *state = 1;
+                return None;
+            }
+            if b == b'\r' || b == b'\n' {
+                return Some(KeyEvent::new(Key::Enter));
+            }
+            if b == 0x7F || b == 0x08 {
+                return Some(KeyEvent::new(Key::Backspace));
+            }
+            if b == 0x09 {
+                return Some(KeyEvent::new(Key::Tab));
+            }
+            if b >= 1 && b <= 26 {
+                if b == 3 {
+                    crate::shell::request_interrupt();
+                }
+                return Some(KeyEvent::ctrl((b + 64) as char));
+            }
+            if b == 0x1B {
+                return Some(KeyEvent::new(Key::Esc));
+            }
+            if b.is_ascii() && !b.is_ascii_control() {
+                return Some(KeyEvent::char(b as char));
+            }
             None
         }
         1 => {
-            if b == b'[' { *state = 2; return None; }
+            if b == b'[' {
+                *state = 2;
+                return None;
+            }
             // ESC alone
             *state = 0;
             // Push ESC then re-evaluate b
@@ -303,7 +468,8 @@ fn try_parse_serial_byte(b: u8) -> Option<KeyEvent> {
                 b'D' => return Some(KeyEvent::new(Key::ArrowLeft)),
                 b'H' => return Some(KeyEvent::new(Key::Home)),
                 b'F' => return Some(KeyEvent::new(Key::End)),
-                b'5' => { // PageUp is ESC[5~
+                b'5' => {
+                    // PageUp is ESC[5~
                     // Need to consume trailing ~ ; peek not available, assume next byte is ~
                     // We can't consume future; treat as PageUp
                     return Some(KeyEvent::new(Key::PageUp));
@@ -314,7 +480,10 @@ fn try_parse_serial_byte(b: u8) -> Option<KeyEvent> {
                 _ => return None,
             }
         }
-        _ => { *state = 0; None }
+        _ => {
+            *state = 0;
+            None
+        }
     }
 }
 
@@ -392,7 +561,9 @@ pub fn wait_for_char() -> char {
 
 /// Checks if there are characters/keys available
 pub fn has_char() -> bool {
-    if crate::drivers::serial::has_input() { return true; }
+    if crate::drivers::serial::has_input() {
+        return true;
+    }
     use x86_64::instructions::interrupts;
     interrupts::without_interrupts(|| {
         let buffer = BUFFER.lock();
@@ -402,7 +573,9 @@ pub fn has_char() -> bool {
 
 /// Checks if key available (including serial)
 pub fn has_key() -> bool {
-    if crate::drivers::serial::has_input() { return true; }
+    if crate::drivers::serial::has_input() {
+        return true;
+    }
     use x86_64::instructions::interrupts;
     interrupts::without_interrupts(|| {
         let buffer = BUFFER.lock();
@@ -411,4 +584,55 @@ pub fn has_key() -> bool {
 }
 
 /// Peek / debug: returns true if serial escape pending
-pub fn serial_escape_pending() -> bool { *SERIAL_ESC_STATE.lock() != 0 }
+pub fn serial_escape_pending() -> bool {
+    *SERIAL_ESC_STATE.lock() != 0
+}
+
+/// Push a USB HID boot-protocol report (8 bytes: modifier, reserved, keycode[6]).
+/// Called from USB HID drivers (EHCI/xHCI) to inject key events.
+pub fn push_usb_report(report: [u8; 8]) {
+    use x86_64::instructions::interrupts;
+
+    let modifier = report[0];
+    let shift = modifier & 0x22 != 0;
+    let ctrl = modifier & 0x11 != 0;
+    let alt = modifier & 0x44 != 0;
+
+    interrupts::without_interrupts(|| {
+        let mut last = LAST_HID_REPORT.lock();
+        let mut buf = BUFFER.lock();
+        for &usage in &report[2..] {
+            if usage == 0 || usage == 0x01 {
+                continue; // empty slot / error rollover
+            }
+            if last[2..].contains(&usage) {
+                continue; // held key: no repeat event
+            }
+            let ev = if let Some((plain, shifted)) = hid_to_ascii(usage) {
+                let c = if shift { shifted } else { plain };
+                if ctrl && c.is_ascii_alphabetic() {
+                    KeyEvent::ctrl(c.to_ascii_uppercase())
+                } else {
+                    let mut ev = KeyEvent::char(c);
+                    ev.shift = shift;
+                    ev.alt = alt;
+                    ev.ctrl = ctrl;
+                    ev
+                }
+            } else if let Some(key) = hid_to_key(usage) {
+                let mut ev = KeyEvent::new(key);
+                ev.shift = shift;
+                ev.alt = alt;
+                ev.ctrl = ctrl;
+                ev
+            } else {
+                continue;
+            };
+            if matches!(ev.key, Key::Ctrl('C')) {
+                crate::shell::request_interrupt();
+            }
+            let _ = buf.push(ev);
+        }
+        *last = report;
+    });
+}

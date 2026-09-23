@@ -10,3 +10,17 @@ edition = "2021"
 
 [dependencies]
 bootloader = "0.11"
+anyhow = "1.0"
+hyper = { version = "1.0", features = ["full"] }
+hyper-tungstenite = "0.30"
+hyper-util = { version = "0.1", features = ["full"] }
+tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = "0.30"
+tungstenite = "0.30"
+mime_guess = "2.0"
+include_dir = "0.7"
+http-body-util = "0.1"
+futures-util = "0.3"
+
+[build-dependencies]
+bootloader = "0.11"

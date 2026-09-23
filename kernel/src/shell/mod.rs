@@ -6,12 +6,12 @@
 //!
 //! A simple command-line shell for the Matzen Kernel Framework.
 
-use crate::drivers::{keyboard, vga};
 use crate::drivers::keyboard::Key;
+use crate::drivers::{keyboard, vga};
 use crate::{print, println};
-use alloc::vec::Vec;
 use alloc::string::String;
-use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 /// Maximum length of a command line
@@ -19,23 +19,84 @@ const MAX_CMD_LENGTH: usize = 256;
 
 /// Builtin commands for TAB completion (must match execute_command and help)
 const BUILTINS: &[&str] = &[
-    "help", "clear", "cls", "echo", "about", "version", "uptime", "mem", "memory",
-    "reboot", "halt", "shutdown", "date", "whoami", "cpuinfo", "calc", "color", "test",
-    "diskinfo", "mkfs", "mount", "ls", "dir", "touch", "cat", "write", "rm", "mkdir", "rmdir",
-    "cd", "pwd", "ifconfig", "ping", "netstat", "tcpconnect", "tcpsend", "tcpclose",
-    "nano", "edit", "mfkedit", "run", "exec", "mkapp", "writehex", "ps", "appinfo",
+    "help",
+    "clear",
+    "cls",
+    "echo",
+    "about",
+    "version",
+    "uptime",
+    "mem",
+    "memory",
+    "reboot",
+    "halt",
+    "shutdown",
+    "date",
+    "whoami",
+    "cpuinfo",
+    "calc",
+    "color",
+    "test",
+    "diskinfo",
+    "mkfs",
+    "mount",
+    "ls",
+    "dir",
+    "touch",
+    "cat",
+    "write",
+    "rm",
+    "mkdir",
+    "rmdir",
+    "cd",
+    "pwd",
+    "ifconfig",
+    "ping",
+    "netstat",
+    "tcpconnect",
+    "tcpsend",
+    "tcpclose",
+    "nano",
+    "edit",
+    "mfkedit",
+    "run",
+    "exec",
+    "mkapp",
+    "writehex",
+    "ps",
+    "appinfo",
+    "desktop",
+    "install",
+    "usb",
+    "mouse",
+    "dns",
+    "arp",
+    "udp-send",
+    "udp-recv",
+    "wget",
+    "speedtest",
+    "speedtest-server",
+    "netdebug",
+    "tlsinfo",
+    "tcpstatus",
+    "tcprecv",
 ];
 
 /// Shell prompt string (dynamic in code, fallback)
 const PROMPT: &str = "mfk> ";
 
 fn prompt() -> alloc::string::String {
-    // Try to show current path like mfk:/docs> 
+    // Try to show current path like mfk:/docs>
     if let Some(path) = current_path_string() {
         alloc::format!("mfk:{}> ", path)
     } else {
         alloc::string::String::from(PROMPT)
     }
+}
+
+/// Prompt text used by the desktop terminal frontend.
+pub fn desktop_prompt() -> alloc::string::String {
+    prompt()
 }
 
 fn current_path_string() -> Option<alloc::string::String> {
@@ -53,7 +114,9 @@ fn current_path_string() -> Option<alloc::string::String> {
     None
 }
 
-/// Simple tick counter for uptime tracking
+/// Millisecond-ish monotonic counter. PIT IRQ0 advances this by 10ms; the
+/// explicit cooperative increment is also used as a fail-open timeout path
+/// while synchronous commands pump packets.
 static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Global interrupt flag for Ctrl+C handling
@@ -67,9 +130,23 @@ pub fn get_tick_count() -> u64 {
     TICK_COUNTER.load(Ordering::Relaxed)
 }
 
+/// Monotonic millisecond source for bounded network operations.
+pub fn monotonic_ms() -> u64 {
+    if crate::time::is_initialized() {
+        crate::time::uptime_millis()
+    } else {
+        get_tick_count()
+    }
+}
+
 /// Increment tick (used by editor which bypasses shell::run loop)
 pub fn increment_tick() {
     TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Advance the shell clock from the 100 Hz PIT interrupt.
+pub fn timer_tick() {
+    TICK_COUNTER.fetch_add(crate::time::MS_PER_TICK, Ordering::Relaxed);
 }
 
 /// Check if Ctrl+C was pressed
@@ -87,6 +164,10 @@ fn set_interrupt() {
     INTERRUPT_FLAG.store(true, Ordering::Relaxed);
 }
 
+pub fn request_interrupt() {
+    set_interrupt();
+}
+
 /// Runs the shell loop
 pub fn run() -> ! {
     let mut cmd_buffer: [u8; MAX_CMD_LENGTH] = [0; MAX_CMD_LENGTH];
@@ -95,11 +176,12 @@ pub fn run() -> ! {
     print!("{}", prompt());
 
     loop {
-        // Increment tick counter for basic timing
-        TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
-
         // Process network packets
         crate::net::process_packets();
+
+        // Poll USB HID keyboards so xHCI/usb-kbd input reaches the buffer.
+        #[cfg(feature = "usb")]
+        crate::drivers::usb::poll();
 
         if let Some(ev) = keyboard::read_key() {
             match ev.key {
@@ -186,15 +268,36 @@ pub fn execute_command(cmd: &str) -> bool {
         "ifconfig" => cmd_ifconfig(parts.1),
         "ping" => cmd_ping(parts.1),
         "netstat" => cmd_netstat(),
+        "dns" => cmd_dns(parts.1),
+        "arp" => cmd_arp(parts.1),
+        "udp-send" => cmd_udp_send(parts.1),
+        "udp-recv" => cmd_udp_recv(parts.1),
+        "wget" => crate::net::wget::cmd_run(parts.1),
+        "speedtest" => crate::net::speedtest::cmd_run(parts.1),
+        "speedtest-server" => crate::net::speedtest::cmd_server(parts.1),
+        "netdebug" => cmd_netdebug(parts.1),
+        "tlsinfo" => cmd_tlsinfo(),
         "tcpconnect" => cmd_tcpconnect(parts.1),
         "tcpsend" => cmd_tcpsend(parts.1),
         "tcpclose" => cmd_tcpclose(parts.1),
+        "tcpstatus" => cmd_tcpstatus(parts.1),
+        "tcprecv" => cmd_tcprecv(parts.1),
         "nano" | "edit" | "mfkedit" => cmd_edit(parts.1),
         "run" | "exec" => cmd_run(parts.1),
         "mkapp" => cmd_mkapp(parts.1),
         "writehex" => cmd_writehex(parts.1),
         "ps" => cmd_ps(),
         "appinfo" => cmd_appinfo(parts.1),
+        "desktop" => {
+            if crate::drivers::vga::output_capture_active() {
+                println!("desktop: already running");
+            } else {
+                cmd_desktop();
+            }
+        }
+        "install" => cmd_install(),
+        "usb" => cmd_usb(),
+        "mouse" => cmd_mouse(),
         "" => {}
         _ => {
             println!(
@@ -256,19 +359,34 @@ fn cmd_help() {
     println!("  ps            - Show process status (Phase 1: cooperative)");
     println!();
     println!("Network Commands:");
-    println!("  ifconfig     - Configure network interface (e.g., 'ifconfig 10.0.2.15')");
-    println!("  ping         - Send ICMP echo request (e.g., 'ping 10.0.2.2 4')");
-    println!("  netstat      - Display network status");
-    println!("  tcpconnect   - Connect to TCP server (e.g., 'tcpconnect 10.0.2.2 80')");
+    println!("  ifconfig     - Show/configure address [netmask] [gateway]");
+    println!("                 e.g. ifconfig 10.0.2.15 255.255.255.0 10.0.2.2");
+    println!("  ping         - Ping IPv4 address or hostname (e.g., 'ping example.com 4')");
+    println!("  dns          - Resolve IPv4 hostname (e.g., 'dns example.com')");
+    println!("  arp          - Show cache or resolve IPv4 (e.g., 'arp 10.0.2.2')");
+    println!("  netstat      - Show interface, route, ARP and protocol status");
+    println!("  tcpconnect   - Connect to TCP server by IP or hostname");
     println!("  tcpsend      - Send data on TCP connection (e.g., 'tcpsend <port> <data>')");
     println!("  tcpclose     - Close TCP connection (e.g., 'tcpclose <port>')");
+    println!("  tcpstatus    - Show TCP state (e.g., 'tcpstatus <local-port>')");
+    println!("  tcprecv      - Wait for TCP data (e.g., 'tcprecv <local-port> [seconds]')");
+    println!("  udp-send     - Send UDP text: udp-send <host> <src-port> <dst-port> <text>");
+    println!("  udp-recv     - Wait for UDP: udp-recv <local-port> [timeout-seconds]");
+    println!("  wget         - Download HTTP(S) to mounted filesystem (e.g., 'wget URL /file')");
+    println!("  speedtest    - Run LibreSpeed HTTP(S) test");
+    println!("  speedtest-server - Show/set speedtest server");
+    println!("  netdebug     - Toggle gated packet tracing (on/off/status)");
+    println!("  tlsinfo      - Show whether the TLS 1.3 backend is compiled in");
+    println!("  Add -d/--debug to wget and speedtest for network traces.");
 }
 
 /// Clears the screen - true clear for both VGA and serial, no whitespace trick
 fn cmd_clear() {
     vga::clear_screen();
     // True ANSI clear for serial/QEMU headless (VGA already cleared above)
-    crate::serial_print!("\x1b[2J\x1b[H\x1b[0m");
+    if !vga::output_capture_active() {
+        crate::serial_print!("\x1b[2J\x1b[H\x1b[0m");
+    }
     // Sync hardware cursor to where next shell text will appear (bottom row, col 0)
     // VGA Writer is bottom-anchored (write_byte always at BUFFER_HEIGHT-1), so home is bottom row.
     vga::set_cursor_pos(crate::drivers::vga::VGA_HEIGHT - 1, 0);
@@ -297,13 +415,10 @@ fn cmd_about() {
 /// Displays uptime
 fn cmd_uptime() {
     let ticks = TICK_COUNTER.load(Ordering::Relaxed);
-    // Rough estimate: each loop iteration is very fast,
-    // we estimate ~1000 ticks per second in idle
-    let approx_seconds = ticks / 1000;
-    let minutes = approx_seconds / 60;
-    let seconds = approx_seconds % 60;
+    let minutes = ticks / 60_000;
+    let seconds = (ticks / 1000) % 60;
     println!("System uptime: {} minutes, {} seconds", minutes, seconds);
-    println!("(Loop iterations: {})", ticks);
+    println!("({} ms)", ticks);
 }
 
 /// Displays memory information
@@ -1003,7 +1118,11 @@ fn cmd_cd(path: &str) {
     }
     let mut device = crate::drivers::block::AtaBlockDevice::new();
     if let Some(ref mut fs) = *fs_guard {
-        let target = if path.trim().is_empty() { "/" } else { path.trim() };
+        let target = if path.trim().is_empty() {
+            "/"
+        } else {
+            path.trim()
+        };
         match fs.change_directory_path(&mut device, target) {
             Ok(()) => {}
             Err(e) => println!("cd: {}: {}", target, e),
@@ -1032,125 +1151,232 @@ fn cmd_ifconfig(args: &str) {
     if args.is_empty() {
         // Display current configuration
         if let Some(mac) = crate::drivers::e1000::mac_address() {
+            let cfg = crate::net::ip::network_config();
             println!("Network Interface:");
-            println!("  MAC Address: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-            
-            if let Some(ip) = crate::net::ip::get_ip_address() {
+            println!(
+                "  MAC Address: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            );
+
+            if let Some(ip) = cfg.address {
                 println!("  IP Address:  {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
             } else {
                 println!("  IP Address:  Not configured");
+            }
+            println!(
+                "  Netmask:     {}.{}.{}.{}",
+                cfg.netmask[0], cfg.netmask[1], cfg.netmask[2], cfg.netmask[3]
+            );
+            if let Some(gw) = cfg.gateway {
+                println!("  Gateway:     {}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3]);
+            } else {
+                println!("  Gateway:     (none)");
             }
         } else {
             println!("Network interface not initialized");
         }
     } else {
-        // Parse and set IP address
-        let parts: Vec<&str> = args.split('.').collect();
-        if parts.len() != 4 {
-            println!("Invalid IP address format. Use: ifconfig <ip> (e.g., ifconfig 10.0.2.15)");
+        // Configure an address and optionally a netmask + gateway.
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        if parts.is_empty() || parts.len() > 3 {
+            println!("Usage: ifconfig <ip> [netmask] [gateway]");
+            println!("Example: ifconfig 10.0.2.15 255.255.255.0 10.0.2.2");
             return;
         }
-
-        let mut ip = [0u8; 4];
-        for (i, part) in parts.iter().enumerate() {
-            match part.parse::<u8>() {
-                Ok(octet) => ip[i] = octet,
-                Err(_) => {
-                    println!("Invalid IP address format");
+        let Some(ip) = parse_ipv4(parts[0]) else {
+            println!("Invalid IPv4 address: {}", parts[0]);
+            return;
+        };
+        let current = crate::net::ip::network_config();
+        let mask = if parts.len() > 1 {
+            match parse_ipv4(parts[1]) {
+                Some(mask) => mask,
+                None => {
+                    println!("Invalid netmask: {}", parts[1]);
                     return;
                 }
             }
+        } else {
+            current.netmask
+        };
+        let mut saw_host_bit = false;
+        let mut valid_mask = true;
+        for bit in 0..32 {
+            let set = (mask[bit / 8] & (1u8 << (7 - bit % 8))) != 0;
+            if saw_host_bit && set {
+                valid_mask = false;
+                break;
+            }
+            if !set {
+                saw_host_bit = true;
+            }
         }
+        if !valid_mask {
+            println!("Netmask must contain contiguous 1 bits followed by 0 bits");
+            return;
+        }
+        let gateway = if parts.len() > 2 {
+            match parse_ipv4(parts[2]) {
+                Some(gw) => Some(gw),
+                None => {
+                    println!("Invalid gateway: {}", parts[2]);
+                    return;
+                }
+            }
+        } else {
+            current.gateway
+        };
+        crate::net::ip::configure(ip, mask, gateway);
+        println!(
+            "Network configured: {}.{}.{}.{} / {}.{}.{}.{}{}",
+            ip[0],
+            ip[1],
+            ip[2],
+            ip[3],
+            mask[0],
+            mask[1],
+            mask[2],
+            mask[3],
+            match gateway {
+                Some(g) => alloc::format!(" gateway {}.{}.{}.{}", g[0], g[1], g[2], g[3]),
+                None => alloc::string::String::new(),
+            }
+        );
+    }
+}
 
-        crate::net::ip::set_ip_address(ip);
-        println!("IP address set to {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+fn parse_ipv4(text: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut count = 0usize;
+    for part in text.split('.') {
+        if count >= 4 {
+            return None;
+        }
+        octets[count] = part.parse::<u8>().ok()?;
+        count += 1;
+    }
+    (count == 4).then_some(octets)
+}
+
+fn take_word(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    if end == 0 {
+        None
+    } else {
+        Some((&input[..end], &input[end..]))
     }
 }
 
 /// Send ping (ICMP echo request)
 fn cmd_ping(args: &str) {
     if args.is_empty() {
-        println!("Usage: ping <ip-address> [count]");
+        println!("Usage: ping <ip-address|hostname> [count]");
         println!("Example: ping 10.0.2.2 4");
         return;
     }
 
-    // Split args to get IP and optional count
+    // Split args to get IPv4/hostname and optional count.
     let parts: Vec<&str> = args.split_whitespace().collect();
-    
-    // Parse IP address
-    let ip_parts: Vec<&str> = parts[0].split('.').collect();
-    if ip_parts.len() != 4 {
-        println!("Invalid IP address format");
+    if crate::net::ip::get_ip_address().is_none() {
+        println!("Network not configured. Run 'ifconfig 10.0.2.15 255.255.255.0 10.0.2.2' first.");
         return;
     }
+    let target_ip = match parse_ipv4(parts[0]) {
+        Some(ip) => ip,
+        None => match crate::net::dns::resolve_ipv4(parts[0]) {
+            Ok(ip) => ip,
+            Err(e) => {
+                println!("Could not resolve '{}': {}", parts[0], e);
+                return;
+            }
+        },
+    };
 
-    let mut target_ip = [0u8; 4];
-    for (i, part) in ip_parts.iter().enumerate() {
-        match part.parse::<u8>() {
-            Ok(octet) => target_ip[i] = octet,
-            Err(_) => {
-                println!("Invalid IP address");
+    // Parse count
+    let count: u32 = if parts.len() > 1 {
+        match parts[1].parse::<u32>() {
+            Ok(n) if (1..=32).contains(&n) => n,
+            _ => {
+                println!("Ping count must be between 1 and 32");
                 return;
             }
         }
-    }
-    
-    // Parse count
-    let count = if parts.len() > 1 {
-        parts[1].parse().unwrap_or(4)
     } else {
         4
     };
 
-    println!("Pinging {}.{}.{}.{} with {} packets...", 
-        target_ip[0], target_ip[1], target_ip[2], target_ip[3], count);
-    
+    println!(
+        "Pinging {}.{}.{}.{} with {} packets...",
+        target_ip[0], target_ip[1], target_ip[2], target_ip[3], count
+    );
+
     // Send pings
+    clear_interrupt();
+    let identifier = crate::net::icmp::next_identifier();
+    let mut transmitted = 0u32;
     for seq in 0..count {
-        match crate::net::icmp::send_ping(target_ip, 1, seq) {
-            Ok(_) => {},
+        match crate::net::icmp::send_ping(target_ip, identifier, seq as u16) {
+            Ok(_) => transmitted += 1,
             Err(e) => {
                 println!("Failed to send ping {}: {}", seq, e);
                 break;
             }
         }
         // Small delay between pings
-        for _ in 0..1000000 { core::hint::spin_loop(); }
+        for _ in 0..10000 {
+            core::hint::spin_loop();
+        }
     }
-    
-    println!("Sent {} ping(s), waiting for replies...", count);
-    
+
+    println!("Sent {} ping(s), waiting for replies...", transmitted);
+    if transmitted == 0 {
+        println!("--- ping statistics ---");
+        println!("0 packets transmitted, 0 received, 100% packet loss");
+        return;
+    }
+
     // Wait for replies with timeout
-    let start_time = get_tick_count();
-    let timeout_ms = 5000;
+    let start_time = monotonic_ms();
+    let timeout_ms: u64 = 5000;
     let mut received = 0;
-    clear_interrupt();
-    
-    while get_tick_count() - start_time < timeout_ms && !is_interrupted() {
+    let poll_limit = timeout_ms.saturating_mul(1000).max(1);
+    let mut polls = 0u64;
+
+    while polls < poll_limit
+        && monotonic_ms().saturating_sub(start_time) < timeout_ms
+        && !is_interrupted()
+    {
         // Process incoming packets
         crate::net::process_packets();
-        
+
         // Check for replies
-        while let Some(reply) = crate::net::icmp::pop_reply() {
-            println!("Reply from {}.{}.{}.{}: seq={} time={}ms",
-                reply.source_ip[0], reply.source_ip[1],
-                reply.source_ip[2], reply.source_ip[3],
-                reply.sequence, reply.rtt_ms);
+        while let Some(reply) = crate::net::icmp::pop_reply_for(identifier) {
+            println!(
+                "Reply from {}.{}.{}.{}: seq={} time={}ms",
+                reply.source_ip[0],
+                reply.source_ip[1],
+                reply.source_ip[2],
+                reply.source_ip[3],
+                reply.sequence,
+                reply.rtt_ms
+            );
             received += 1;
         }
-        
+
         // If we got all replies, we're done
-        if received >= count {
+        if received >= transmitted {
             break;
         }
-        
-        // Small delay
-        for _ in 0..10000 { core::hint::spin_loop(); }
+
+        // Yield briefly; the PIT IRQ advances the monotonic clock.
+        increment_tick();
+        polls += 1;
+        core::hint::spin_loop();
     }
-    
+
     if is_interrupted() {
+        crate::net::icmp::clear_pending(identifier);
         println!("Ping cancelled by user");
         clear_interrupt();
     } else {
@@ -1159,30 +1385,53 @@ fn cmd_ping(args: &str) {
         if timed_out > 0 {
             println!("{} packet(s) timed out", timed_out);
         }
-        
+
         println!("--- ping statistics ---");
-        println!("{} packets transmitted, {} received, {}% packet loss",
-            count, received, 
-            if count > 0 { ((count - received) * 100) / count } else { 0 });
+        println!(
+            "{} packets transmitted, {} received, {}% packet loss",
+            transmitted,
+            received,
+            if transmitted > 0 {
+                ((transmitted.saturating_sub(received)) * 100) / transmitted
+            } else {
+                0
+            }
+        );
     }
+    crate::net::icmp::clear_pending(identifier);
 }
 
 /// Display network statistics
 fn cmd_netstat() {
     println!("Network Status:");
     println!();
-    
+
     if let Some(mac) = crate::drivers::e1000::mac_address() {
         println!("Interface: E1000");
-        println!("  MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        
-        if let Some(ip) = crate::net::ip::get_ip_address() {
-            println!("  IP:  {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+        println!(
+            "  MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        );
+
+        let cfg = crate::net::ip::network_config();
+        if let Some(ip) = cfg.address {
+            println!("  IP:      {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
         } else {
-            println!("  IP:  Not configured");
+            println!("  IP:      Not configured");
         }
-        
+        println!(
+            "  Netmask: {}.{}.{}.{}",
+            cfg.netmask[0], cfg.netmask[1], cfg.netmask[2], cfg.netmask[3]
+        );
+        if let Some(g) = cfg.gateway {
+            println!("  Gateway: {}.{}.{}.{}", g[0], g[1], g[2], g[3]);
+        } else {
+            println!("  Gateway: (none)");
+        }
+        println!(
+            "  ARP cache: {} entr(y/ies)",
+            crate::net::arp::entries().len()
+        );
         println!();
         println!("Protocol Stack:");
         println!("  Ethernet - Active");
@@ -1191,14 +1440,196 @@ fn cmd_netstat() {
         println!("  ICMP     - Active");
         println!("  UDP      - Active");
         println!("  TCP      - Active");
+        println!(
+            "  DNS      - {}",
+            if cfg.address.is_some() {
+                "available"
+            } else {
+                "needs IP config"
+            }
+        );
+        println!("  UDP RX   - {} queued", crate::net::udp::queued_count());
     } else {
         println!("Network interface not initialized");
     }
 }
 
+fn cmd_dns(args: &str) {
+    if crate::net::ip::get_ip_address().is_none() {
+        println!("Network not configured. Run 'ifconfig 10.0.2.15 255.255.255.0 10.0.2.2' first.");
+        return;
+    }
+    let name = args.trim();
+    if name.is_empty() {
+        println!("Usage: dns <hostname>");
+        println!("Example: dns example.com");
+        return;
+    }
+    match parse_ipv4(name) {
+        Some(ip) => println!(
+            "{} -> {}.{}.{}.{} (literal)",
+            name, ip[0], ip[1], ip[2], ip[3]
+        ),
+        None => match crate::net::dns::resolve_ipv4(name) {
+            Ok(ip) => println!("{} -> {}.{}.{}.{}", name, ip[0], ip[1], ip[2], ip[3]),
+            Err(e) => println!("dns: {}", e),
+        },
+    }
+}
+
+fn cmd_arp(args: &str) {
+    let arg = args.trim();
+    if arg.is_empty() || arg == "-a" || arg == "list" {
+        let entries = crate::net::arp::entries();
+        if entries.is_empty() {
+            println!("ARP cache is empty");
+        } else {
+            for (ip, mac) in entries {
+                println!(
+                    "{}.{}.{}.{}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    ip[0], ip[1], ip[2], ip[3], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                );
+            }
+        }
+        return;
+    }
+    let Some(ip) = parse_ipv4(arg) else {
+        println!("Usage: arp [-a|list|<IPv4 address>]");
+        return;
+    };
+    match crate::net::arp::resolve(ip, 2000) {
+        Ok(mac) => println!(
+            "{}.{}.{}.{}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            ip[0], ip[1], ip[2], ip[3], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        ),
+        Err(e) => println!("arp: {}", e),
+    }
+}
+
+fn cmd_udp_send(args: &str) {
+    let Some((host, rest)) = take_word(args) else {
+        println!("Usage: udp-send <IPv4|hostname> <local-port> <remote-port> <text>");
+        return;
+    };
+    let Some((src, rest)) = take_word(rest) else {
+        println!("Usage: udp-send <IPv4|hostname> <local-port> <remote-port> <text>");
+        return;
+    };
+    let Some((dst, data)) = take_word(rest) else {
+        println!("Usage: udp-send <IPv4|hostname> <local-port> <remote-port> <text>");
+        return;
+    };
+    let data = data.trim_start();
+    if data.is_empty() {
+        println!("Usage: udp-send <IPv4|hostname> <local-port> <remote-port> <text>");
+        return;
+    }
+    let Some(ip) = parse_ipv4(host).or_else(|| crate::net::dns::resolve_ipv4(host).ok()) else {
+        println!("udp-send: host resolution failed");
+        return;
+    };
+    let (Ok(src), Ok(dst)) = (src.parse::<u16>(), dst.parse::<u16>()) else {
+        println!("udp-send: invalid port");
+        return;
+    };
+    match crate::net::udp::send_packet(ip, src, dst, data.as_bytes()) {
+        Ok(()) => println!(
+            "Sent {} UDP payload bytes to {}.{}.{}.{}:{}",
+            data.len(),
+            ip[0],
+            ip[1],
+            ip[2],
+            ip[3],
+            dst
+        ),
+        Err(e) => println!("udp-send: {}", e),
+    }
+}
+
+fn cmd_netdebug(args: &str) {
+    match args.trim() {
+        "on" | "enable" => {
+            crate::net::debug::set_debug(true);
+            println!("Network debug output enabled");
+        }
+        "off" | "disable" => {
+            crate::net::debug::set_debug(false);
+            println!("Network debug output disabled");
+        }
+        "" | "status" => println!(
+            "Network debug output: {}",
+            if crate::net::debug::debug_enabled() {
+                "on"
+            } else {
+                "off"
+            }
+        ),
+        _ => println!("Usage: netdebug [on|off|status]"),
+    }
+}
+
+fn cmd_tlsinfo() {
+    if cfg!(feature = "net_tls") {
+        println!("TLS 1.3 backend: enabled (net_tls)");
+    } else {
+        println!("TLS 1.3 backend: disabled; rebuild with --features net_tls");
+    }
+}
+
+fn cmd_udp_recv(args: &str) {
+    let mut fields = args.split_whitespace();
+    let Some(port_text) = fields.next() else {
+        println!("Usage: udp-recv <local-port> [timeout-seconds]");
+        return;
+    };
+    let Ok(port) = port_text.parse::<u16>() else {
+        println!("udp-recv: invalid port");
+        return;
+    };
+    let timeout_s = fields
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5)
+        .clamp(1, 60);
+    let deadline = monotonic_ms().saturating_add(timeout_s * 1000);
+    let poll_limit = timeout_s.saturating_mul(1000).max(1);
+    let mut polls = 0u64;
+    clear_interrupt();
+    while polls < poll_limit && monotonic_ms() < deadline && !is_interrupted() {
+        crate::net::process_packets();
+        if let Some(d) = crate::net::udp::receive(port) {
+            println!(
+                "UDP from {}.{}.{}.{}:{} ({} bytes)",
+                d.source_ip[0],
+                d.source_ip[1],
+                d.source_ip[2],
+                d.source_ip[3],
+                d.source_port,
+                d.payload.len()
+            );
+            if let Ok(s) = core::str::from_utf8(&d.payload) {
+                println!("{}", s);
+            } else {
+                println!("(binary payload)");
+            }
+            return;
+        }
+        increment_tick();
+        polls += 1;
+        core::hint::spin_loop();
+    }
+
+    if is_interrupted() {
+        println!("udp-recv cancelled");
+        clear_interrupt();
+    } else {
+        println!("udp-recv timed out waiting on port {}", port);
+    }
+}
+
 fn cmd_tcpconnect(args: &str) {
     if args.is_empty() {
-        println!("Usage: tcpconnect <ip-address> <port>");
+        println!("Usage: tcpconnect <ip-address|hostname> <port>");
         println!("Example: tcpconnect 10.0.2.2 80");
         println!("         tcpconnect 93.184.216.34 80  (example.com)");
         return;
@@ -1210,23 +1641,16 @@ fn cmd_tcpconnect(args: &str) {
         return;
     }
 
-    // Parse IP address
-    let ip_parts: Vec<&str> = parts[0].split('.').collect();
-    if ip_parts.len() != 4 {
-        println!("Invalid IP address format");
-        return;
-    }
-
-    let mut target_ip = [0u8; 4];
-    for (i, part) in ip_parts.iter().enumerate() {
-        match part.parse::<u8>() {
-            Ok(octet) => target_ip[i] = octet,
-            Err(_) => {
-                println!("Invalid IP address");
+    let target_ip = match parse_ipv4(parts[0]) {
+        Some(ip) => ip,
+        None => match crate::net::dns::resolve_ipv4(parts[0]) {
+            Ok(ip) => ip,
+            Err(e) => {
+                println!("Could not resolve '{}': {}", parts[0], e);
                 return;
             }
-        }
-    }
+        },
+    };
 
     // Parse port
     let port = match parts[1].parse::<u16>() {
@@ -1237,22 +1661,29 @@ fn cmd_tcpconnect(args: &str) {
         }
     };
 
-    println!("Connecting to {}.{}.{}.{}:{}...", 
-        target_ip[0], target_ip[1], target_ip[2], target_ip[3], port);
+    println!(
+        "Connecting to {}.{}.{}.{}:{}...",
+        target_ip[0], target_ip[1], target_ip[2], target_ip[3], port
+    );
 
     match crate::net::tcp::connect(target_ip, port) {
         Ok(local_port) => {
             println!("Connection initiated from local port {}", local_port);
             println!("Waiting for connection to establish...");
-            
+
             // Wait for connection to establish
-            let start_time = get_tick_count();
-            let timeout_ms = 5000;
+            let start_time = monotonic_ms();
+            let timeout_ms: u64 = 5000;
+            let poll_limit = timeout_ms.saturating_mul(1000).max(1);
+            let mut polls = 0u64;
             clear_interrupt();
-            
-            while get_tick_count() - start_time < timeout_ms && !is_interrupted() {
+
+            while polls < poll_limit
+                && monotonic_ms().saturating_sub(start_time) < timeout_ms
+                && !is_interrupted()
+            {
                 crate::net::process_packets();
-                
+
                 if let Some(state) = crate::net::tcp::get_state(local_port) {
                     if state == crate::net::tcp::TcpState::Established {
                         println!("Connection established! Local port: {}", local_port);
@@ -1261,10 +1692,12 @@ fn cmd_tcpconnect(args: &str) {
                         return;
                     }
                 }
-                
-                for _ in 0..10000 { core::hint::spin_loop(); }
+
+                increment_tick();
+                polls += 1;
+                core::hint::spin_loop();
             }
-            
+
             if is_interrupted() {
                 println!("Connection cancelled by user");
                 clear_interrupt();
@@ -1274,6 +1707,8 @@ fn cmd_tcpconnect(args: &str) {
                 println!("      the host (10.0.2.2) may work. Use TAP networking for");
                 println!("      connections to external servers.");
             }
+            let _ = crate::net::tcp::close(local_port);
+            crate::net::tcp::forget(local_port);
         }
         Err(e) => {
             println!("Failed to initiate connection: {}", e);
@@ -1303,19 +1738,24 @@ fn cmd_tcpsend(args: &str) {
     };
 
     let data = parts[1].as_bytes();
-    
+
     match crate::net::tcp::send_data(port, data) {
         Ok(_) => {
             println!("Sent {} bytes on port {}", data.len(), port);
             println!("Checking for response...");
-            
+
             // Wait a bit for response
-            let start_time = get_tick_count();
-            let timeout_ms = 2000;
-            
-            while get_tick_count() - start_time < timeout_ms {
+            let start_time = monotonic_ms();
+            let timeout_ms: u64 = 2000;
+            let poll_limit = timeout_ms.saturating_mul(1000).max(1);
+            let mut polls = 0u64;
+
+            while polls < poll_limit
+                && monotonic_ms().saturating_sub(start_time) < timeout_ms
+                && !is_interrupted()
+            {
                 crate::net::process_packets();
-                
+
                 if let Some(recv_data) = crate::net::tcp::read_data(port) {
                     println!("Received {} bytes:", recv_data.len());
                     // Print as string if possible
@@ -1326,11 +1766,18 @@ fn cmd_tcpsend(args: &str) {
                     }
                     return;
                 }
-                
-                for _ in 0..10000 { core::hint::spin_loop(); }
+
+                increment_tick();
+                polls += 1;
+                core::hint::spin_loop();
             }
-            
-            println!("No response received (timeout)");
+
+            if is_interrupted() {
+                clear_interrupt();
+                println!("TCP receive cancelled");
+            } else {
+                println!("No response received (timeout)");
+            }
         }
         Err(e) => {
             println!("Failed to send data: {}", e);
@@ -1359,6 +1806,69 @@ fn cmd_tcpclose(args: &str) {
     }
 }
 
+fn cmd_tcpstatus(args: &str) {
+    let Ok(port) = args.trim().parse::<u16>() else {
+        println!("Usage: tcpstatus <local-port>");
+        return;
+    };
+    match crate::net::tcp::get_state(port) {
+        Some(state) => println!("TCP local port {}: {:?}", port, state),
+        None => println!("No TCP connection on local port {}", port),
+    }
+}
+
+fn cmd_tcprecv(args: &str) {
+    let mut fields = args.split_whitespace();
+    let Some(port_text) = fields.next() else {
+        println!("Usage: tcprecv <local-port> [timeout-seconds]");
+        return;
+    };
+    let Ok(port) = port_text.parse::<u16>() else {
+        println!("tcprecv: invalid port");
+        return;
+    };
+    if crate::net::tcp::get_state(port).is_none() {
+        println!("tcprecv: no TCP connection on local port {}", port);
+        return;
+    }
+    let timeout_s = fields
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5)
+        .clamp(1, 60);
+    let deadline = monotonic_ms().saturating_add(timeout_s * 1000);
+    clear_interrupt();
+    loop {
+        crate::net::process_packets();
+        if let Some(data) = crate::net::tcp::read_data(port) {
+            println!("Received {} bytes:", data.len());
+            if let Ok(text) = core::str::from_utf8(&data) {
+                println!("{}", text);
+            } else {
+                println!("(binary data)");
+            }
+            return;
+        }
+        if let Some(crate::net::tcp::TcpState::CloseWait | crate::net::tcp::TcpState::Closed) =
+            crate::net::tcp::get_state(port)
+        {
+            println!("tcprecv: connection closed");
+            return;
+        }
+        if is_interrupted() {
+            clear_interrupt();
+            println!("tcprecv cancelled");
+            return;
+        }
+        if monotonic_ms() >= deadline {
+            println!("tcprecv timed out");
+            return;
+        }
+        increment_tick();
+        core::hint::spin_loop();
+    }
+}
+
 // ── Editor helpers (exposed for editor crate) ─────────────
 
 /// Check if filesystem is mounted
@@ -1367,7 +1877,10 @@ pub fn is_mounted() -> bool {
 }
 
 /// Read file contents via FS – returns None if not mounted or not found (path-aware)
-pub fn read_file_contents(name: &str, device: &mut dyn crate::drivers::block::BlockDevice) -> Option<alloc::vec::Vec<u8>> {
+pub fn read_file_contents(
+    name: &str,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) -> Option<alloc::vec::Vec<u8>> {
     let mut guard = FILESYSTEM.lock();
     if let Some(ref mut fs) = *guard {
         match fs.read_file(device, name) {
@@ -1380,7 +1893,11 @@ pub fn read_file_contents(name: &str, device: &mut dyn crate::drivers::block::Bl
 }
 
 /// Write file contents – creates file if needed, returns static error str on failure (path-aware)
-pub fn write_file_contents(name: &str, data: &[u8], device: &mut dyn crate::drivers::block::BlockDevice) -> Result<(), &'static str> {
+pub fn write_file_contents(
+    name: &str,
+    data: &[u8],
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) -> Result<(), &'static str> {
     let mut guard = FILESYSTEM.lock();
     if guard.is_none() {
         return Err("Filesystem not mounted");
@@ -1397,6 +1914,214 @@ pub fn write_file_contents(name: &str, data: &[u8], device: &mut dyn crate::driv
             Err(_) => fs.create_file(device, name)?,
         };
         fs.write_file_by_inode(device, inode, data)
+    } else {
+        Err("Filesystem not mounted")
+    }
+}
+
+// ── GUI bridge (shared by desktop File Explorer + Drive apps) ─────
+// These wrap the same FILESYSTEM + AtaBlockDevice logic as the CLI
+// commands so shell and desktop stay in sync. All helpers create
+// their own device, lock FS once, copy results out, and drop the
+// lock before returning (desktop must never hold the lock across
+// compositor.render()).
+
+/// Format disk (GUI version of `mkfs`). Returns human-readable summary.
+/// Drops any mounted FS so a stale in-memory image can't linger after erase.
+pub fn gui_format_disk() -> Result<alloc::string::String, &'static str> {
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    match crate::fs::SimpleFilesystem::format(&mut device) {
+        Ok(()) => {
+            *FILESYSTEM.lock() = None;
+            Ok(alloc::string::String::from(
+                "Formatted with SimplFS. Use Mount.",
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Mount filesystem (GUI version of `mount`). Returns human-readable summary.
+pub fn gui_mount_fs() -> Result<alloc::string::String, &'static str> {
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    match crate::fs::SimpleFilesystem::mount(&mut device) {
+        Ok(fs) => {
+            *FILESYSTEM.lock() = Some(fs);
+            Ok(alloc::string::String::from("Mounted. Root ready."))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// One-line mount status for GUI labels. Never fails.
+pub fn gui_fs_status() -> alloc::string::String {
+    let guard = FILESYSTEM.lock();
+    if guard.is_none() {
+        return alloc::string::String::from("Status: not mounted (open Drive: Format, then Mount)");
+    }
+    drop(guard);
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut guard = FILESYSTEM.lock();
+    if let Some(ref mut fs) = *guard {
+        match fs.current_path(&mut device) {
+            Ok(p) => alloc::format!("Status: mounted, cwd={}", p),
+            Err(_) => alloc::string::String::from("Status: mounted"),
+        }
+    } else {
+        alloc::string::String::from("Status: not mounted")
+    }
+}
+
+/// Disk + FS summary for the Drive app status label.
+pub fn gui_disk_summary() -> alloc::string::String {
+    use alloc::string::ToString;
+    if !is_mounted() {
+        return alloc::string::String::from("Disk: ATA PIO 512B/block | FS: not mounted");
+    }
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut guard = FILESYSTEM.lock();
+    if let Some(ref mut fs) = *guard {
+        // list root to prove readability + count entries
+        let count = match fs.list_directory(&mut device, 0) {
+            Ok(v) => v.len(),
+            Err(_) => 0,
+        };
+        alloc::format!(
+            "Disk: ATA 512B/block | FS: SimplFS mounted | root entries: {}",
+            count
+        )
+    } else {
+        alloc::string::String::from("Disk: ATA | FS: not mounted")
+    }
+}
+
+/// List directory at `path` for GUI. Returns (display_path, entries).
+/// Empty path means filesystem cwd; absolute or relative paths supported.
+pub fn gui_list_dir(
+    path: &str,
+) -> Result<(alloc::string::String, alloc::vec::Vec<crate::fs::FileInfo>), &'static str> {
+    if !is_mounted() {
+        return Err("Filesystem not mounted. Use Drive: Mount first.");
+    }
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut guard = FILESYSTEM.lock();
+    if let Some(ref mut fs) = *guard {
+        let target = if path.trim().is_empty() {
+            fs.current_directory()
+        } else {
+            match fs.resolve_file_or_dir(&mut device, path.trim()) {
+                Ok(ino) => {
+                    if !fs.is_dir(ino) {
+                        return Err("Not a directory");
+                    }
+                    ino
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let entries = fs.list_directory(&mut device, target)?;
+        // Display path: requested path, or actual cwd if empty
+        let disp = if path.trim().is_empty() {
+            fs.current_path(&mut device)
+                .unwrap_or(alloc::string::String::from("/"))
+        } else {
+            alloc::string::String::from(path.trim())
+        };
+        Ok((disp, entries))
+    } else {
+        Err("Filesystem not mounted")
+    }
+}
+
+/// Read file for GUI preview (capped by caller via truncate).
+pub fn gui_read_file(path: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    if !is_mounted() {
+        return Err("Filesystem not mounted");
+    }
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut guard = FILESYSTEM.lock();
+    if let Some(ref mut fs) = *guard {
+        fs.read_file(&mut device, path.trim())
+    } else {
+        Err("Filesystem not mounted")
+    }
+}
+
+/// Create file at GUI-resolved full path.
+pub fn gui_create_file(path: &str) -> Result<u32, &'static str> {
+    if !is_mounted() {
+        return Err("Filesystem not mounted");
+    }
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut guard = FILESYSTEM.lock();
+    if let Some(ref mut fs) = *guard {
+        fs.create_file(&mut device, path.trim())
+    } else {
+        Err("Filesystem not mounted")
+    }
+}
+
+/// Create directory at GUI-resolved full path.
+pub fn gui_create_dir(path: &str) -> Result<u32, &'static str> {
+    if !is_mounted() {
+        return Err("Filesystem not mounted");
+    }
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut guard = FILESYSTEM.lock();
+    if let Some(ref mut fs) = *guard {
+        fs.create_directory(&mut device, path.trim())
+    } else {
+        Err("Filesystem not mounted")
+    }
+}
+
+/// Delete file or (empty) directory at path. Tries file first, then dir.
+pub fn gui_delete_path(path: &str) -> Result<(), &'static str> {
+    if !is_mounted() {
+        return Err("Filesystem not mounted");
+    }
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut guard = FILESYSTEM.lock();
+    if let Some(ref mut fs) = *guard {
+        // Determine type first
+        let ino = fs.resolve_file_or_dir(&mut device, path.trim())?;
+        if fs.is_dir(ino) {
+            if ino == 0 {
+                return Err("Cannot delete root");
+            }
+            fs.remove_directory(&mut device, path.trim())
+        } else {
+            fs.delete_file(&mut device, path.trim())
+        }
+    } else {
+        Err("Filesystem not mounted")
+    }
+}
+
+/// Save Settings text to `/config/settings.cfg` (GUI version of `write`).
+/// Creates `/config` and the file on first use. Never panics; fails soft
+/// when the FS is not mounted so Settings stays usable session-only.
+pub fn gui_save_settings(text: &str) -> Result<alloc::string::String, &'static str> {
+    if !is_mounted() {
+        return Err("Filesystem not mounted");
+    }
+    if text.len() > 4096 {
+        return Err("Settings too large");
+    }
+    let path = crate::desktop::wallpaper::SETTINGS_PATH;
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut guard = FILESYSTEM.lock();
+    if let Some(ref mut fs) = *guard {
+        if fs.resolve_file_or_dir(&mut device, "/config").is_err() {
+            // Best-effort: ignore "already exists" races from double-clicks.
+            let _ = fs.create_directory(&mut device, "/config");
+        }
+        if fs.resolve_file_or_dir(&mut device, path).is_err() {
+            fs.create_file(&mut device, path)
+                .map_err(|_| "Cannot create settings file")?;
+        }
+        fs.write_file(&mut device, path, text.as_bytes())?;
+        Ok(alloc::string::String::from("settings saved"))
     } else {
         Err("Filesystem not mounted")
     }
@@ -1424,7 +2149,9 @@ fn cmd_run(args: &str) {
     }
     // split first token as path, rest as args
     let mut parts: alloc::vec::Vec<&str> = args.split_whitespace().collect();
-    if parts.is_empty() { return; }
+    if parts.is_empty() {
+        return;
+    }
     let path = parts[0];
     // args for app includes path as $0 plus extra
     let app_args: alloc::vec::Vec<&str> = parts.clone();
@@ -1507,7 +2234,10 @@ fn cmd_appinfo(args: &str) {
         println!("App '{}' ({} bytes)", path, data.len());
         if data.len() >= 4 && &data[0..4] == &[0x7F, b'E', b'L', b'F'] {
             println!("  Type: ELF (native) - not yet runnable, needs Phase 2");
-        } else if data.len() >= 4 && u32::from_le_bytes([data[0],data[1],data[2],data[3]]) == crate::app::loader::MFKE_MAGIC {
+        } else if data.len() >= 4
+            && u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+                == crate::app::loader::MFKE_MAGIC
+        {
             if let Ok(h) = crate::app::loader::validate_header(&data) {
                 let len = unsafe { core::ptr::addr_of!(h.bytecode_len).read_unaligned() };
                 let entry = unsafe { core::ptr::addr_of!(h.entry_offset).read_unaligned() };
@@ -1519,13 +2249,18 @@ fn cmd_appinfo(args: &str) {
             println!("  Type: unknown binary");
         } else {
             println!("  Type: script/text");
-            println!("  Runnable: yes ({} lines)", data.iter().filter(|&&b| b==b'\n').count()+1);
+            println!(
+                "  Runnable: yes ({} lines)",
+                data.iter().filter(|&&b| b == b'\n').count() + 1
+            );
             // preview first 5 lines
             if let Ok(s) = core::str::from_utf8(&data) {
                 for (i, line) in s.lines().take(5).enumerate() {
-                    println!("    {}: {}", i+1, line);
+                    println!("    {}: {}", i + 1, line);
                 }
-                if s.lines().count() > 5 { println!("    ..."); }
+                if s.lines().count() > 5 {
+                    println!("    ...");
+                }
             }
         }
     } else {
@@ -1540,7 +2275,72 @@ fn cmd_ps() {
     println!("  Apps currently run synchronously: `run` blocks shell until exit.");
 }
 
+/// Enters the graphical desktop (requires framebuffer)
+fn cmd_desktop() {
+    if !crate::drivers::fb::is_active() {
+        println!("desktop: no framebuffer available (VGA text mode only)");
+        println!("The graphical desktop requires a UEFI GOP framebuffer.");
+        return;
+    }
+    crate::desktop::run();
+}
+
+/// Runs the disk installer (text mode, works on VGA or framebuffer)
+fn cmd_install() {
+    crate::install::run();
+}
+
+/// Shows USB controller + HID keyboard status (also printed at boot)
+fn cmd_usb() {
+    #[cfg(feature = "usb")]
+    {
+        crate::drivers::usb::probe_report();
+    }
+    #[cfg(not(feature = "usb"))]
+    {
+        println!("USB support not compiled in (enable with 'cargo build --features usb')");
+    }
+}
+
+/// Shows live mouse state across all transports (move the mouse to see it)
+fn cmd_mouse() {
+    use crate::drivers::mouse;
+    let (mx, my) = mouse::position();
+    let (bytes, packets, dropped) = mouse::mouse_stats();
+    let (usb_rel, usb_abs) = mouse::mouse_usb_stats();
+    println!(
+        "mouse: {}",
+        if mouse::is_present() {
+            "ready"
+        } else {
+            "absent"
+        }
+    );
+    println!(
+        "  Position: ({}, {})  Buttons: {:#05b}",
+        mx,
+        my,
+        mouse::buttons()
+    );
+    println!(
+        "  PS/2 IRQ bytes: {}  packets: {}  dropped: {}",
+        bytes, packets, dropped
+    );
+    println!(
+        "  USB reports: {} relative (mouse) + {} absolute (tablet)",
+        usb_rel, usb_abs
+    );
+    match mouse::config_snapshot() {
+        Some(cfg) => println!("  i8042 config: {:#04x}", cfg),
+        None => println!("  i8042 config: <unavailable>"),
+    }
+}
+
 // ── TAB completion ───────────────────────────────────
+
+pub fn complete_desktop_input(cmd_buffer: &mut [u8; MAX_CMD_LENGTH], cmd_len: &mut usize) {
+    handle_tab_completion(cmd_buffer, cmd_len);
+}
 
 fn handle_tab_completion(cmd_buffer: &mut [u8; MAX_CMD_LENGTH], cmd_len: &mut usize) {
     let input = match core::str::from_utf8(&cmd_buffer[..*cmd_len]) {
@@ -1557,7 +2357,11 @@ fn handle_tab_completion(cmd_buffer: &mut [u8; MAX_CMD_LENGTH], cmd_len: &mut us
         if prefix.is_empty() {
             return;
         }
-        let mut candidates: Vec<&str> = BUILTINS.iter().cloned().filter(|c| c.starts_with(prefix)).collect();
+        let mut candidates: Vec<&str> = BUILTINS
+            .iter()
+            .cloned()
+            .filter(|c| c.starts_with(prefix))
+            .collect();
         candidates.sort_unstable();
         candidates.dedup();
         if candidates.is_empty() {

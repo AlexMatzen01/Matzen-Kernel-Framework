@@ -1,11 +1,13 @@
 //! UI rendering for nano-like editor
 //! Draws titlebar, edit area, statusbar, helpbar
 
+use super::buffer::TextBuffer;
+use super::viewport::{
+    Viewport, EDIT_TOP, HEADER_HEIGHT, HELP_HEIGHT, SCREEN_WIDTH, STATUS_HEIGHT,
+};
+use crate::drivers::vga::{Color, WRITER};
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::drivers::vga::{Color, WRITER};
-use super::buffer::TextBuffer;
-use super::viewport::{Viewport, SCREEN_WIDTH, EDIT_TOP, HEADER_HEIGHT, STATUS_HEIGHT, HELP_HEIGHT};
 
 const TITLE_FG: Color = Color::Black;
 const TITLE_BG: Color = Color::White;
@@ -17,12 +19,19 @@ const HELP_FG: Color = Color::White;
 const HELP_BG: Color = Color::Black;
 
 // Help bar lines (nano style, shortened to fit 80 cols)
-const HELP_LINE1: &str = "^G Get Help  ^O Write Out ^W Where Is  ^K Cut       ^J Justify   ^C Cur Pos";
-const HELP_LINE2: &str = "^X Exit      ^R Read File ^\\ Replace   ^U Uncut     ^T To Spell  ^_ Go To Line";
+const HELP_LINE1: &str =
+    "^G Get Help  ^O Write Out ^W Where Is  ^K Cut       ^J Justify   ^C Cur Pos";
+const HELP_LINE2: &str =
+    "^X Exit      ^R Read File ^\\ Replace   ^U Uncut     ^T To Spell  ^_ Go To Line";
 // Extended help line extras for sophisticated: ^Z Undo ^Y Redo  M-A Mark
 
 /// Draw full frame
-pub fn draw_frame(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>, status_is_error: bool) {
+pub fn draw_frame(
+    buf: &TextBuffer,
+    vp: &Viewport,
+    status_msg: Option<&str>,
+    status_is_error: bool,
+) {
     // Use WRITER lock via interrupts
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut w = WRITER.lock();
@@ -32,7 +41,9 @@ pub fn draw_frame(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>, sta
         let tbytes = title.as_bytes();
         let start = (SCREEN_WIDTH.saturating_sub(tbytes.len())) / 2;
         for (i, &b) in tbytes.iter().enumerate() {
-            if start + i >= SCREEN_WIDTH { break; }
+            if start + i >= SCREEN_WIDTH {
+                break;
+            }
             w.write_at(0, start + i, b, TITLE_FG, TITLE_BG);
         }
 
@@ -46,7 +57,11 @@ pub fn draw_frame(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>, sta
                 // Horizontal scroll
                 let left = vp.left_col;
                 let right = (left + SCREEN_WIDTH).min(line.len());
-                let visible = if left < line.len() { &line[left..right] } else { &[][..] };
+                let visible = if left < line.len() {
+                    &line[left..right]
+                } else {
+                    &[][..]
+                };
                 // Render with tab expansion? Show tabs as 4 spaces
                 let mut col = 0usize;
                 let mut idx = left;
@@ -55,7 +70,9 @@ pub fn draw_frame(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>, sta
                     if b == b'\t' {
                         let spaces = 4 - (col % 4);
                         for _ in 0..spaces {
-                            if col >= SCREEN_WIDTH { break; }
+                            if col >= SCREEN_WIDTH {
+                                break;
+                            }
                             w.write_at(screen_row, col, b' ', EDIT_FG, EDIT_BG);
                             col += 1;
                         }
@@ -74,7 +91,7 @@ pub fn draw_frame(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>, sta
                     w.write_at(screen_row, 0, b'$', Color::Yellow, EDIT_BG);
                 }
                 if line.len() > vp.left_col + SCREEN_WIDTH {
-                    w.write_at(screen_row, SCREEN_WIDTH-1, b'$', Color::Yellow, EDIT_BG);
+                    w.write_at(screen_row, SCREEN_WIDTH - 1, b'$', Color::Yellow, EDIT_BG);
                 }
                 // If mark active, highlight selection
                 if let Some((mr, mc)) = buf.mark {
@@ -85,23 +102,35 @@ pub fn draw_frame(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>, sta
 
         // Status bar (row 22)
         let status_row = EDIT_TOP + vp.height;
-        let (sf, sb) = if status_is_error { (Color::White, Color::Red) } else { (STATUS_FG, STATUS_BG) };
+        let (sf, sb) = if status_is_error {
+            (Color::White, Color::Red)
+        } else {
+            (STATUS_FG, STATUS_BG)
+        };
         w.fill_rect(status_row, 0, SCREEN_WIDTH, 1, b' ', sf, sb);
         if let Some(msg) = status_msg {
             let msg_bytes = msg.as_bytes();
             let mut col = 1;
-            for &b in msg_bytes.iter().take(SCREEN_WIDTH-2) {
+            for &b in msg_bytes.iter().take(SCREEN_WIDTH - 2) {
                 w.write_at(status_row, col, b, sf, sb);
                 col += 1;
             }
         } else {
             // Default status: show filename, dirty, cursor pos helper?
-            let fname = buf.filename.clone().unwrap_or_else(|| String::from("[New File]"));
+            let fname = buf
+                .filename
+                .clone()
+                .unwrap_or_else(|| String::from("[New File]"));
             let dirty = if buf.dirty { " *" } else { "" };
-            let line_col = alloc::format!(" L{}/{} C{}", buf.cursor_row+1, buf.lines.len(), buf.cursor_col+1);
+            let line_col = alloc::format!(
+                " L{}/{} C{}",
+                buf.cursor_row + 1,
+                buf.lines.len(),
+                buf.cursor_col + 1
+            );
             let left_part = alloc::format!(" {}{}", fname, dirty);
             // Left
-            for (i, b) in left_part.bytes().enumerate().take(SCREEN_WIDTH-20) {
+            for (i, b) in left_part.bytes().enumerate().take(SCREEN_WIDTH - 20) {
                 w.write_at(status_row, i, b, sf, sb);
             }
             // Right aligned
@@ -121,6 +150,7 @@ pub fn draw_frame(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>, sta
         render_help_line(&mut w, help_row1, HELP_LINE1);
         render_help_line(&mut w, help_row2, HELP_LINE2);
     });
+    crate::desktop::refresh_terminal_editor();
 }
 
 fn render_help_line(w: &mut crate::drivers::vga::Writer, row: usize, line: &str) {
@@ -128,12 +158,12 @@ fn render_help_line(w: &mut crate::drivers::vga::Writer, row: usize, line: &str)
     let bytes = line.as_bytes();
     let mut i = 0;
     while i < bytes.len() && col < SCREEN_WIDTH {
-        if bytes[i] == b'^' && i+1 < bytes.len() {
+        if bytes[i] == b'^' && i + 1 < bytes.len() {
             // Render ^X in yellow/bold style
             w.write_at(row, col, b'^', Color::Yellow, Color::Black);
             col += 1;
             if col < SCREEN_WIDTH {
-                w.write_at(row, col, bytes[i+1], Color::Yellow, Color::Black);
+                w.write_at(row, col, bytes[i + 1], Color::Yellow, Color::Black);
                 col += 1;
             }
             i += 2;
@@ -147,28 +177,53 @@ fn render_help_line(w: &mut crate::drivers::vga::Writer, row: usize, line: &str)
 }
 
 fn build_title(buf: &TextBuffer) -> String {
-    let name = buf.filename.clone().unwrap_or_else(|| String::from("New Buffer"));
+    let name = buf
+        .filename
+        .clone()
+        .unwrap_or_else(|| String::from("New Buffer"));
     let modif = if buf.dirty { " [Modified]" } else { "" };
     // Nano title format centered
     alloc::format!(" GNU nano 7.2  File: {}{}", name, modif)
 }
 
-fn highlight_selection(w: &mut crate::drivers::vga::Writer, buf: &TextBuffer, vp: &Viewport, mr: usize, mc: usize, screen_row: usize, buf_row: usize) {
+fn highlight_selection(
+    w: &mut crate::drivers::vga::Writer,
+    buf: &TextBuffer,
+    vp: &Viewport,
+    mr: usize,
+    mc: usize,
+    screen_row: usize,
+    buf_row: usize,
+) {
     let (sr, sc, er, ec) = if (mr, mc) <= (buf.cursor_row, buf.cursor_col) {
         (mr, mc, buf.cursor_row, buf.cursor_col)
     } else {
         (buf.cursor_row, buf.cursor_col, mr, mc)
     };
-    if buf_row < sr || buf_row > er { return; }
+    if buf_row < sr || buf_row > er {
+        return;
+    }
     let start = if buf_row == sr { sc } else { 0 };
-    let end = if buf_row == er { ec } else { buf.lines[buf_row].len() };
+    let end = if buf_row == er {
+        ec
+    } else {
+        buf.lines[buf_row].len()
+    };
     // Map to screen cols
     for bcol in start..end {
-        if bcol < vp.left_col || bcol >= vp.left_col + SCREEN_WIDTH { continue; }
+        if bcol < vp.left_col || bcol >= vp.left_col + SCREEN_WIDTH {
+            continue;
+        }
         let scol = bcol - vp.left_col;
         // Need original char to keep glyph, but invert colors
         let b = buf.lines[buf_row][bcol];
-        let ch = if b == b'\t' { b' ' } else if b < 0x20 { b'^' } else { b };
+        let ch = if b == b'\t' {
+            b' '
+        } else if b < 0x20 {
+            b'^'
+        } else {
+            b
+        };
         // Highlight: white on blue (nano selection)
         w.write_at(screen_row, scol, ch, Color::White, Color::Blue);
     }
@@ -187,16 +242,26 @@ pub fn prompt_with_input(question: &str, initial: Option<&str>) -> Option<String
     let render = |input: &Vec<u8>, cursor: usize| {
         x86_64::instructions::interrupts::without_interrupts(|| {
             let mut w = WRITER.lock();
-            w.fill_rect(status_row, 0, SCREEN_WIDTH, 1, b' ', Color::Black, Color::White);
+            w.fill_rect(
+                status_row,
+                0,
+                SCREEN_WIDTH,
+                1,
+                b' ',
+                Color::Black,
+                Color::White,
+            );
             let qbytes = question.as_bytes();
             let mut col = 0;
             for &b in qbytes.iter().take(SCREEN_WIDTH) {
                 w.write_at(status_row, col, b, Color::Black, Color::White);
                 col += 1;
-                if col >= SCREEN_WIDTH { break; }
+                if col >= SCREEN_WIDTH {
+                    break;
+                }
             }
             // Show input after question + space
-            if col < SCREEN_WIDTH-1 {
+            if col < SCREEN_WIDTH - 1 {
                 w.write_at(status_row, col, b' ', Color::Black, Color::White);
                 col += 1;
             }
@@ -212,21 +277,28 @@ pub fn prompt_with_input(question: &str, initial: Option<&str>) -> Option<String
         });
         // Also render to serial ANSI
         super::serial_render::draw_prompt_ansi(question, input, cursor);
+        crate::desktop::refresh_terminal_editor();
     };
 
     render(&input, cursor);
     loop {
         crate::net::process_packets(); // keep net alive if needed
+        #[cfg(feature = "usb")]
+        crate::drivers::usb::poll();
         if let Some(ev) = crate::drivers::keyboard::read_key() {
             use crate::drivers::keyboard::Key;
             match ev.key {
                 Key::Enter => {
-                    x86_64::instructions::interrupts::without_interrupts(|| { WRITER.lock().hide_cursor(); });
+                    x86_64::instructions::interrupts::without_interrupts(|| {
+                        WRITER.lock().hide_cursor();
+                    });
                     let s = String::from_utf8(input).unwrap_or_default();
                     return Some(s);
                 }
                 Key::Esc | Key::Ctrl('C') | Key::Ctrl('G') => {
-                    x86_64::instructions::interrupts::without_interrupts(|| { WRITER.lock().hide_cursor(); });
+                    x86_64::instructions::interrupts::without_interrupts(|| {
+                        WRITER.lock().hide_cursor();
+                    });
                     return None;
                 }
                 Key::Backspace => {
@@ -240,21 +312,35 @@ pub fn prompt_with_input(question: &str, initial: Option<&str>) -> Option<String
                         input.remove(cursor);
                     }
                 }
-                Key::ArrowLeft => { if cursor > 0 { cursor -= 1; } }
-                Key::ArrowRight => { if cursor < input.len() { cursor += 1; } }
-                Key::Home => { cursor = 0; }
-                Key::End => { cursor = input.len(); }
+                Key::ArrowLeft => {
+                    if cursor > 0 {
+                        cursor -= 1;
+                    }
+                }
+                Key::ArrowRight => {
+                    if cursor < input.len() {
+                        cursor += 1;
+                    }
+                }
+                Key::Home => {
+                    cursor = 0;
+                }
+                Key::End => {
+                    cursor = input.len();
+                }
                 Key::Char(c) => {
                     if input.len() < 120 {
                         input.insert(cursor, c as u8);
                         cursor += 1;
                     }
                 }
-                Key::Ctrl('U') => { // clear line like nano
+                Key::Ctrl('U') => {
+                    // clear line like nano
                     input.clear();
                     cursor = 0;
                 }
-                Key::Ctrl('K') => { // cut to end
+                Key::Ctrl('K') => {
+                    // cut to end
                     input.truncate(cursor);
                 }
                 _ => {}
@@ -270,31 +356,48 @@ pub fn confirm(question: &str) -> Option<bool> {
     let status_row = EDIT_TOP + super::viewport::EDIT_HEIGHT;
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut w = WRITER.lock();
-        w.fill_rect(status_row, 0, SCREEN_WIDTH, 1, b' ', Color::White, Color::Red);
+        w.fill_rect(
+            status_row,
+            0,
+            SCREEN_WIDTH,
+            1,
+            b' ',
+            Color::White,
+            Color::Red,
+        );
         let full = alloc::format!("{} (Y/N) ?", question);
         let bytes = full.as_bytes();
         for (i, &b) in bytes.iter().enumerate().take(SCREEN_WIDTH) {
             w.write_at(status_row, i, b, Color::White, Color::Red);
         }
-        w.set_cursor_pos(status_row, bytes.len().min(SCREEN_WIDTH-1));
+        w.set_cursor_pos(status_row, bytes.len().min(SCREEN_WIDTH - 1));
         w.show_cursor();
     });
     super::serial_render::draw_confirm_ansi(question);
+    crate::desktop::refresh_terminal_editor();
     loop {
         crate::net::process_packets();
+        #[cfg(feature = "usb")]
+        crate::drivers::usb::poll();
         if let Some(ev) = crate::drivers::keyboard::read_key() {
             use crate::drivers::keyboard::Key;
             match ev.key {
                 Key::Char('y') | Key::Char('Y') => {
-                    x86_64::instructions::interrupts::without_interrupts(|| { WRITER.lock().hide_cursor(); });
+                    x86_64::instructions::interrupts::without_interrupts(|| {
+                        WRITER.lock().hide_cursor();
+                    });
                     return Some(true);
                 }
                 Key::Char('n') | Key::Char('N') => {
-                    x86_64::instructions::interrupts::without_interrupts(|| { WRITER.lock().hide_cursor(); });
+                    x86_64::instructions::interrupts::without_interrupts(|| {
+                        WRITER.lock().hide_cursor();
+                    });
                     return Some(false);
                 }
                 Key::Esc | Key::Ctrl('C') | Key::Ctrl('G') => {
-                    x86_64::instructions::interrupts::without_interrupts(|| { WRITER.lock().hide_cursor(); });
+                    x86_64::instructions::interrupts::without_interrupts(|| {
+                        WRITER.lock().hide_cursor();
+                    });
                     return None;
                 }
                 _ => {}
@@ -354,20 +457,28 @@ pub fn show_help_overlay() {
             w.fill_rect(0, 0, SCREEN_WIDTH, 1, b' ', Color::White, Color::Blue);
             let t = b" MFKEdit Help (ESC to exit) ";
             for (i, &b) in t.iter().enumerate() {
-                w.write_at(0, (SCREEN_WIDTH - t.len())/2 + i, b, Color::White, Color::Blue);
+                w.write_at(
+                    0,
+                    (SCREEN_WIDTH - t.len()) / 2 + i,
+                    b,
+                    Color::White,
+                    Color::Blue,
+                );
             }
             // Content rows 1..23
             let content_rows = crate::drivers::vga::VGA_HEIGHT - 2;
             for i in 0..content_rows {
                 let idx = scroll + i;
-                if idx >= HELP_TEXT.len() { break; }
+                if idx >= HELP_TEXT.len() {
+                    break;
+                }
                 let line = HELP_TEXT[idx];
                 for (c, b) in line.bytes().enumerate().take(SCREEN_WIDTH) {
                     w.write_at(1 + i, c, b, Color::White, Color::Blue);
                 }
             }
             // Footer
-            let fr = crate::drivers::vga::VGA_HEIGHT -1;
+            let fr = crate::drivers::vga::VGA_HEIGHT - 1;
             w.fill_rect(fr, 0, SCREEN_WIDTH, 1, b' ', Color::Black, Color::White);
             let footer = b" [ ESC / ^G / ^X to close Help ]  [ PgUp/PgDn or Arrows to scroll ] ";
             for (i, &b) in footer.iter().enumerate().take(SCREEN_WIDTH) {
@@ -375,6 +486,7 @@ pub fn show_help_overlay() {
             }
         });
         super::serial_render::draw_help_ansi(scroll);
+        crate::desktop::refresh_terminal_editor();
 
         // Wait for key
         let ev_opt = poll_key_blocking();
@@ -382,13 +494,27 @@ pub fn show_help_overlay() {
             use crate::drivers::keyboard::Key;
             match ev.key {
                 Key::Esc | Key::Ctrl('G') | Key::Ctrl('X') => break,
-                Key::ArrowDown => { if scroll + max_visible < HELP_TEXT.len() { scroll += 1; } }
-                Key::ArrowUp => { if scroll > 0 { scroll -= 1; } }
-                Key::PageDown => { scroll = (scroll + 5).min(HELP_TEXT.len().saturating_sub(max_visible)); }
-                Key::PageUp => { scroll = scroll.saturating_sub(5); }
+                Key::ArrowDown => {
+                    if scroll + max_visible < HELP_TEXT.len() {
+                        scroll += 1;
+                    }
+                }
+                Key::ArrowUp => {
+                    if scroll > 0 {
+                        scroll -= 1;
+                    }
+                }
+                Key::PageDown => {
+                    scroll = (scroll + 5).min(HELP_TEXT.len().saturating_sub(max_visible));
+                }
+                Key::PageUp => {
+                    scroll = scroll.saturating_sub(5);
+                }
                 _ => break,
             }
-        } else { break; }
+        } else {
+            break;
+        }
     }
 }
 
@@ -396,9 +522,15 @@ fn poll_key_blocking() -> Option<crate::drivers::keyboard::KeyEvent> {
     // blocking with net process
     loop {
         crate::net::process_packets();
-        if let Some(ev) = crate::drivers::keyboard::read_key() { return Some(ev); }
+        #[cfg(feature = "usb")]
+        crate::drivers::usb::poll();
+        if let Some(ev) = crate::drivers::keyboard::read_key() {
+            return Some(ev);
+        }
         // also allow tick? spin
-        for _ in 0..5000 { core::hint::spin_loop(); }
+        for _ in 0..5000 {
+            core::hint::spin_loop();
+        }
         // To avoid infinite lock if no input, we could timeout but for help we block
         // We break outer loop only on ESC; other keys close help
         // Instead we loop until key appears; but need to give chance to check maybe? Already.
@@ -420,4 +552,5 @@ pub fn clear_and_draw_status(msg: &str) {
             w.write_at(row, i, b, Color::Black, Color::Yellow);
         }
     });
+    crate::desktop::refresh_terminal_editor();
 }

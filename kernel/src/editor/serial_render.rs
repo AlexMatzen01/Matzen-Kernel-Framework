@@ -2,10 +2,10 @@
 //! Mirrors `ui::draw_frame` but emits ANSI escapes to COM1 so editor is visible
 //! over serial. VBox GUI still uses VGA text buffer; QEMU headless uses this.
 
-use alloc::string::String;
 use super::buffer::TextBuffer;
-use super::viewport::{Viewport, SCREEN_WIDTH, EDIT_TOP};
+use super::viewport::{Viewport, EDIT_TOP, SCREEN_WIDTH};
 use crate::drivers::vga::Color;
+use alloc::string::String;
 
 /// Map VGA Color to ANSI foreground code
 fn ansi_fg(c: Color) -> &'static str {
@@ -59,7 +59,10 @@ const EDIT_FG: Color = Color::White;
 const EDIT_BG: Color = Color::Black;
 
 fn build_title(buf: &TextBuffer) -> String {
-    let name = buf.filename.clone().unwrap_or_else(|| String::from("New Buffer"));
+    let name = buf
+        .filename
+        .clone()
+        .unwrap_or_else(|| String::from("New Buffer"));
     let modif = if buf.dirty { " [Modified]" } else { "" };
     alloc::format!(" MFKEdit  File: {}{}", name, modif)
 }
@@ -67,7 +70,15 @@ fn build_title(buf: &TextBuffer) -> String {
 /// Draw full frame to serial as ANSI — fullscreen, realtime in-place (no ESC[2J flicker).
 /// Uses `crate::serial_print!` (which already does without_interrupts + SERIAL lock).
 /// Covers full 80x25 by repositioning + erasing per row, not by clearing whitespace then pasting.
-pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>, status_is_error: bool) {
+pub fn draw_frame_ansi(
+    buf: &TextBuffer,
+    vp: &Viewport,
+    status_msg: Option<&str>,
+    status_is_error: bool,
+) {
+    if crate::drivers::vga::output_capture_active() {
+        return;
+    }
     // Home cursor, hide cursor during draw to reduce flicker — NO ESC[2J (realtime in-place)
     crate::serial_print!("\x1b[H\x1b[?25l");
 
@@ -78,14 +89,22 @@ pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>
     // Title bar: black on white, full width
     crate::serial_print!("\x1b[1;1H\x1b[2K"); // erase line, then paint
     crate::serial_print!("{}{}", ansi_fg(TITLE_FG), ansi_bg(TITLE_BG));
-    for _ in 0..start { crate::serial_print!(" "); }
+    for _ in 0..start {
+        crate::serial_print!(" ");
+    }
     for &b in tbytes.iter().take(SCREEN_WIDTH - start) {
-        let ch = if (0x20..=0x7e).contains(&b) { b as char } else { '?' };
+        let ch = if (0x20..=0x7e).contains(&b) {
+            b as char
+        } else {
+            '?'
+        };
         crate::serial_print!("{}", ch);
     }
     // pad rest
     let used = start + tbytes.len().min(SCREEN_WIDTH - start);
-    for _ in used..SCREEN_WIDTH { crate::serial_print!(" "); }
+    for _ in used..SCREEN_WIDTH {
+        crate::serial_print!(" ");
+    }
     crate::serial_print!("\x1b[0m");
 
     // Edit area rows 2..22 (EDIT_HEIGHT=21) — fullscreen reuse: home+erase per row
@@ -118,7 +137,9 @@ pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>
                 if b == b'\t' {
                     let spaces = 4 - (col % 4);
                     for _ in 0..spaces {
-                        if col >= SCREEN_WIDTH { break; }
+                        if col >= SCREEN_WIDTH {
+                            break;
+                        }
                         row_chars[col] = b' ';
                         col += 1;
                     }
@@ -152,7 +173,9 @@ pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>
                     let s = if buf_row == sr { sc } else { 0 };
                     let e = if buf_row == er { ec } else { line.len() };
                     for bcol in s..e {
-                        if bcol < vp.left_col || bcol >= vp.left_col + SCREEN_WIDTH { continue; }
+                        if bcol < vp.left_col || bcol >= vp.left_col + SCREEN_WIDTH {
+                            continue;
+                        }
                         let scol = bcol - vp.left_col;
                         row_fg[scol] = Color::White;
                         row_bg[scol] = Color::Blue;
@@ -180,7 +203,9 @@ pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>
         } else {
             // empty line beyond EOF – just spaces in edit colors
             crate::serial_print!("{}{}", ansi_fg(EDIT_FG), ansi_bg(EDIT_BG));
-            for _ in 0..SCREEN_WIDTH { crate::serial_print!(" "); }
+            for _ in 0..SCREEN_WIDTH {
+                crate::serial_print!(" ");
+            }
             crate::serial_print!("\x1b[0m");
         }
     }
@@ -188,7 +213,11 @@ pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>
     // Status bar row 23 (ansi row EDIT_TOP+height+1)
     let status_row_ansi = EDIT_TOP + vp.height + 1;
     crate::serial_print!("\x1b[{};1H", status_row_ansi);
-    let (sf, sb) = if status_is_error { (Color::White, Color::Red) } else { (STATUS_FG, STATUS_BG) };
+    let (sf, sb) = if status_is_error {
+        (Color::White, Color::Red)
+    } else {
+        (STATUS_FG, STATUS_BG)
+    };
     crate::serial_print!("{}{}", ansi_fg(sf), ansi_bg(sb));
     // Clear line and write message or default
     // Use erase to end of line: \x1b[K
@@ -197,10 +226,18 @@ pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>
         crate::serial_print!(" {}", msg);
         // pad already cleared via erase
     } else {
-        let fname = buf.filename.clone().unwrap_or_else(|| String::from("[New File]"));
+        let fname = buf
+            .filename
+            .clone()
+            .unwrap_or_else(|| String::from("[New File]"));
         let dirty = if buf.dirty { " *" } else { "" };
         let left = alloc::format!(" {}{}", fname, dirty);
-        let right = alloc::format!(" L{}/{} C{}", buf.cursor_row + 1, buf.lines.len(), buf.cursor_col + 1);
+        let right = alloc::format!(
+            " L{}/{} C{}",
+            buf.cursor_row + 1,
+            buf.lines.len(),
+            buf.cursor_col + 1
+        );
         // Left part
         let left_bytes = left.as_bytes();
         for &b in left_bytes.iter().take(SCREEN_WIDTH - 20) {
@@ -213,7 +250,9 @@ pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>
         // We already at col1, we could pad spaces then overwrite, simpler: emit spaces to pad, then right
         let used = left_bytes.len().min(SCREEN_WIDTH - 20);
         if start_col > used {
-            for _ in used..start_col { crate::serial_print!(" "); }
+            for _ in used..start_col {
+                crate::serial_print!(" ");
+            }
         }
         crate::serial_print!("{}", right);
     }
@@ -222,16 +261,24 @@ pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>
     // Help bar rows 24-25
     let help_row1_ansi = status_row_ansi + 1;
     let help_row2_ansi = help_row1_ansi + 1;
-    const HELP_LINE1: &str = "^G Get Help  ^O Write Out ^W Where Is  ^K Cut       ^J Justify   ^C Cur Pos";
-    const HELP_LINE2: &str = "^X Exit      ^R Read File ^\\ Replace   ^U Uncut     ^T To Spell  ^_ Go To Line";
+    const HELP_LINE1: &str =
+        "^G Get Help  ^O Write Out ^W Where Is  ^K Cut       ^J Justify   ^C Cur Pos";
+    const HELP_LINE2: &str =
+        "^X Exit      ^R Read File ^\\ Replace   ^U Uncut     ^T To Spell  ^_ Go To Line";
     for (row, line) in [(help_row1_ansi, HELP_LINE1), (help_row2_ansi, HELP_LINE2)] {
         crate::serial_print!("\x1b[{};1H\x1b[37;40m\x1b[2K", row); // white on black, erase line
-        // Render help with ^highlight yellow
+                                                                   // Render help with ^highlight yellow
         let bytes = line.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'^' && i + 1 < bytes.len() {
-                crate::serial_print!("{}{}^{}{}", "\x1b[33m", "", "\x1b[33m", bytes[i + 1] as char); // yellow ^X
+                crate::serial_print!(
+                    "{}{}^{}{}",
+                    "\x1b[33m",
+                    "",
+                    "\x1b[33m",
+                    bytes[i + 1] as char
+                ); // yellow ^X
                 crate::serial_print!("\x1b[37;40m"); // back to white
                 i += 2;
             } else {
@@ -244,10 +291,15 @@ pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>
 
     // Move cursor to editor position and show it
     if let Some(screen_row) = {
-        if buf.cursor_row < vp.top_line { None }
-        else {
+        if buf.cursor_row < vp.top_line {
+            None
+        } else {
             let rel = buf.cursor_row - vp.top_line;
-            if rel >= vp.height { None } else { Some(EDIT_TOP + rel) }
+            if rel >= vp.height {
+                None
+            } else {
+                Some(EDIT_TOP + rel)
+            }
         }
     } {
         let ansi_row = screen_row + 1; // 1-indexed
@@ -260,6 +312,9 @@ pub fn draw_frame_ansi(buf: &TextBuffer, vp: &Viewport, status_msg: Option<&str>
 
 /// Draw prompt line on serial status row (mirrors ui::prompt_with_input render)
 pub fn draw_prompt_ansi(question: &str, input: &[u8], cursor: usize) {
+    if crate::drivers::vga::output_capture_active() {
+        return;
+    }
     let status_row_ansi = super::viewport::EDIT_TOP + super::viewport::EDIT_HEIGHT + 1;
     // Status row is 23 in 1-indexed (EDIT_TOP=1, height=21 => status 23)
     crate::serial_print!("\x1b[{};1H\x1b[30;47m\x1b[2K", status_row_ansi); // black on white, erase
@@ -268,7 +323,11 @@ pub fn draw_prompt_ansi(question: &str, input: &[u8], cursor: usize) {
     let remaining = SCREEN_WIDTH.saturating_sub(qlen + 1);
     let display = &input[..input.len().min(remaining)];
     for &b in display {
-        let ch = if (0x20..=0x7e).contains(&b) { b as char } else { '?' };
+        let ch = if (0x20..=0x7e).contains(&b) {
+            b as char
+        } else {
+            '?'
+        };
         crate::serial_print!("{}", ch);
     }
     // Move cursor
@@ -278,14 +337,24 @@ pub fn draw_prompt_ansi(question: &str, input: &[u8], cursor: usize) {
 
 /// Draw confirm line on serial status row
 pub fn draw_confirm_ansi(question: &str) {
+    if crate::drivers::vga::output_capture_active() {
+        return;
+    }
     let status_row_ansi = super::viewport::EDIT_TOP + super::viewport::EDIT_HEIGHT + 1;
     crate::serial_print!("\x1b[{};1H\x1b[37;41m\x1b[2K", status_row_ansi); // white on red
     crate::serial_print!("{} (Y/N) ?", question);
-    crate::serial_print!("\x1b[0m\x1b[{};{}H\x1b[?25h", status_row_ansi, question.len() + 8);
+    crate::serial_print!(
+        "\x1b[0m\x1b[{};{}H\x1b[?25h",
+        status_row_ansi,
+        question.len() + 8
+    );
 }
 
 /// Help overlay for serial — fullscreen in-place, no ESC[2J flicker
 pub fn draw_help_ansi(scroll: usize) {
+    if crate::drivers::vga::output_capture_active() {
+        return;
+    }
     const HELP_TEXT: &[&str] = &[
         " MFKEdit Help Text",
         "",
@@ -318,14 +387,20 @@ pub fn draw_help_ansi(scroll: usize) {
     crate::serial_print!("\x1b[1;1H\x1b[37;44m\x1b[2K");
     let title = " MFKEdit Help (ESC to exit) ";
     let pad = (SCREEN_WIDTH.saturating_sub(title.len())) / 2;
-    for _ in 0..pad { crate::serial_print!(" "); }
+    for _ in 0..pad {
+        crate::serial_print!(" ");
+    }
     crate::serial_print!("{}", title);
-    for _ in 0..(SCREEN_WIDTH - pad - title.len()) { crate::serial_print!(" "); }
+    for _ in 0..(SCREEN_WIDTH - pad - title.len()) {
+        crate::serial_print!(" ");
+    }
     // Content rows 2..24
     let content_rows = crate::drivers::vga::VGA_HEIGHT - 2; // 23
     for i in 0..content_rows {
         let idx = scroll + i;
-        if idx >= HELP_TEXT.len() { break; }
+        if idx >= HELP_TEXT.len() {
+            break;
+        }
         let row = 2 + i;
         crate::serial_print!("\x1b[{};1H\x1b[37;44m\x1b[2K", row);
         crate::serial_print!("{}", HELP_TEXT[idx]);

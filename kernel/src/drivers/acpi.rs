@@ -17,13 +17,13 @@ use crate::serial_println;
 /// RSDP (Root System Description Pointer) structure.
 #[repr(C, packed)]
 struct Rsdp {
-    signature: [u8; 8],      // "RSD PTR "
+    signature: [u8; 8], // "RSD PTR "
     checksum: u8,
     oem_id: [u8; 6],
     revision: u8,
-    rsdt_addr: u32,          // Physical address of RSDT
-    length: u32,             // Length of XSDT (revision >= 2)
-    xsdt_addr: u64,          // Physical address of XSDT (revision >= 2)
+    rsdt_addr: u32, // Physical address of RSDT
+    length: u32,    // Length of XSDT (revision >= 2)
+    xsdt_addr: u64, // Physical address of XSDT (revision >= 2)
     extended_checksum: u8,
     reserved: [u8; 3],
 }
@@ -61,13 +61,13 @@ struct Fadt {
     pm1a_cnt_blk: u32,
     pm1b_cnt_blk: u32,
     pm2_cnt_blk: u32,
-    pm_tmr_blk: u32,         // PM_TIMER_BLOCK - what we need!
+    pm_tmr_blk: u32, // PM_TIMER_BLOCK - what we need!
     gpe0_blk: u32,
     gpe1_blk: u32,
     pm1_evt_len: u8,
     pm1_cnt_len: u8,
     pm2_cnt_len: u8,
-    pm_tmr_len: u8,          // 4 = 32-bit, else 24-bit
+    pm_tmr_len: u8, // 4 = 32-bit, else 24-bit
     gpe0_blk_len: u8,
     gpe1_blk_len: u8,
     gpe1_base: u8,
@@ -91,20 +91,20 @@ struct Fadt {
 #[derive(Debug, Clone, Copy)]
 pub struct FadtInfo {
     pub pm_timer_addr: u16,
-    pub pm_timer_len: u8,    // 4 = 32-bit, else 24-bit
+    pub pm_timer_len: u8, // 4 = 32-bit, else 24-bit
     pub flags: u32,
 }
 
 /// Common fallback PM timer I/O addresses (covers 99% of UEFI platforms).
 const FALLBACK_PM_TIMER_ADDRS: &[u16] = &[
-    0x408,   // Standard
-    0x4008,  // Common on Intel PCH
-    0x808,   // Some older chipsets
-    0x1008,  // Some AMD
-    0x1808,  // Some server platforms
-    0x2008,  // Rare
-    0x4000,  // Additional Intel PCH variant
-    0x4408,  // Additional Intel PCH variant
+    0x408,  // Standard
+    0x4008, // Common on Intel PCH
+    0x808,  // Some older chipsets
+    0x1008, // Some AMD
+    0x1808, // Some server platforms
+    0x2008, // Rare
+    0x4000, // Additional Intel PCH variant
+    0x4408, // Additional Intel PCH variant
 ];
 
 /// Reads a physical address via the bootloader's physical memory offset.
@@ -193,9 +193,7 @@ fn parse_rsdp(rsdp_addr: u64, phys_offset: u64) -> Option<(u64, bool)> {
 
 /// Searches RSDT/XSDT for FADT (signature "FACP").
 fn find_fadt(sdt_addr: u64, is_xsdt: bool, phys_offset: u64) -> Option<u64> {
-    let header = unsafe {
-        ptr::read_volatile((phys_offset + sdt_addr) as *const SdtHeader)
-    };
+    let header = unsafe { ptr::read_volatile((phys_offset + sdt_addr) as *const SdtHeader) };
     if &header.signature != b"RSDT" && &header.signature != b"XSDT" {
         return None;
     }
@@ -226,9 +224,7 @@ fn find_fadt(sdt_addr: u64, is_xsdt: bool, phys_offset: u64) -> Option<u64> {
 
 /// Parses FADT at the given physical address.
 fn parse_fadt(fadt_addr: u64, phys_offset: u64) -> Option<FadtInfo> {
-    let fadt = unsafe {
-        ptr::read_volatile((phys_offset + fadt_addr) as *const Fadt)
-    };
+    let fadt = unsafe { ptr::read_volatile((phys_offset + fadt_addr) as *const Fadt) };
 
     // Validate signature and checksum
     if &fadt.header.signature != b"FACP" {

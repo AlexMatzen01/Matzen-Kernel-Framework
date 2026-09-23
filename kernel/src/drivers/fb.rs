@@ -33,9 +33,9 @@ pub type FrameBufferInfo = bootloader_api::info::FrameBufferInfo;
 pub type PixelFormat = bootloader_api::info::PixelFormat;
 use spin::Mutex;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
 
 use super::vga::Color;
 
@@ -378,11 +378,7 @@ impl FbState {
         unsafe {
             let fb = self.base as *mut u8;
             // Move pixel rows [CELL_H..height) to [0..height-CELL_H).
-            core::ptr::copy(
-                fb.add(CELL_H * line_bytes),
-                fb,
-                move_rows_px * line_bytes,
-            );
+            core::ptr::copy(fb.add(CELL_H * line_bytes), fb, move_rows_px * line_bytes);
         }
         // Clear the freed bottom text row.
         let last = self.rows.saturating_sub(1);
@@ -502,7 +498,16 @@ impl FbState {
     // ──────────────────────────────────────────────
 
     /// Fill a pixel rectangle with RGB color.
-    pub(crate) fn fill_px_rect(&mut self, x: usize, y: usize, w: usize, h: usize, r: u8, g: u8, b: u8) {
+    pub(crate) fn fill_px_rect(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        r: u8,
+        g: u8,
+        b: u8,
+    ) {
         if !self.is_active() {
             return;
         }
@@ -510,10 +515,29 @@ impl FbState {
             Some(i) => i,
             None => return,
         };
+        let xs = x.min(info.width);
         let x_end = (x + w).min(info.width);
         let y_end = (y + h).min(info.height);
-        for py in y..y_end {
-            for px in x..x_end {
+        // Fast path: packed 4bpp rows as single u32 stores (no per-pixel
+        // format match, no offset math). Covers all QEMU/GOP modes.
+        if info.bytes_per_pixel == 4 {
+            let px: u32 = match info.pixel_format {
+                PixelFormat::Rgb => u32::from_le_bytes([r, g, b, 0]),
+                _ => u32::from_le_bytes([b, g, r, 0]),
+            };
+            unsafe {
+                let fb = self.base as *mut u32;
+                for py in y.min(info.height)..y_end {
+                    let row = fb.add(py * info.stride + xs);
+                    for i in 0..(x_end - xs) {
+                        core::ptr::write_volatile(row.add(i), px);
+                    }
+                }
+            }
+            return;
+        }
+        for py in y.min(info.height)..y_end {
+            for px in xs..x_end {
                 if let Some(off) = self.pixel_offset(px, py) {
                     self.put_pixel_rgb(off, r, g, b);
                 }
@@ -541,7 +565,17 @@ impl FbState {
     }
 
     /// Blit a 32-bit RGBA bitmap (row-major, w*4 bytes per row).
-    pub(crate) fn blit_rgba(&mut self, x: usize, y: usize, w: usize, h: usize, rgba: &[u8]) {
+    pub(crate) fn blit_rgba(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        rgba: &[u8],
+        source_stride: usize,
+        source_x: usize,
+        source_y: usize,
+    ) {
         if !self.is_active() {
             return;
         }
@@ -555,7 +589,7 @@ impl FbState {
         let y_end = (y + h).min(info.height);
         for py in 0..(y_end - y) {
             for px in 0..(x_end - x) {
-                let src_idx = (py * w + px) * 4;
+                let src_idx = ((source_y + py) * source_stride + source_x + px) * 4;
                 if src_idx + 3 >= rgba.len() {
                     continue;
                 }
@@ -577,13 +611,21 @@ impl FbState {
                             match info.pixel_format {
                                 PixelFormat::Rgb => {
                                     core::ptr::write_volatile(p, r);
-                                    if bpp > 1 { core::ptr::write_volatile(p.add(1), g); }
-                                    if bpp > 2 { core::ptr::write_volatile(p.add(2), b_); }
+                                    if bpp > 1 {
+                                        core::ptr::write_volatile(p.add(1), g);
+                                    }
+                                    if bpp > 2 {
+                                        core::ptr::write_volatile(p.add(2), b_);
+                                    }
                                 }
                                 _ => {
                                     core::ptr::write_volatile(p, b_);
-                                    if bpp > 1 { core::ptr::write_volatile(p.add(1), g); }
-                                    if bpp > 2 { core::ptr::write_volatile(p.add(2), r); }
+                                    if bpp > 1 {
+                                        core::ptr::write_volatile(p.add(1), g);
+                                    }
+                                    if bpp > 2 {
+                                        core::ptr::write_volatile(p.add(2), r);
+                                    }
                                 }
                             }
                         } else {
@@ -597,13 +639,17 @@ impl FbState {
                                     PixelFormat::Rgb => *p.add(1),
                                     _ => *p.add(1),
                                 }
-                            } else { 0 };
+                            } else {
+                                0
+                            };
                             let dst_b = if bpp > 2 {
                                 match info.pixel_format {
                                     PixelFormat::Rgb => *p.add(2),
                                     _ => *p,
                                 }
-                            } else { 0 };
+                            } else {
+                                0
+                            };
                             let inv_a = 255 - a as u16;
                             let blend = |src: u8, dst: u8| -> u8 {
                                 ((src as u16 * a as u16 + dst as u16 * inv_a) >> 8) as u8
@@ -614,13 +660,21 @@ impl FbState {
                             match info.pixel_format {
                                 PixelFormat::Rgb => {
                                     core::ptr::write_volatile(p, nr);
-                                    if bpp > 1 { core::ptr::write_volatile(p.add(1), ng); }
-                                    if bpp > 2 { core::ptr::write_volatile(p.add(2), nb); }
+                                    if bpp > 1 {
+                                        core::ptr::write_volatile(p.add(1), ng);
+                                    }
+                                    if bpp > 2 {
+                                        core::ptr::write_volatile(p.add(2), nb);
+                                    }
                                 }
                                 _ => {
                                     core::ptr::write_volatile(p, nb);
-                                    if bpp > 1 { core::ptr::write_volatile(p.add(1), ng); }
-                                    if bpp > 2 { core::ptr::write_volatile(p.add(2), nr); }
+                                    if bpp > 1 {
+                                        core::ptr::write_volatile(p.add(1), ng);
+                                    }
+                                    if bpp > 2 {
+                                        core::ptr::write_volatile(p.add(2), nr);
+                                    }
                                 }
                             }
                         }
@@ -631,7 +685,14 @@ impl FbState {
     }
 
     /// Save a pixel rectangle to an RGBA buffer (row-major, 4 bytes/pixel).
-    pub(crate) fn save_px_rect(&mut self, x: usize, y: usize, w: usize, h: usize, out: &mut alloc::vec::Vec<u8>) {
+    pub(crate) fn save_px_rect(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        out: &mut alloc::vec::Vec<u8>,
+    ) {
         if !self.is_active() {
             return;
         }
@@ -699,13 +760,21 @@ impl FbState {
                             match info.pixel_format {
                                 PixelFormat::Rgb => {
                                     core::ptr::write_volatile(p, r);
-                                    if bpp > 1 { core::ptr::write_volatile(p.add(1), g); }
-                                    if bpp > 2 { core::ptr::write_volatile(p.add(2), b_); }
+                                    if bpp > 1 {
+                                        core::ptr::write_volatile(p.add(1), g);
+                                    }
+                                    if bpp > 2 {
+                                        core::ptr::write_volatile(p.add(2), b_);
+                                    }
                                 }
                                 _ => {
                                     core::ptr::write_volatile(p, b_);
-                                    if bpp > 1 { core::ptr::write_volatile(p.add(1), g); }
-                                    if bpp > 2 { core::ptr::write_volatile(p.add(2), r); }
+                                    if bpp > 1 {
+                                        core::ptr::write_volatile(p.add(1), g);
+                                    }
+                                    if bpp > 2 {
+                                        core::ptr::write_volatile(p.add(2), r);
+                                    }
                                 }
                             }
                         } else {
@@ -718,13 +787,17 @@ impl FbState {
                                     PixelFormat::Rgb => *p.add(1),
                                     _ => *p.add(1),
                                 }
-                            } else { 0 };
+                            } else {
+                                0
+                            };
                             let dst_b = if bpp > 2 {
                                 match info.pixel_format {
                                     PixelFormat::Rgb => *p.add(2),
                                     _ => *p,
                                 }
-                            } else { 0 };
+                            } else {
+                                0
+                            };
                             let inv_a = 255 - a as u16;
                             let blend = |src: u8, dst: u8| -> u8 {
                                 ((src as u16 * a as u16 + dst as u16 * inv_a) >> 8) as u8
@@ -735,13 +808,21 @@ impl FbState {
                             match info.pixel_format {
                                 PixelFormat::Rgb => {
                                     core::ptr::write_volatile(p, nr);
-                                    if bpp > 1 { core::ptr::write_volatile(p.add(1), ng); }
-                                    if bpp > 2 { core::ptr::write_volatile(p.add(2), nb); }
+                                    if bpp > 1 {
+                                        core::ptr::write_volatile(p.add(1), ng);
+                                    }
+                                    if bpp > 2 {
+                                        core::ptr::write_volatile(p.add(2), nb);
+                                    }
                                 }
                                 _ => {
                                     core::ptr::write_volatile(p, nb);
-                                    if bpp > 1 { core::ptr::write_volatile(p.add(1), ng); }
-                                    if bpp > 2 { core::ptr::write_volatile(p.add(2), nr); }
+                                    if bpp > 1 {
+                                        core::ptr::write_volatile(p.add(1), ng);
+                                    }
+                                    if bpp > 2 {
+                                        core::ptr::write_volatile(p.add(2), nr);
+                                    }
                                 }
                             }
                         }
@@ -763,15 +844,27 @@ impl FbState {
             match info.pixel_format {
                 PixelFormat::Rgb => {
                     core::ptr::write_volatile(p, r);
-                    if info.bytes_per_pixel > 1 { core::ptr::write_volatile(p.add(1), g); }
-                    if info.bytes_per_pixel > 2 { core::ptr::write_volatile(p.add(2), b); }
-                    if info.bytes_per_pixel > 3 { core::ptr::write_volatile(p.add(3), 0); }
+                    if info.bytes_per_pixel > 1 {
+                        core::ptr::write_volatile(p.add(1), g);
+                    }
+                    if info.bytes_per_pixel > 2 {
+                        core::ptr::write_volatile(p.add(2), b);
+                    }
+                    if info.bytes_per_pixel > 3 {
+                        core::ptr::write_volatile(p.add(3), 0);
+                    }
                 }
                 _ => {
                     core::ptr::write_volatile(p, b);
-                    if info.bytes_per_pixel > 1 { core::ptr::write_volatile(p.add(1), g); }
-                    if info.bytes_per_pixel > 2 { core::ptr::write_volatile(p.add(2), r); }
-                    if info.bytes_per_pixel > 3 { core::ptr::write_volatile(p.add(3), 0); }
+                    if info.bytes_per_pixel > 1 {
+                        core::ptr::write_volatile(p.add(1), g);
+                    }
+                    if info.bytes_per_pixel > 2 {
+                        core::ptr::write_volatile(p.add(2), r);
+                    }
+                    if info.bytes_per_pixel > 3 {
+                        core::ptr::write_volatile(p.add(3), 0);
+                    }
                 }
             }
         }
@@ -826,8 +919,30 @@ where
     F: FnOnce(&mut FbState) -> R,
 {
     use x86_64::instructions::interrupts;
-    interrupts::without_interrupts(|| {
-        f(&mut FB.lock())
+    interrupts::without_interrupts(|| f(&mut FB.lock()))
+}
+
+/// Run `f` with the framebuffer state temporarily remapped to another
+/// backing store (the double-buffer back/front buffers). Restores the
+/// hardware base/len afterwards.
+///
+/// Lock discipline: takes ONLY the framebuffer lock. Callers must snapshot
+/// the target base/len beforehand and must NOT hold any other driver lock
+/// across this call — the old fb_gfx redirect helpers deadlocked by taking
+/// the double-buffer lock outside and again inside.
+pub(crate) fn with_mapped_base<F, R>(base: usize, len: usize, f: F) -> R
+where
+    F: FnOnce(&mut FbState) -> R,
+{
+    with_lock(|st| {
+        let old_base = st.base;
+        let old_len = st.byte_len;
+        st.base = base;
+        st.byte_len = len;
+        let r = f(st);
+        st.base = old_base;
+        st.byte_len = old_len;
+        r
     })
 }
 
@@ -869,6 +984,155 @@ pub fn write_at(row: usize, col: usize, byte: u8, fg: Color, bg: Color) {
         }
         st.fill_cell(col, row, fg, bg, byte);
     });
+}
+
+/// Draw one 8x16 glyph (8x8 font, doubled vertically like the console)
+/// with a transparent background: only set pixels are written, clipped to
+/// the framebuffer and to `clip` (x, y, w, h) when given.
+fn draw_glyph_px(
+    st: &mut FbState,
+    x0: usize,
+    y0: usize,
+    byte: u8,
+    rgb: (u8, u8, u8),
+    clip: Option<(usize, usize, usize, usize)>,
+) {
+    if !st.is_active() {
+        return;
+    }
+    let glyph = FONT[(byte as usize).min(127)];
+    for gy in 0..8 {
+        let bits = glyph[gy];
+        for gx in 0..8 {
+            if (bits >> gx) & 1 == 0 {
+                continue; // transparent: leave background alone
+            }
+            for dy in 0..2 {
+                let px = x0 + gx;
+                let py = y0 + gy * 2 + dy;
+                if let Some((cx, cy, cw, ch)) = clip {
+                    if px < cx || py < cy || px >= cx + cw || py >= cy + ch {
+                        continue;
+                    }
+                }
+                st.put_pixel(px, py, rgb);
+            }
+        }
+    }
+}
+
+/// Pixel-positioned transparent text for the desktop compositor.
+/// Unlike the grid-snapped console helpers, this draws at exact pixel
+/// coordinates in `rgb` with no background fill and no line wrapping;
+/// callers clip and wrap. Non-printable bytes render as space.
+pub fn draw_text_px(
+    x: usize,
+    y: usize,
+    s: &str,
+    rgb: (u8, u8, u8),
+    clip: Option<(usize, usize, usize, usize)>,
+) {
+    with_lock(|st| {
+        draw_text_px_in(st, x, y, s, rgb, clip);
+    });
+}
+
+/// `draw_text_px` core operating on an already-locked (possibly remapped)
+/// state. Used by the double-buffer path without taking a second lock.
+pub(crate) fn draw_text_px_in(
+    st: &mut FbState,
+    x: usize,
+    y: usize,
+    s: &str,
+    rgb: (u8, u8, u8),
+    clip: Option<(usize, usize, usize, usize)>,
+) {
+    for (i, b) in s.bytes().enumerate() {
+        let ch = match b {
+            0x20..=0x7e => b,
+            b'\t' => b' ',
+            _ => b' ',
+        };
+        // Skip fully off-screen glyphs early (put_pixel clips anyway).
+        draw_glyph_px(st, x + i * CELL_W, y, ch, rgb, clip);
+    }
+}
+
+/// Width in pixels of `s` in the 8px desktop font.
+pub fn text_px_width(s: &str) -> usize {
+    s.bytes().count() * CELL_W
+}
+
+/// Wallpaper gradient from `top` (screen top) toward 45% brightness at the
+/// bottom edge. One lock for the whole region (the compositor used to issue
+/// ~800 one-row fills per frame). Pure function of y, so partial repaints
+/// blend seamlessly with full repaints.
+pub fn paint_wallpaper_gradient(x: usize, y: usize, w: usize, h: usize, top: (u8, u8, u8)) {
+    with_lock(|st| {
+        paint_wallpaper_gradient_in(st, x, y, w, h, top);
+    });
+}
+
+/// `paint_wallpaper_gradient` core operating on an already-locked
+/// (possibly remapped) state. Used by the double-buffer path without
+/// taking a second lock.
+pub(crate) fn paint_wallpaper_gradient_in(
+    st: &mut FbState,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    top: (u8, u8, u8),
+) {
+    if !st.is_active() {
+        return;
+    }
+    let info = match st.info {
+        Some(i) => i,
+        None => return,
+    };
+    let full_h = info.height.max(1);
+    let xs = x.min(info.width);
+    let x_end = (x + w).min(info.width);
+    let y_end = (y + h).min(info.height);
+    if info.bytes_per_pixel == 4 {
+        unsafe {
+            let fb = st.base as *mut u32;
+            let rgb = info.pixel_format == PixelFormat::Rgb;
+            for py in y.min(info.height)..y_end {
+                let t = py * 100 / full_h; // 0..100
+                let k = (100 - t * 55 / 100) as u16; // 100 -> 45
+                let (r, g, b) = (
+                    (top.0 as u16 * k / 100) as u8,
+                    (top.1 as u16 * k / 100) as u8,
+                    (top.2 as u16 * k / 100) as u8,
+                );
+                let px: u32 = if rgb {
+                    u32::from_le_bytes([r, g, b, 0])
+                } else {
+                    u32::from_le_bytes([b, g, r, 0])
+                };
+                let row = fb.add(py * info.stride + xs);
+                for i in 0..(x_end - xs) {
+                    core::ptr::write_volatile(row.add(i), px);
+                }
+            }
+        }
+        return;
+    }
+    for py in y.min(info.height)..y_end {
+        let t = py * 100 / full_h;
+        let k = (100 - t * 55 / 100) as u16;
+        st.fill_px_rect(
+            xs,
+            py,
+            x_end - xs,
+            1,
+            (top.0 as u16 * k / 100) as u8,
+            (top.1 as u16 * k / 100) as u8,
+            (top.2 as u16 * k / 100) as u8,
+        );
+    }
 }
 
 pub fn write_str_at(row: usize, col: usize, s: &str, fg: Color, bg: Color) {

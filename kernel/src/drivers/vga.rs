@@ -6,6 +6,8 @@
 //!
 //! Provides text output to the VGA text buffer at 0xb8000.
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt;
 use core::ptr;
 use spin::Mutex;
@@ -16,7 +18,7 @@ const BUFFER_WIDTH: usize = 80;
 const BUFFER_HEIGHT: usize = 25;
 
 /// VGA text buffer physical address
-const VGA_BUFFER_PHYS: u64 = 0xb9000;
+const VGA_BUFFER_PHYS: u64 = 0xb8000;
 
 /// VGA color codes
 #[allow(dead_code)]
@@ -91,6 +93,9 @@ pub struct Writer {
     column_position: usize,
     color_code: ColorCode,
     buffer: Option<&'static mut Buffer>,
+    cursor_row: usize,
+    cursor_col: usize,
+    cursor_visible: bool,
 }
 
 impl Writer {
@@ -100,6 +105,9 @@ impl Writer {
             column_position: 0,
             color_code: ColorCode::new(Color::LightGreen, Color::Black),
             buffer: None,
+            cursor_row: BUFFER_HEIGHT - 1,
+            cursor_col: 0,
+            cursor_visible: false,
         }
     }
 
@@ -273,7 +281,14 @@ impl Writer {
         if let Some(buffer) = &mut self.buffer {
             for r in row..(row + height).min(BUFFER_HEIGHT) {
                 for c in col..(col + width).min(BUFFER_WIDTH) {
-                    buffer.write(r, c, ScreenChar { ascii_character: ch, color_code: color });
+                    buffer.write(
+                        r,
+                        c,
+                        ScreenChar {
+                            ascii_character: ch,
+                            color_code: color,
+                        },
+                    );
                 }
             }
         }
@@ -286,6 +301,10 @@ impl Writer {
 
     /// Update hardware cursor position (visible cursor)
     pub fn set_cursor_pos(&mut self, row: usize, col: usize) {
+        let row = row.min(BUFFER_HEIGHT - 1);
+        let col = col.min(BUFFER_WIDTH - 1);
+        self.cursor_row = row;
+        self.cursor_col = col;
         let pos = (row * BUFFER_WIDTH + col) as u16;
         unsafe {
             use x86_64::instructions::port::Port;
@@ -300,6 +319,7 @@ impl Writer {
 
     /// Show hardware cursor (default shape: lines 0..15)
     pub fn show_cursor(&mut self) {
+        self.cursor_visible = true;
         unsafe {
             use x86_64::instructions::port::Port;
             let mut addr = Port::<u8>::new(VGA_CRTC_ADDR);
@@ -313,6 +333,7 @@ impl Writer {
 
     /// Hide hardware cursor
     pub fn hide_cursor(&mut self) {
+        self.cursor_visible = false;
         unsafe {
             use x86_64::instructions::port::Port;
             let mut addr = Port::<u8>::new(VGA_CRTC_ADDR);
@@ -361,6 +382,75 @@ impl fmt::Write for Writer {
 /// Global writer instance
 pub static WRITER: Mutex<Writer> = Mutex::new(Writer::new_uninit());
 
+/// Captures shell output while a desktop terminal command is executing.
+static OUTPUT_CAPTURE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn begin_output_capture() {
+    *OUTPUT_CAPTURE.lock() = Some(String::new());
+}
+
+pub fn end_output_capture() -> String {
+    OUTPUT_CAPTURE.lock().take().unwrap_or_default()
+}
+
+pub fn output_capture_active() -> bool {
+    OUTPUT_CAPTURE.lock().is_some()
+}
+
+/// Snapshot the VGA text grid for rendering a full-screen tool, such as the
+/// editor, inside the desktop terminal window.
+pub fn text_grid_snapshot() -> (Vec<(u8, Color, Color)>, usize, usize, bool) {
+    let writer = WRITER.lock();
+    let Some(buffer) = writer.buffer.as_ref() else {
+        return (
+            Vec::new(),
+            writer.cursor_row,
+            writer.cursor_col,
+            writer.cursor_visible,
+        );
+    };
+
+    let mut cells = Vec::with_capacity(BUFFER_WIDTH * BUFFER_HEIGHT);
+    for row in 0..BUFFER_HEIGHT {
+        for col in 0..BUFFER_WIDTH {
+            let cell = buffer.read(row, col);
+            let code = cell.color_code.0;
+            cells.push((
+                cell.ascii_character,
+                decode_color(code & 0x0f),
+                decode_color((code >> 4) & 0x0f),
+            ));
+        }
+    }
+    (
+        cells,
+        writer.cursor_row,
+        writer.cursor_col,
+        writer.cursor_visible,
+    )
+}
+
+fn decode_color(value: u8) -> Color {
+    match value {
+        0 => Color::Black,
+        1 => Color::Blue,
+        2 => Color::Green,
+        3 => Color::Cyan,
+        4 => Color::Red,
+        5 => Color::Magenta,
+        6 => Color::Brown,
+        7 => Color::LightGray,
+        8 => Color::DarkGray,
+        9 => Color::LightBlue,
+        10 => Color::LightGreen,
+        11 => Color::LightCyan,
+        12 => Color::LightRed,
+        13 => Color::Pink,
+        14 => Color::Yellow,
+        _ => Color::White,
+    }
+}
+
 /// Initializes the VGA text buffer with the physical memory offset
 pub fn init_with_offset(physical_memory_offset: u64) {
     let vga_buffer_virt = physical_memory_offset + VGA_BUFFER_PHYS;
@@ -381,7 +471,19 @@ pub fn _print(args: fmt::Arguments) {
     // Disable interrupts to prevent deadlock if an interrupt handler tries to print
     // while we're holding the WRITER lock
     interrupts::without_interrupts(|| {
+        {
+            let mut capture = OUTPUT_CAPTURE.lock();
+            if let Some(output) = capture.as_mut() {
+                let _ = output.write_fmt(args);
+                return;
+            }
+        }
         WRITER.lock().write_fmt(args).unwrap();
+        // Mirror to GOP framebuffer when active (UEFI); no-op otherwise.
+        // `fb` uses its own lock + without_interrupts (re-entrant safe).
+        if crate::drivers::fb::is_active() {
+            crate::drivers::fb::write_fmt(args);
+        }
         // Also write to serial for console access
         crate::drivers::serial::_print(args);
     });
@@ -408,6 +510,9 @@ pub fn clear_screen() {
 
     interrupts::without_interrupts(|| {
         WRITER.lock().clear_screen();
+        if let Some(output) = OUTPUT_CAPTURE.lock().as_mut() {
+            output.clear();
+        }
     });
 }
 

@@ -87,7 +87,8 @@ pub fn copy_disk(
 
     // Refuse to clone garbage: the source must look bootable (MBR signature).
     let mut mbr = [0u8; BLOCK_SIZE];
-    src.read_blocks(0, 1, &mut mbr).map_err(|_| "Source read failed")?;
+    src.read_blocks(0, 1, &mut mbr)
+        .map_err(|_| "Source read failed")?;
     if mbr[510] != 0x55 || mbr[511] != 0xAA {
         return Err("Source has no boot signature (not an MFK boot disk?)");
     }
@@ -97,7 +98,8 @@ pub fn copy_disk(
     while lba < total {
         let n = (total - lba).min(CHUNK_SECTORS as u64) as usize;
         let span = &mut buf[..n * BLOCK_SIZE];
-        src.read_blocks(lba, n, span).map_err(|_| "Source read failed")?;
+        src.read_blocks(lba, n, span)
+            .map_err(|_| "Source read failed")?;
         dst.write_blocks(lba, n, span)
             .map_err(|_| "Target write failed")?;
         lba += n as u64;
@@ -169,7 +171,11 @@ fn drive_label(index: usize) -> String {
         return format!("{}: probe data unavailable", base);
     };
     if !info.exists {
-        return format!("{}: absent ({})", base, info.last_error.unwrap_or("not detected"));
+        return format!(
+            "{}: absent ({})",
+            base,
+            info.last_error.unwrap_or("not detected")
+        );
     }
     let mut label = format!(
         "{}: {} sectors ({} MB)",
@@ -269,12 +275,14 @@ fn draw_page(title: &str, body: &[String], items: &[String], selected: usize, fo
         vga::write_str_at(VGA_HEIGHT - 2, 2, &hint, Color::DarkGray, Color::Black);
     }
     crate::serial_println!("{}", footer);
+    crate::desktop::refresh_terminal_editor();
 }
 
 /// Blocking read of the next key, keeping USB/net alive (the shell loop is
 /// suspended while the installer owns the screen).
 fn next_key() -> KeyEvent {
     loop {
+        #[cfg(feature = "usb")]
         crate::drivers::usb::poll();
         crate::net::process_packets();
         if let Some(ev) = crate::drivers::keyboard::read_key() {
@@ -287,13 +295,8 @@ fn next_key() -> KeyEvent {
 /// Simple "press any key" pause on top of the current screen.
 fn wait_any_key(msg: &str) {
     crate::serial_println!("{}", msg);
-    vga::write_str_at(
-        VGA_HEIGHT - 1,
-        2,
-        msg,
-        Color::Yellow,
-        Color::Black,
-    );
+    vga::write_str_at(VGA_HEIGHT - 1, 2, msg, Color::Yellow, Color::Black);
+    crate::desktop::refresh_terminal_editor();
     let _ = next_key();
 }
 
@@ -329,8 +332,10 @@ fn pick_drive(title: &str, candidates: &[usize]) -> Option<usize> {
     if candidates.is_empty() {
         draw_page(
             title,
-            &alloc::vec![String::from("No usable target disks found."),
-                String::from("Attach another disk (e.g. Secondary Master) and retry.")],
+            &alloc::vec![
+                String::from("No usable target disks found."),
+                String::from("Attach another disk (e.g. Secondary Master) and retry.")
+            ],
             &[],
             0,
             "Press any key to go back",
@@ -345,7 +350,13 @@ fn pick_drive(title: &str, candidates: &[usize]) -> Option<usize> {
     loop {
         let labels: Vec<String> = all.iter().map(|&i| drive_label(i)).collect();
         let body = alloc::vec![String::from("Select target disk:")];
-        draw_page(title, &body, &labels, selected, "Up/Down/1-4 + Enter, Esc cancels");
+        draw_page(
+            title,
+            &body,
+            &labels,
+            selected,
+            "Up/Down/1-4 + Enter, Esc cancels",
+        );
         match next_key().key {
             Key::ArrowUp => selected = (selected + all.len() - 1) % all.len(),
             Key::ArrowDown => selected = (selected + 1) % all.len(),
@@ -377,20 +388,17 @@ fn copy_with_progress(src_slot: usize, dst_slot: usize) -> Result<u64, &'static 
     let mut src = DriveBlockDevice::new(src_slot);
     let mut dst = DriveBlockDevice::new(dst_slot);
     let mut last_pct = u64::MAX;
-    copy_disk(
-        &mut src,
-        &mut dst,
-        |done, total| {
-            let pct = done * 100 / total.max(1);
-            if pct != last_pct {
-                last_pct = pct;
-                let line = format!("Copying... {}% ({}/{} sectors)", pct, done, total);
-                vga::fill_rect(10, 2, VGA_WIDTH - 4, 1, b' ', Color::White, Color::Black);
-                vga::write_str_at(10, 2, &line, Color::White, Color::Black);
-                crate::serial_println!("[install] {}", line);
-            }
-        },
-    )
+    copy_disk(&mut src, &mut dst, |done, total| {
+        let pct = done * 100 / total.max(1);
+        if pct != last_pct {
+            last_pct = pct;
+            let line = format!("Copying... {}% ({}/{} sectors)", pct, done, total);
+            vga::fill_rect(10, 2, VGA_WIDTH - 4, 1, b' ', Color::White, Color::Black);
+            vga::write_str_at(10, 2, &line, Color::White, Color::Black);
+            crate::desktop::refresh_terminal_editor();
+            crate::serial_println!("[install] {}", line);
+        }
+    })
 }
 
 /// Verify with a live percentage display. Returns the verify result.
@@ -398,20 +406,17 @@ fn verify_with_progress(src_slot: usize, dst_slot: usize) -> Result<u64, &'stati
     let mut src = DriveBlockDevice::new(src_slot);
     let mut dst = DriveBlockDevice::new(dst_slot);
     let mut last_pct = u64::MAX;
-    verify_disks(
-        &mut src,
-        &mut dst,
-        |done, total| {
-            let pct = done * 100 / total.max(1);
-            if pct != last_pct {
-                last_pct = pct;
-                let line = format!("Verifying... {}% ({}/{} sectors)", pct, done, total);
-                vga::fill_rect(10, 2, VGA_WIDTH - 4, 1, b' ', Color::White, Color::Black);
-                vga::write_str_at(10, 2, &line, Color::White, Color::Black);
-                crate::serial_println!("[install] {}", line);
-            }
-        },
-    )
+    verify_disks(&mut src, &mut dst, |done, total| {
+        let pct = done * 100 / total.max(1);
+        if pct != last_pct {
+            last_pct = pct;
+            let line = format!("Verifying... {}% ({}/{} sectors)", pct, done, total);
+            vga::fill_rect(10, 2, VGA_WIDTH - 4, 1, b' ', Color::White, Color::Black);
+            vga::write_str_at(10, 2, &line, Color::White, Color::Black);
+            crate::desktop::refresh_terminal_editor();
+            crate::serial_println!("[install] {}", line);
+        }
+    })
 }
 
 fn action_install() {
@@ -436,8 +441,18 @@ fn action_install() {
     };
     let dst_sectors = DriveBlockDevice::new(dst).block_count();
     let summary = alloc::vec![
-        format!("Source: {} ({} sectors, {} MB)", slot_name(SOURCE_INDEX), sectors, sectors / 2048),
-        format!("Target: {} ({} sectors, {} MB)", slot_name(dst), dst_sectors, dst_sectors / 2048),
+        format!(
+            "Source: {} ({} sectors, {} MB)",
+            slot_name(SOURCE_INDEX),
+            sectors,
+            sectors / 2048
+        ),
+        format!(
+            "Target: {} ({} sectors, {} MB)",
+            slot_name(dst),
+            dst_sectors,
+            dst_sectors / 2048
+        ),
         String::from(""),
         String::from("ALL DATA ON THE TARGET DISK WILL BE DESTROYED."),
         String::from("The target will become a bootable MFK disk."),
@@ -492,7 +507,9 @@ fn action_verify() {
     if !ready {
         draw_page(
             "Verify installation",
-            &alloc::vec![String::from("Boot source not recognized; nothing to compare against.")],
+            &alloc::vec![String::from(
+                "Boot source not recognized; nothing to compare against."
+            )],
             &[],
             0,
             "Press any key to go back",
@@ -517,7 +534,11 @@ fn action_verify() {
     };
     draw_page(
         "Verify installation",
-        &alloc::vec![format!("Comparing {} against source ({} sectors) ...", slot_name(dst), sectors)],
+        &alloc::vec![format!(
+            "Comparing {} against source ({} sectors) ...",
+            slot_name(dst),
+            sectors
+        )],
         &[],
         0,
         "Please wait.",
@@ -526,7 +547,11 @@ fn action_verify() {
         Ok(v) => {
             draw_page(
                 "Verify OK",
-                &alloc::vec![format!("{} matches source ({} sectors).", slot_name(dst), v)],
+                &alloc::vec![format!(
+                    "{} matches source ({} sectors).",
+                    slot_name(dst),
+                    v
+                )],
                 &[],
                 0,
                 "Press any key",
@@ -572,7 +597,9 @@ pub fn run() {
                 sectors / 2048
             ));
         } else {
-            body.push(String::from("Source: boot disk not recognized (install disabled)."));
+            body.push(String::from(
+                "Source: boot disk not recognized (install disabled).",
+            ));
         }
         draw_page(
             "MFK Installer",

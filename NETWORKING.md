@@ -20,25 +20,43 @@ The Matzen Kernel Framework now includes basic networking support with an Intel 
 
 ## Shell Commands
 
-### `ifconfig [ip-address]`
-Configure or display network interface settings.
+### `ifconfig [ip-address] [netmask] [gateway]`
+Configure or display network interface settings. The netmask and gateway are
+optional; the default netmask is `255.255.255.0`.
 
 **Examples:**
 ```
 ifconfig                  # Display current configuration
-ifconfig 10.0.2.15       # Set IP address
+ifconfig 10.0.2.15 255.255.255.0 10.0.2.2
 ```
 
-### `ping <ip-address>`
-Send ICMP echo request to test connectivity.
+### `ping <ip-address|hostname> [count]`
+Send ICMP echo requests. IP destinations are resolved with ARP; hostnames use
+DNS. The command has a bounded five-second reply wait.
 
 **Example:**
 ```
-ping 10.0.2.2            # Ping the QEMU gateway
+ping 10.0.2.2 4          # Ping the QEMU gateway
 ```
 
+### `dns <hostname>`
+Resolve a hostname to IPv4.
+
+### `arp [-a|list|<ip-address>]`
+Show the ARP cache or resolve an address.
+
 ### `netstat`
-Display network status and protocol information.
+Display interface, route, ARP, and protocol state.
+
+### `udp-send` / `udp-recv`
+Send and receive diagnostic UDP datagrams.
+
+### `wget` / `speedtest`
+Use the existing HTTP client and LibreSpeed client. Add `-d` or `--debug` for
+network traces.
+
+### `netdebug` / `tlsinfo`
+Toggle packet traces or show the optional TLS 1.3 build status.
 
 ### `tcpconnect <ip-address> <port>`
 Establish a TCP connection to a remote server.
@@ -65,6 +83,9 @@ Close a TCP connection.
 tcpclose 49152                    # Close connection on port 49152
 ```
 
+### `tcpstatus <local-port>` / `tcprecv <local-port> [seconds]`
+Inspect a TCP connection or wait for its received data.
+
 ## Usage Example
 
 ```
@@ -73,13 +94,11 @@ Network Interface:
   MAC Address: 52:54:00:12:34:56
   IP Address:  Not configured
 
-mfk> ifconfig 10.0.2.15
-IP address set to 10.0.2.15
+mfk> ifconfig 10.0.2.15 255.255.255.0 10.0.2.2
+Network configured: 10.0.2.15 / 255.255.255.0 gateway 10.0.2.2
 
-mfk> ping 10.0.2.2
-Pinging 10.0.2.2...
-Ping sent successfully
-Note: Check serial output for replies
+mfk> ping 10.0.2.2 4
+Pinging 10.0.2.2 with 4 packets...
 
 mfk> netstat
 Network Status:
@@ -126,7 +145,14 @@ Port forwarding is configured by default for:
 
 `run.sh` uses unrestricted user-mode networking (`restrict=off`) so the guest can make outbound internet and LAN connections without additional setup.
 
-Note: ICMP echo replies (ping) are still limited by QEMU user-mode networking. For reliable ICMP testing, use TAP mode (`run_with_tap.sh`).
+For QEMU user-mode networking, configure the gateway and netmask explicitly:
+
+```
+ifconfig 10.0.2.15 255.255.255.0 10.0.2.2
+```
+
+ARP resolves the gateway before IP packets are sent. TAP mode remains useful
+when testing hosts outside the QEMU user-mode NAT.
 
 ## Implementation Details
 

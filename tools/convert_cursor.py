@@ -24,16 +24,9 @@ def main() -> None:
     im = Image.open(SRC).convert("RGBA")
     w, h = im.size
     px = list(im.get_flattened_data())
-    # Hotspot: tip of the arrow = first opaque pixel scanning top-left.
-    hotspot = (0, 0)
-    for y in range(h):
-        for x in range(w):
-            if px[y * w + x][3] >= 128:
-                hotspot = (x, y)
-                break
-        else:
-            continue
-        break
+    # Keep the hotspot on the original arrow tip. The outline in the source
+    # bitmap can extend above/left of the opaque cursor body.
+    hotspot = (3, 1)
     vals = []
     for r, g, b, a in px:
         vals.extend((str(r), str(g), str(b), str(a)))

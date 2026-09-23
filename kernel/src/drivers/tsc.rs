@@ -8,7 +8,7 @@
 //! Calibrates against a reference hardware timer (PM Timer preferred) or
 //! derives frequency from CPUID leaf 0x15 / 0x16.
 
-use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static TSC_FREQ_HZ: AtomicU64 = AtomicU64::new(0);
 static CALIBRATED: AtomicBool = AtomicBool::new(false);
@@ -36,12 +36,12 @@ fn try_cpuid_leaf_15() -> (u64, bool) {
     if eax == 0 {
         return (0, false);
     }
-    
+
     // Method 1: EDX = TSC frequency directly (newer CPUs)
     if edx != 0 {
         return (edx as u64, true);
     }
-    
+
     // Method 2: ECX = crystal Hz, EBX/EAX = TSC/crystal ratio
     if ecx != 0 && ebx != 0 && eax != 0 {
         // TSC frequency = ECX * EBX / EAX
@@ -50,13 +50,13 @@ fn try_cpuid_leaf_15() -> (u64, bool) {
             return (freq, true);
         }
     }
-    
+
     // Method 3: EBX = TSC frequency directly (some implementations)
     if ebx != 0 && eax != 0 && ecx == 0 {
         // Some CPUs report TSC Hz in EBX when ECX=0
         return (ebx as u64, true);
     }
-    
+
     (0, false)
 }
 
@@ -77,17 +77,17 @@ fn try_cpuid_leaf_16() -> (u64, bool) {
     if eax != 0 {
         return ((eax as u64) * 1_000_000, true);
     }
-    
+
     // EBX = Maximum Frequency in MHz
     if ebx != 0 {
         return ((ebx as u64) * 1_000_000, true);
     }
-    
+
     // ECX = Bus/Reference Frequency in MHz
     if ecx != 0 {
         return ((ecx as u64) * 1_000_000, true);
     }
-    
+
     (0, false)
 }
 
@@ -96,16 +96,24 @@ fn try_cpuid_leaf_16() -> (u64, bool) {
 pub fn try_cpuid_frequency() -> (u64, bool) {
     // Try leaf 0x16 first (more direct)
     if let (freq, true) = try_cpuid_leaf_16() {
-        crate::serial_println!("[tsc] CPUID leaf 0x16: {} Hz ({:.2} GHz)", freq, freq as f64 / 1e9);
+        crate::serial_println!(
+            "[tsc] CPUID leaf 0x16: {} Hz ({:.2} GHz)",
+            freq,
+            freq as f64 / 1e9
+        );
         return (freq, true);
     }
-    
+
     // Try leaf 0x15 (crystal-based)
     if let (freq, true) = try_cpuid_leaf_15() {
-        crate::serial_println!("[tsc] CPUID leaf 0x15: {} Hz ({:.2} GHz)", freq, freq as f64 / 1e9);
+        crate::serial_println!(
+            "[tsc] CPUID leaf 0x15: {} Hz ({:.2} GHz)",
+            freq,
+            freq as f64 / 1e9
+        );
         return (freq, true);
     }
-    
+
     (0, false)
 }
 
@@ -140,7 +148,11 @@ where
     TSC_FREQ_HZ.store(freq, Ordering::Relaxed);
     CALIBRATED.store(true, Ordering::Relaxed);
 
-    crate::serial_println!("[tsc] calibrated @ {} Hz ({:.2} GHz)", freq, freq as f64 / 1_000_000_000.0);
+    crate::serial_println!(
+        "[tsc] calibrated @ {} Hz ({:.2} GHz)",
+        freq,
+        freq as f64 / 1_000_000_000.0
+    );
     freq
 }
 
@@ -155,14 +167,22 @@ pub fn init(reference: crate::drivers::time_source::TimeSource) {
     if let (freq, true) = try_cpuid_frequency() {
         TSC_FREQ_HZ.store(freq, Ordering::Relaxed);
         CALIBRATED.store(true, Ordering::Relaxed);
-        crate::serial_println!("[tsc] CPUID frequency: {} Hz ({:.2} GHz)", freq, freq as f64 / 1e9);
-        crate::println!("[tsc] CPUID frequency: {} Hz ({:.2} GHz)", freq, freq as f64 / 1e9);
+        crate::serial_println!(
+            "[tsc] CPUID frequency: {} Hz ({:.2} GHz)",
+            freq,
+            freq as f64 / 1e9
+        );
+        crate::println!(
+            "[tsc] CPUID frequency: {} Hz ({:.2} GHz)",
+            freq,
+            freq as f64 / 1e9
+        );
         return;
     }
 
     // Fallback to calibration against reference timer
     crate::serial_println!("[tsc] CPUID frequency unavailable, falling back to calibration...");
-    
+
     let freq = match reference {
         crate::drivers::time_source::TimeSource::PmTimer => {
             crate::serial_println!("[tsc] calibrating against PM Timer (10ms)...");
@@ -173,7 +193,9 @@ pub fn init(reference: crate::drivers::time_source::TimeSource) {
             calibrate(10, |ms| crate::drivers::pit::sleep_ms_pit_only(ms))
         }
         _ => {
-            crate::serial_println!("[tsc] WARNING: no hardware reference for calibration, skipping");
+            crate::serial_println!(
+                "[tsc] WARNING: no hardware reference for calibration, skipping"
+            );
             0
         }
     };
@@ -182,8 +204,16 @@ pub fn init(reference: crate::drivers::time_source::TimeSource) {
         crate::serial_println!("[tsc] calibration failed");
         crate::println!("[tsc] calibration failed");
     } else {
-        crate::serial_println!("[tsc] calibrated @ {} Hz ({:.2} GHz)", freq, freq as f64 / 1e9);
-        crate::println!("[tsc] calibrated @ {} Hz ({:.2} GHz)", freq, freq as f64 / 1e9);
+        crate::serial_println!(
+            "[tsc] calibrated @ {} Hz ({:.2} GHz)",
+            freq,
+            freq as f64 / 1e9
+        );
+        crate::println!(
+            "[tsc] calibrated @ {} Hz ({:.2} GHz)",
+            freq,
+            freq as f64 / 1e9
+        );
     }
 }
 
@@ -245,10 +275,7 @@ pub fn calibrate_via_rtc() -> u64 {
         freq,
         freq as f64 / 1_000_000_000.0
     );
-    crate::println!(
-        "[time] TSC freq={} MHz (RTC)",
-        freq / 1_000_000
-    );
+    crate::println!("[time] TSC freq={} MHz (RTC)", freq / 1_000_000);
     freq
 }
 

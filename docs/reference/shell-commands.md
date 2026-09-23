@@ -184,64 +184,66 @@ System enters infinite halt loop. Press Ctrl+C or close QEMU.
 
 ## Network Commands
 
-### `ifconfig [IP]`
-Configure or display network interface settings.
+### `ifconfig [IP] [netmask] [gateway]`
+Configure or display the E1000 interface. The netmask and gateway are optional;
+the default netmask is `255.255.255.0`.
 
-**Display current config:**
+**QEMU user-mode NAT:**
 ```bash
-mfk> ifconfig
-Network Interface:
-  MAC Address: 52:54:00:12:34:56
-  IP Address:  10.0.2.15
+mfk> ifconfig 10.0.2.15 255.255.255.0 10.0.2.2
 ```
 
-**Set IP address:**
-```bash
-mfk> ifconfig 192.168.1.100
-IP address set to 192.168.1.100
-```
-
-Format: `ifconfig <octet1>.<octet2>.<octet3>.<octet4>`
-
-### `ping <IP> [count]`
-Send ICMP echo requests (ping).
+### `ping <IP|hostname> [count]`
+Send ICMP echo requests and wait for replies. The batch timeout is bounded at
+five seconds; ARP failures and no-reply batches return to the prompt.
 
 ```bash
 mfk> ping 10.0.2.2 4
 Pinging 10.0.2.2 with 4 packets...
 Reply from 10.0.2.2: seq=0 time=2ms
-Reply from 10.0.2.2: seq=1 time=1ms
-Reply from 10.0.2.2: seq=2 time=1ms
-Reply from 10.0.2.2: seq=3 time=2ms
 --- ping statistics ---
 4 packets transmitted, 4 received, 0% packet loss
 ```
 
-Parameters:
-- `<IP>` — Target IP address (required)
-- `[count]` — Number of packets (default: 4)
-
-Timeout: 5 seconds per ping batch
-
-### `netstat`
-Display network status and statistics.
+### `dns <hostname>`
+Resolve an IPv4 hostname through the configured DNS path.
 
 ```bash
-mfk> netstat
-Network Status:
-
-Interface: E1000
-  MAC: 52:54:00:12:34:56
-  IP:  10.0.2.15
-
-Protocol Stack:
-  Ethernet - Active
-  ARP      - Active
-  IPv4     - Active
-  ICMP     - Active
-  UDP      - Active
-  TCP      - Not implemented
+mfk> dns example.com
+example.com -> 93.184.216.34
 ```
+
+### `arp [-a|list|<IP>]`
+Show the ARP cache or resolve one IPv4 address with a bounded ARP wait.
+
+### `netstat`
+Show the interface, address, netmask, gateway, ARP cache, and protocol state.
+
+### `tcpconnect`, `tcpsend`, `tcpclose`, `tcpstatus`, `tcprecv`
+Use the TCP connection commands. `tcpstatus` and `tcprecv` operate on a local
+port returned by `tcpconnect`.
+
+### `udp-send` / `udp-recv`
+Send and receive diagnostic UDP datagrams.
+
+```bash
+mfk> udp-send 10.0.2.2 49153 5555 hello
+mfk> udp-recv 5555 5
+```
+
+### `wget <http(s)-url> <file>`
+Download an HTTP(S) response to the mounted SimplFS filesystem. HTTP works in
+the default build; HTTPS requires the optional `net_tls` feature.
+
+### `speedtest` / `speedtest-server`
+Run a LibreSpeed-compatible test or display/set its server URL.
+
+### `netdebug [on|off|status]`
+Enable or disable gated per-packet serial diagnostics. `wget` and `speedtest`
+also accept `-d` or `--debug` for one invocation.
+
+### `tlsinfo`
+Show whether the optional TLS 1.3 backend is compiled into the kernel.
 
 ## File System Commands
 

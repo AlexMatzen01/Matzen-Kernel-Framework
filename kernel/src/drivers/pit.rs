@@ -173,7 +173,9 @@ pub fn sleep_ms(ms: u32) {
             if elapsed_ticks * 2 < expected_ticks {
                 crate::serial_println!(
                     "[pit] chunk {}ms: expected {} ticks, got {} — marking UNRELIABLE",
-                    chunk, expected_ticks, elapsed_ticks
+                    chunk,
+                    expected_ticks,
+                    elapsed_ticks
                 );
                 crate::drivers::pit::mark_ch2_unreliable();
                 crate::drivers::pm_timer::sleep_ms(left);
@@ -288,7 +290,8 @@ impl Timeout {
         if self.no_pit {
             if self.pm_fallback {
                 // Use PM timer for deadline tracking
-                let elapsed_us = crate::drivers::pm_timer::read_us().saturating_sub(self.pm_start_us);
+                let elapsed_us =
+                    crate::drivers::pm_timer::read_us().saturating_sub(self.pm_start_us);
                 return elapsed_us >= self.pm_duration_us;
             }
             if self.tsc_fallback {
@@ -315,7 +318,8 @@ impl Timeout {
                 self.pm_start_us = crate::drivers::pm_timer::read_us();
                 self.pm_duration_us = self.remaining_ms as u64 * 1000;
                 // Now poll using PM timer
-                let elapsed_us = crate::drivers::pm_timer::read_us().saturating_sub(self.pm_start_us);
+                let elapsed_us =
+                    crate::drivers::pm_timer::read_us().saturating_sub(self.pm_start_us);
                 elapsed_us >= self.pm_duration_us
             } else if arm_tsc_fallback(self, self.remaining_ms) {
                 tsc_expired(self)

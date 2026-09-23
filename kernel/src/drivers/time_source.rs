@@ -12,7 +12,7 @@ use alloc::string::String;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::drivers::{pit, pm_timer, tsc};
-use crate::{serial_println, println, print};
+use crate::{print, println, serial_println};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -143,7 +143,11 @@ fn test_pm_timer(phys_offset: u64) -> bool {
 
     // Try FADT first (preferred - gets exact address and 24/32-bit info)
     if let Some(fadt) = crate::drivers::acpi::find_pm_timer_info(phys_offset) {
-        crate::serial_println!("[time] PM Timer test: FADT found at 0x{:04x} ({}-bit)", fadt.pm_timer_addr, if fadt.pm_timer_len == 4 { 32 } else { 24 });
+        crate::serial_println!(
+            "[time] PM Timer test: FADT found at 0x{:04x} ({}-bit)",
+            fadt.pm_timer_addr,
+            if fadt.pm_timer_len == 4 { 32 } else { 24 }
+        );
         if pm_timer::init_from_fadt(&fadt) {
             crate::serial_println!("[time] PM Timer test: running 50ms calibration...");
             let start = pm_timer::read_us();
@@ -160,7 +164,12 @@ fn test_pm_timer(phys_offset: u64) -> bool {
             if ok {
                 let addr = pm_timer::get_address();
                 let bits = if pm_timer::is_32bit() { 32 } else { 24 };
-                crate::println!("[time] PM Timer test: 50ms expected, {}us actual OK (addr 0x{:04x}, {}-bit)", elapsed, addr, bits);
+                crate::println!(
+                    "[time] PM Timer test: 50ms expected, {}us actual OK (addr 0x{:04x}, {}-bit)",
+                    elapsed,
+                    addr,
+                    bits
+                );
             }
             return ok;
         }
@@ -181,14 +190,18 @@ fn test_pm_timer(phys_offset: u64) -> bool {
             pm_timer::get_address()
         );
         if ok {
-            crate::println!("[time] PM Timer test: 50ms expected, {}us actual OK (fallback addr 0x{:04x})", elapsed, pm_timer::get_address());
+            crate::println!(
+                "[time] PM Timer test: 50ms expected, {}us actual OK (fallback addr 0x{:04x})",
+                elapsed,
+                pm_timer::get_address()
+            );
         }
         return ok;
     }
 
-crate::serial_println!("[time] PM Timer test: FAIL (no working address)");
-        crate::println!("[time] PM Timer test: FAIL (no working address — FADT missing/invalid, fallbacks exhausted)");
-        false
+    crate::serial_println!("[time] PM Timer test: FAIL (no working address)");
+    crate::println!("[time] PM Timer test: FAIL (no working address — FADT missing/invalid, fallbacks exhausted)");
+    false
 }
 
 /// Tests TSC by calibrating against... we don't have a reference.
@@ -239,11 +252,25 @@ pub fn get_calibration_results() -> CalibrationResults {
         pit_ok: test_pit(),
         pm_timer_ok: test_pm_timer(0),
         tsc_ok: test_tsc(),
-        pit_addr: if pit::ch2_reliable() { Some("0x40/0x42 (ch0/ch2)".into()) } else { None },
+        pit_addr: if pit::ch2_reliable() {
+            Some("0x40/0x42 (ch0/ch2)".into())
+        } else {
+            None
+        },
         pm_timer_addr: if pm_timer::is_available() {
-            Some(alloc::format!("0x{:04x} ({}-bit)", pm_timer::get_address(), if pm_timer::is_32bit() { 32 } else { 24 }))
-        } else { None },
-        tsc_freq: if tsc::is_calibrated() { Some(tsc::get_freq_hz()) } else { None },
+            Some(alloc::format!(
+                "0x{:04x} ({}-bit)",
+                pm_timer::get_address(),
+                if pm_timer::is_32bit() { 32 } else { 24 }
+            ))
+        } else {
+            None
+        },
+        tsc_freq: if tsc::is_calibrated() {
+            Some(tsc::get_freq_hz())
+        } else {
+            None
+        },
     }
 }
 

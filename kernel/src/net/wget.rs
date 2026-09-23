@@ -445,7 +445,8 @@ pub fn cmd_run(args: &str) {
     if args.is_empty() || args == "--help" || args == "-h" || args == "help" {
         crate::println!("Usage: wget [-d|--debug] [-td=5s|--timeout=5s] <http-url> <local-file>");
         crate::println!("  e.g. wget http://10.0.2.2:8000/hello.txt /docs/hello.txt");
-        crate::println!("  Supports HTTP and TLS 1.3 HTTPS. Requires mounted FS ('mount').");
+        crate::println!("  HTTP works by default; HTTPS requires a net_tls-enabled build.");
+        crate::println!("  Requires mounted FS ('mount').");
         crate::println!("  Follows up to 3 HTTP(S) redirects.");
         crate::println!("  Timeout: -td=5s or --timeout=5s (also ms and m; default 25s).");
         crate::println!("  Max file size 6144 bytes; larger files are refused.");

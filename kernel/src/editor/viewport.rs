@@ -14,15 +14,20 @@ pub const EDIT_BOTTOM: usize = EDIT_TOP + EDIT_HEIGHT - 1; // 21
 
 #[derive(Debug, Clone)]
 pub struct Viewport {
-    pub top_line: usize,   // first buffer line visible
-    pub left_col: usize,   // first column visible (horizontal scroll)
-    pub width: usize,      // usually 80
-    pub height: usize,     // EDIT_HEIGHT
+    pub top_line: usize, // first buffer line visible
+    pub left_col: usize, // first column visible (horizontal scroll)
+    pub width: usize,    // usually 80
+    pub height: usize,   // EDIT_HEIGHT
 }
 
 impl Viewport {
     pub fn new() -> Self {
-        Self { top_line: 0, left_col: 0, width: SCREEN_WIDTH, height: EDIT_HEIGHT }
+        Self {
+            top_line: 0,
+            left_col: 0,
+            width: SCREEN_WIDTH,
+            height: EDIT_HEIGHT,
+        }
     }
 
     /// Ensure cursor is within viewport, adjusting top_line/left_col
@@ -58,14 +63,18 @@ impl Viewport {
 
     /// Convert buffer row to screen row
     pub fn buffer_to_screen_row(&self, buf_row: usize) -> Option<usize> {
-        if buf_row < self.top_line { return None; }
+        if buf_row < self.top_line {
+            return None;
+        }
         let rel = buf_row - self.top_line;
-        if rel >= self.height { return None; }
+        if rel >= self.height {
+            return None;
+        }
         Some(EDIT_TOP + rel)
     }
 
     pub fn screen_row(&self, buf_row: usize) -> usize {
-        EDIT_TOP + (buf_row.saturating_sub(self.top_line)).min(self.height-1)
+        EDIT_TOP + (buf_row.saturating_sub(self.top_line)).min(self.height - 1)
     }
 
     pub fn screen_col(&self, buf_col: usize) -> usize {
@@ -78,7 +87,11 @@ impl Viewport {
 
     pub fn page_up(&mut self, buf: &mut TextBuffer) {
         let jump = self.height.saturating_sub(1);
-        if buf.cursor_row >= jump { buf.cursor_row -= jump; } else { buf.cursor_row = 0; }
+        if buf.cursor_row >= jump {
+            buf.cursor_row -= jump;
+        } else {
+            buf.cursor_row = 0;
+        }
         let len = buf.lines[buf.cursor_row].len();
         buf.cursor_col = core::cmp::min(buf.desired_col, len);
         self.ensure_cursor_visible(buf);

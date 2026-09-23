@@ -2,20 +2,25 @@
 //! Author: Alexander Matzen
 //! Licensed under the MIT license.
 
-//! PS/2 Mouse Driver (IRQ12, i8042 aux port)
+//! Mouse Driver (PS/2 primary, USB HID merged)
 //!
-//! Polling-free, interrupt-driven: the IRQ12 handler in `interrupts.rs`
-//! reads the data port (0x60) and forwards each byte here. Three bytes
-//! form one packet (status, dx, dy). Position is tracked in framebuffer
-//! pixels; the desktop clamps it via [`set_bounds`].
+//! PS/2 path: polling-free, interrupt-driven — the IRQ12 handler in
+//! `interrupts.rs` reads the data port (0x60) and forwards each byte here.
+//! Three bytes form one packet (status, dx, dy).
 //!
-//! Init is fail-open with bounded waits: an absent mouse only logs and
-//! leaves keyboard/serial input untouched. USB HID mice are a separate
-//! future task (see `usb::find_hid_keyboard` surroundings).
+//! USB path: the xHCI/EHCI drivers claim HID mice and tablets and push
+//! decoded reports via [`push_usb_mouse`]/[`push_usb_tablet`]. All sources
+//! share one position/buttons/event queue: relative reports accumulate,
+//! absolute (tablet) reports set the position, and button bytes are full
+//! bitmasks (last-writer-wins).
+//!
+//! Position is tracked in framebuffer pixels; the desktop clamps it via
+//! [`set_bounds`]. Init is fail-open with bounded waits: an absent mouse
+//! only logs and leaves keyboard/serial input untouched.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 const DATA_PORT: u16 = 0x60;
 const STATUS_PORT: u16 = 0x64;
@@ -136,6 +141,10 @@ static MOUSE_BYTES: AtomicU64 = AtomicU64::new(0);
 static MOUSE_PACKETS: AtomicU64 = AtomicU64::new(0);
 /// Bytes/packets discarded (resync or overflow).
 static MOUSE_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// USB HID boot-mouse reports consumed since boot.
+static MOUSE_USB_PACKETS: AtomicU64 = AtomicU64::new(0);
+/// USB HID tablet (absolute) reports consumed since boot.
+static MOUSE_TABLET_PACKETS: AtomicU64 = AtomicU64::new(0);
 
 /// (bytes, packets, dropped) mouse input stats. Exposed via `irqstat`.
 pub fn mouse_stats() -> (u64, u64, u64) {
@@ -143,6 +152,15 @@ pub fn mouse_stats() -> (u64, u64, u64) {
         MOUSE_BYTES.load(Ordering::Relaxed),
         MOUSE_PACKETS.load(Ordering::Relaxed),
         MOUSE_DROPPED.load(Ordering::Relaxed),
+    )
+}
+
+/// (usb mouse reports, usb tablet reports) since boot. Proves which USB
+/// transport delivered movement when PS/2 and USB coexist.
+pub fn mouse_usb_stats() -> (u64, u64) {
+    (
+        MOUSE_USB_PACKETS.load(Ordering::Relaxed),
+        MOUSE_TABLET_PACKETS.load(Ordering::Relaxed),
     )
 }
 
@@ -364,7 +382,82 @@ pub fn handle_byte(b: u8) {
     st.push(MouseDelta { dx, dy, buttons });
 }
 
-/// True once init succeeded (or an IRQ arrived).
+/// Push a USB HID boot-mouse report: full button bitmask plus signed
+/// relative deltas (screen pixels, positive Y down). Merges into the same
+/// position/buttons/queue as PS/2; callable from USB poll paths (EHCI/xHCI)
+/// which already run with bounded, non-blocking discipline.
+pub fn push_usb_mouse(buttons: u8, dx: i16, dy: i16) {
+    use x86_64::instructions::interrupts;
+    let signal = interrupts::without_interrupts(|| {
+        let mut st = STATE.lock();
+        st.present = true;
+        let new_buttons = buttons & 0x07;
+        // Re-polled identical reports carry no signal: update idempotently
+        // but skip the queue/counter so idle endpoints stay quiet.
+        if new_buttons == st.buttons && dx == 0 && dy == 0 {
+            return false;
+        }
+        st.x = (st.x as isize + dx as isize).clamp(0, st.max_x as isize) as usize;
+        st.y = (st.y as isize + dy as isize).clamp(0, st.max_y as isize) as usize;
+        st.buttons = new_buttons;
+        let btn = st.buttons;
+        st.push(MouseDelta {
+            dx,
+            dy,
+            buttons: btn,
+        });
+        true
+    });
+    if signal {
+        MOUSE_USB_PACKETS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Push a USB HID tablet (absolute) report: position in device units over
+/// `x_max`/`y_max`, plus full button bitmask. Scales to the current clamp
+/// bounds (set by the desktop from the framebuffer size) and sets the
+/// position absolutely so host and guest cursors stay glued. A movement
+/// delta against the previous position is queued for event consumers.
+pub fn push_usb_tablet(x_abs: u32, y_abs: u32, x_max: u32, y_max: u32, buttons: u8) {
+    use x86_64::instructions::interrupts;
+    let signal = interrupts::without_interrupts(|| {
+        let mut st = STATE.lock();
+        st.present = true;
+        let new_buttons = buttons & 0x07;
+        let nx = if x_max == 0 {
+            st.x
+        } else {
+            ((x_abs as u64 * st.max_x as u64) / x_max.max(1) as u64).min(st.max_x as u64) as usize
+        };
+        let ny = if y_max == 0 {
+            st.y
+        } else {
+            ((y_abs as u64 * st.max_y as u64) / y_max.max(1) as u64).min(st.max_y as u64) as usize
+        };
+        let dx = nx as isize - st.x as isize;
+        let dy = ny as isize - st.y as isize;
+        // Same no-signal filter as relative reports: a re-polled identical
+        // absolute position with unchanged buttons queues nothing.
+        if new_buttons == st.buttons && dx == 0 && dy == 0 {
+            return false;
+        }
+        st.x = nx;
+        st.y = ny;
+        st.buttons = new_buttons;
+        let btn = st.buttons;
+        st.push(MouseDelta {
+            dx: dx.clamp(-32768, 32767) as i16,
+            dy: dy.clamp(-32768, 32767) as i16,
+            buttons: btn,
+        });
+        true
+    });
+    if signal {
+        MOUSE_TABLET_PACKETS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// True once init succeeded (or any mouse input arrived, PS/2 or USB).
 pub fn is_present() -> bool {
     x86_64::instructions::interrupts::without_interrupts(|| STATE.lock().present)
 }

@@ -6,9 +6,9 @@
 //! Each non-empty line is executed via shell's command dispatcher.
 //! Supports args substitution `$1`, `$@`, comments `#`, and `exit <code>`.
 
-use alloc::vec::Vec;
+use crate::shell::{clear_interrupt, is_interrupted};
 use alloc::string::String;
-use crate::shell::{is_interrupted, clear_interrupt};
+use alloc::vec::Vec;
 
 /// Run script file `data` as batch. `argv` includes app name + args.
 /// Returns exit code (0 success)
@@ -21,7 +21,7 @@ pub fn run_script(data: &[u8], path: &str, argv: &[&str]) -> Result<i32, &'stati
     for (idx, raw) in lines.iter().enumerate() {
         if is_interrupted() {
             clear_interrupt();
-            crate::println!("\n[app interrupted ^C] at line {}", idx+1);
+            crate::println!("\n[app interrupted ^C] at line {}", idx + 1);
             return Err("Interrupted");
         }
         // Allow cooperative tick / net processing between lines
@@ -51,7 +51,8 @@ pub fn run_script(data: &[u8], path: &str, argv: &[&str]) -> Result<i32, &'stati
         // If shell's `exit` command was used, it does NOT halt kernel when called from app - we intercept.
         // So we check expanded starts with exit above already.
         // Provide `halt`/`reboot` guard: don't actually halt when inside app
-        if expanded.trim() == "halt" || expanded.trim() == "reboot" || expanded.trim() == "shutdown" {
+        if expanded.trim() == "halt" || expanded.trim() == "reboot" || expanded.trim() == "shutdown"
+        {
             crate::println!("[app] '{}' ignored inside app context", expanded.trim());
         }
         let _ = should_break;
@@ -67,22 +68,37 @@ fn expand_vars(line: &str, path: &str, argv: &[&str]) -> String {
         if c == '$' {
             if let Some(&next) = chars.peek() {
                 match next {
-                    '0' => { chars.next(); out.push_str(path); },
+                    '0' => {
+                        chars.next();
+                        out.push_str(path);
+                    }
                     '@' => {
                         chars.next();
                         for (i, a) in argv.iter().enumerate() {
-                            if i>0 { out.push(' '); }
+                            if i > 0 {
+                                out.push(' ');
+                            }
                             out.push_str(a);
                         }
-                    },
-                    '#' => { chars.next(); out.push_str(&alloc::format!("{}", argv.len())); },
+                    }
+                    '#' => {
+                        chars.next();
+                        out.push_str(&alloc::format!("{}", argv.len()));
+                    }
                     '1'..='9' => {
                         chars.next();
                         let idx = (next as u8 - b'0') as usize;
-                        if idx < argv.len() { out.push_str(argv[idx]); }
-                    },
-                    '$' => { chars.next(); out.push('$'); },
-                    _ => { out.push(c); },
+                        if idx < argv.len() {
+                            out.push_str(argv[idx]);
+                        }
+                    }
+                    '$' => {
+                        chars.next();
+                        out.push('$');
+                    }
+                    _ => {
+                        out.push(c);
+                    }
                 }
             } else {
                 out.push(c);

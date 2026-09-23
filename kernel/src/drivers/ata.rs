@@ -69,6 +69,7 @@ pub struct AtaDrive {
     control_port: PortWriteOnly<u8>,
     exists: bool,
     lba48_supported: bool,
+    total_sectors_: u64,
 }
 
 impl AtaDrive {
@@ -95,6 +96,7 @@ impl AtaDrive {
             control_port: PortWriteOnly::new(ctrl),
             exists: false,
             lba48_supported: false,
+            total_sectors_: 0,
         }
     }
 
@@ -151,9 +153,7 @@ impl AtaDrive {
                 let lba_high = self.lba_high_port.read();
 
                 // ATAPI signature is 0x14, 0xEB or 0x69, 0x96
-                if (lba_mid == 0x14 && lba_high == 0xEB)
-                    || (lba_mid == 0x69 && lba_high == 0x96)
-                {
+                if (lba_mid == 0x14 && lba_high == 0xEB) || (lba_mid == 0x69 && lba_high == 0x96) {
                     return Err("ATAPI device (not ATA)");
                 }
 
@@ -185,6 +185,16 @@ impl AtaDrive {
     /// Check if the drive exists and is initialized
     pub fn exists(&self) -> bool {
         self.exists
+    }
+
+    /// Get total number of sectors on the drive
+    pub fn total_sectors(&self) -> u64 {
+        self.total_sectors_
+    }
+
+    /// Returns true for ATA drives (always true for this type)
+    pub fn is_ata(&self) -> bool {
+        true
     }
 
     /// Read sectors from the disk
@@ -384,7 +394,7 @@ pub fn init() {
             DriveType::Master => "Master",
             DriveType::Slave => "Slave",
         };
-        
+
         serial_println!("  Probing ATA {}/{}...", bus_name, drive_name);
         match drive.init() {
             Ok(()) => {
@@ -425,5 +435,80 @@ pub fn write_sectors(lba: u64, count: u8, buffer: &[u8]) -> Result<(), &'static 
         drives_array[1].write_sectors(lba, count, buffer)
     } else {
         Err("ATA not initialized")
+    }
+}
+
+/// Wrapper for install.rs compatibility
+pub fn read_sectors_from(
+    drive_index: usize,
+    lba: u64,
+    count: u8,
+    buffer: &mut [u8],
+) -> Result<(), &'static str> {
+    let mut drives = DRIVES.lock();
+    if let Some(drives_array) = drives.as_mut() {
+        if drive_index < drives_array.len() {
+            drives_array[drive_index].read_sectors(lba, count, buffer)
+        } else {
+            Err("Invalid drive index")
+        }
+    } else {
+        Err("ATA not initialized")
+    }
+}
+
+/// Wrapper for install.rs compatibility
+pub fn write_sectors_to(
+    drive_index: usize,
+    lba: u64,
+    count: u8,
+    buffer: &[u8],
+) -> Result<(), &'static str> {
+    let mut drives = DRIVES.lock();
+    if let Some(drives_array) = drives.as_mut() {
+        if drive_index < drives_array.len() {
+            drives_array[drive_index].write_sectors(lba, count, buffer)
+        } else {
+            Err("Invalid drive index")
+        }
+    } else {
+        Err("ATA not initialized")
+    }
+}
+
+/// Drive information for the installer
+pub struct DriveInfo {
+    pub exists: bool,
+    pub total_sectors: u64,
+    pub is_ata: bool,
+    pub last_error: Option<&'static str>,
+}
+
+/// Wrapper for install.rs compatibility
+pub fn drive_info(drive_index: usize) -> Option<DriveInfo> {
+    let drives = DRIVES.lock();
+    if let Some(drives_array) = drives.as_ref() {
+        if drive_index < drives_array.len() && drives_array[drive_index].exists() {
+            Some(DriveInfo {
+                exists: true,
+                total_sectors: drives_array[drive_index].total_sectors(),
+                is_ata: drives_array[drive_index].is_ata(),
+                last_error: None,
+            })
+        } else {
+            Some(DriveInfo {
+                exists: false,
+                total_sectors: 0,
+                is_ata: false,
+                last_error: Some("Drive not detected or not ATA"),
+            })
+        }
+    } else {
+        Some(DriveInfo {
+            exists: false,
+            total_sectors: 0,
+            is_ata: false,
+            last_error: Some("ATA not initialized"),
+        })
     }
 }

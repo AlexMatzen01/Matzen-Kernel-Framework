@@ -1,4 +1,4 @@
-﻿//! xHCI (USB 3.x) host-controller driver â€” Phase 1+2: bring-up + enumeration.
+//! xHCI (USB 3.x) host-controller driver â€” Phase 1+2: bring-up + enumeration.
 //!
 //! Polling-only design matching the EHCI driver: no MSI-X/APIC work, the
 //! shell loop calls `poll()` and we drain the event ring by hand. Phase 1
@@ -16,8 +16,8 @@
 //! All waits are bounded so missing/broken hardware cannot hang boot.
 
 use crate::drivers::usb::{
-    delay_ms, dma_page, find_hid_keyboard, mmio_r16, mmio_r32, mmio_r64, mmio_r8, mmio_w32,
-    mmio_w64, setup_packet,
+    delay_ms, dma_page, find_hid_keyboard, find_hid_pointer, mmio_r16, mmio_r32, mmio_r64, mmio_r8,
+    mmio_w32, mmio_w64, parse_tablet_layout, setup_packet, HidPointerKind, TabletLayout,
 };
 use alloc::vec::Vec;
 // ---------------------------------------------------------------------------
@@ -215,12 +215,19 @@ pub struct XhciSlot {
     in_ctx_phys: u64,
     out_ctx_virt: u64,
     out_ctx_phys: u64,
-    // ---- Phase 3 HID interrupt endpoint (claimed keyboards only) ----
+    // ---- Phase 3 HID interrupt endpoint (one HID device per slot) ----
     pub hid_claimed: bool,
+    /// What the claimed endpoint serves (keyboard vs pointer/tablet).
+    pub hid_kind: HidKind,
     hid_ep: u8,
     hid_dci: u32,
     hid_maxpacket: u16,
     hid_interval: u8,
+    /// Interrupt-IN transfer length for this endpoint (8 for boot HID,
+    /// report length for tablets, capped at 64; the buffer is a page).
+    hid_xfer_len: u16,
+    /// Decoded absolute layout for tablets (None for keyboards/mice).
+    tablet_layout: Option<TabletLayout>,
     int_virt: u64,
     int_phys: u64,
     int_idx: usize,
@@ -228,6 +235,16 @@ pub struct XhciSlot {
     hid_buf_virt: u64,
     hid_buf_phys: u64,
     hid_pending_trb: u64,
+}
+
+/// What a claimed xHCI HID endpoint delivers. One device per slot; a
+/// composite keyboard+mouse claims across separate slots/endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HidKind {
+    None,
+    Keyboard,
+    Mouse,
+    Tablet,
 }
 
 unsafe impl Send for XhciController {}
@@ -264,11 +281,17 @@ impl XhciController {
         match pci.pm_info() {
             Some((cap, st)) => crate::println!(
                 "[usb] xHCI {:02x}:{:02x}.{} PM cap {:#x} state D{}",
-                pci.bus, pci.device, pci.function, cap, st
+                pci.bus,
+                pci.device,
+                pci.function,
+                cap,
+                st
             ),
             None => crate::println!(
                 "[usb] xHCI {:02x}:{:02x}.{} no PM cap",
-                pci.bus, pci.device, pci.function
+                pci.bus,
+                pci.device,
+                pci.function
             ),
         }
 
@@ -276,7 +299,7 @@ impl XhciController {
         if mmio_phys == 0 {
             return Err("xHCI BAR zero");
         }
-// Fixed non-destructive mapping: xHCI MMIO is caps + op + runtime +
+        // Fixed non-destructive mapping: xHCI MMIO is caps + op + runtime +
         // doorbells (typical DBOFF 0x2000 / RTSOFF 0x3000). Map 256 KB up
         // front instead of destructively sizing the 64-bit BAR with all-1s
         // writes while decode is enabled. Every failure returns Err so the
@@ -284,7 +307,7 @@ impl XhciController {
         // Increase to 256KB to cover doorbells (DBOFF=0x3000) + runtime (RTSOFF=0x2000) + doorbells
         let base = crate::drivers::pci::map_mmio_region(
             mmio_phys,
-            0x40000,  // 256 KB
+            0x40000, // 256 KB
             phys_offset,
             &mut crate::memory::frame_allocator::frame_allocator(),
         )
@@ -295,7 +318,12 @@ impl XhciController {
         let cmd = pci.read_config(0x04);
         if cmd & 0x02 == 0 {
             pci.write_config(0x04, cmd | 0x02);
-            crate::serial_println!("[usb] xHCI {:02x}:{:02x}.{} COMMAND mem-enable set", pci.bus, pci.device, pci.function);
+            crate::serial_println!(
+                "[usb] xHCI {:02x}:{:02x}.{} COMMAND mem-enable set",
+                pci.bus,
+                pci.device,
+                pci.function
+            );
         }
 
         let caplen = unsafe { mmio_r8(base, CAP_CAPLENGTH) } as usize;
@@ -320,7 +348,13 @@ impl XhciController {
             );
             crate::println!(
                 "[usb] xHCI {:02x}:{:02x}.{} BAD CAPLENGTH {:#x} BAR1={:#x} PSSEN={:#x} cap0={:#x}",
-                pci.bus, pci.device, pci.function, caplen, b1, pss, c0
+                pci.bus,
+                pci.device,
+                pci.function,
+                caplen,
+                b1,
+                pss,
+                c0
             );
             return Err("xHCI bad CAPLENGTH");
         }
@@ -407,14 +441,22 @@ impl XhciController {
             return Err("xHCI no 4K pages");
         }
 
-// MaxSlotsEn (CONFIG[7:0]); leave U3E/CIE zeroed.
+        // MaxSlotsEn (CONFIG[7:0]); leave U3E/CIE zeroed.
         unsafe {
             mmio_w32(op, OP_CONFIG, max_slots);
         }
         // Verify MaxSlotsEn readback
         let config_readback = unsafe { mmio_r32(op, OP_CONFIG) };
-        crate::serial_println!("[usb] xHCI MaxSlotsEn: wrote={} readback={}", max_slots, config_readback & 0xFF);
-        crate::println!("[usb] xHCI MaxSlotsEn: wrote={} readback={}", max_slots, config_readback & 0xFF);
+        crate::serial_println!(
+            "[usb] xHCI MaxSlotsEn: wrote={} readback={}",
+            max_slots,
+            config_readback & 0xFF
+        );
+        crate::println!(
+            "[usb] xHCI MaxSlotsEn: wrote={} readback={}",
+            max_slots,
+            config_readback & 0xFF
+        );
 
         // Scratchpad buffers if the controller demands any.
         let max_sp = (((hcs2 >> 21) & 0x1F) << 5) | ((hcs2 >> 27) & 0x1F);
@@ -441,14 +483,24 @@ impl XhciController {
             return Err("xHCI DCBAA too large");
         }
         let (dcbaa_virt, dcbaa_phys, _) = dma_page().ok_or("DCBAA alloc")?;
-unsafe {
+        unsafe {
             core::ptr::write_volatile(dcbaa_virt as *mut u64, scratch_array_phys);
             mmio_w64(op, OP_DCBAAP, dcbaa_phys);
         }
         // Verify DCBAAP readback
         let dcbaap_readback = unsafe { mmio_r64(op, OP_DCBAAP) };
-        crate::serial_println!("[usb] xHCI DCBAAP: wrote={:#x} readback={:#x} match={}", dcbaa_phys, dcbaap_readback, dcbaap_readback == dcbaa_phys);
-        crate::println!("[usb] xHCI DCBAAP: wrote={:#x} readback={:#x} match={}", dcbaa_phys, dcbaap_readback, dcbaap_readback == dcbaa_phys);
+        crate::serial_println!(
+            "[usb] xHCI DCBAAP: wrote={:#x} readback={:#x} match={}",
+            dcbaa_phys,
+            dcbaap_readback,
+            dcbaap_readback == dcbaa_phys
+        );
+        crate::println!(
+            "[usb] xHCI DCBAAP: wrote={:#x} readback={:#x} match={}",
+            dcbaa_phys,
+            dcbaap_readback,
+            dcbaap_readback == dcbaa_phys
+        );
 
         // Command ring: 127 command TRBs + Link TRB back to base.
         // Initialize all TRBs to 0 (cycle=0) except the link TRB which has cycle=1.
@@ -469,14 +521,17 @@ unsafe {
                     TRB_CYCLE | TRB_LINK_TC | (TRB_LINK << TRB_TYPE_SHIFT),
                 ],
             );
-}
-// Verify command ring physical address is in 32-bit address space (required for CTX64=0)
+        }
+        // Verify command ring physical address is in 32-bit address space (required for CTX64=0)
         if cmd_phys >= 0x1_0000_0000 {
             crate::serial_println!(
                 "[usb] xHCI CRCR ERROR: cmd_phys={:#x} >= 4GB, CTX64=0 requires <4GB",
                 cmd_phys
             );
-            crate::println!("[usb] xHCI CRCR ERROR: cmd_phys={:#x} >= 4GB, CTX64=0 requires <4GB", cmd_phys);
+            crate::println!(
+                "[usb] xHCI CRCR ERROR: cmd_phys={:#x} >= 4GB, CTX64=0 requires <4GB",
+                cmd_phys
+            );
             return Err("xHCI command ring >= 4GB");
         }
 
@@ -500,7 +555,10 @@ unsafe {
         );
         crate::println!(
             "[usb] xHCI preCRCR: CRCR=lo:{:#x} hi:{:#x} DCBAAP=lo:{:#x} hi:{:#x}",
-            pre_crcr_lo, pre_crcr_hi, pre_dcba_lo, pre_dcba_hi
+            pre_crcr_lo,
+            pre_crcr_hi,
+            pre_dcba_lo,
+            pre_dcba_hi
         );
 
         // CRCR write with retry + warn-continue
@@ -532,14 +590,20 @@ unsafe {
             if attempt == 0 {
                 unsafe {
                     // Write high dword first, then low dword
-                    core::ptr::write_volatile((op + OP_CRCR + 4) as *mut u32, (expected_crcr >> 32) as u32);
+                    core::ptr::write_volatile(
+                        (op + OP_CRCR + 4) as *mut u32,
+                        (expected_crcr >> 32) as u32,
+                    );
                     core::ptr::write_volatile((op + OP_CRCR) as *mut u32, expected_crcr as u32);
                 }
             } else if attempt == 1 {
                 unsafe {
                     // Standard low-first order
                     core::ptr::write_volatile((op + OP_CRCR) as *mut u32, expected_crcr as u32);
-                    core::ptr::write_volatile((op + OP_CRCR + 4) as *mut u32, (expected_crcr >> 32) as u32);
+                    core::ptr::write_volatile(
+                        (op + OP_CRCR + 4) as *mut u32,
+                        (expected_crcr >> 32) as u32,
+                    );
                 }
             }
             // Small delay between retries
@@ -576,7 +640,7 @@ unsafe {
         // Event ring: single 128-TRB segment, consumer cycle 1.
         let (evt_virt, evt_phys, _) = dma_page().ok_or("event ring alloc")?;
         let (erst_virt, erst_phys, _) = dma_page().ok_or("ERST alloc")?;
-crate::serial_println!(
+        crate::serial_println!(
             "[usb] xHCI DMA dcbaa={:#x} cmd={:#x} evt={:#x} erst={:#x} ac64={}",
             dcbaa_phys,
             cmd_phys,
@@ -584,7 +648,14 @@ crate::serial_println!(
             erst_phys,
             ac64 as u8
         );
-        crate::println!("[usb] xHCI DMA: dcbaa={:#x} cmd={:#x} evt={:#x} erst={:#x} ac64={}", dcbaa_phys, cmd_phys, evt_phys, erst_phys, ac64 as u8);
+        crate::println!(
+            "[usb] xHCI DMA: dcbaa={:#x} cmd={:#x} evt={:#x} erst={:#x} ac64={}",
+            dcbaa_phys,
+            cmd_phys,
+            evt_phys,
+            erst_phys,
+            ac64 as u8
+        );
         unsafe {
             core::ptr::write_volatile(erst_virt as *mut u64, evt_phys);
             core::ptr::write_volatile((erst_virt + 8) as *mut u32, RING_TRBS as u32);
@@ -668,15 +739,18 @@ crate::serial_println!(
             crate::println!("[usb] xHCI CNR stuck set (STS={:#x})", sts);
             return Err("xHCI CNR timeout");
         }
-// Verify CRCR after controller starts
+        // Verify CRCR after controller starts
         let crcr_after_start = unsafe { mmio_r64(op, OP_CRCR) };
         crate::serial_println!(
             "[usb] xHCI running (STS={:#x} CRCR={:#x})",
             unsafe { mmio_r32(op, OP_USBSTS) },
             crcr_after_start
         );
-        crate::println!("[usb] xHCI running (STS={:#x} CRCR={:#x}), testing NOOP...", 
-            unsafe { mmio_r32(op, OP_USBSTS) }, crcr_after_start);
+        crate::println!(
+            "[usb] xHCI running (STS={:#x} CRCR={:#x}), testing NOOP...",
+            unsafe { mmio_r32(op, OP_USBSTS) },
+            crcr_after_start
+        );
 
         // Prove command + event rings end-to-end with a NO-OP command.
         ctl.submit_noop();
@@ -864,9 +938,8 @@ crate::serial_println!(
         // channel 2 works with interrupts in any state and fails open when
         // no PIT exists. Never nest: channel 2 is single-shared, and these
         // waits always run sequentially.
-        let mut deadline =
-            crate::drivers::pit::timeout_ms(timeout_ms as u32);
-// Backstop so a missing PIT (instant-true poll) still bounds the
+        let mut deadline = crate::drivers::pit::timeout_ms(timeout_ms as u32);
+        // Backstop so a missing PIT (instant-true poll) still bounds the
         // loop instead of spinning on a wedged controller indefinitely.
         let max_iters = timeout_ms.saturating_mul(50_000).max(500_000);
         let mut iters = 0usize;
@@ -1017,25 +1090,66 @@ crate::serial_println!(
         if idx >= self.slots.len() {
             return;
         }
-        let (buf_virt, claimed) = {
+        let (buf_virt, claimed, kind, xfer_len, layout) = {
             let s = &self.slots[idx];
-            (s.hid_buf_virt, s.hid_claimed)
+            (
+                s.hid_buf_virt,
+                s.hid_claimed,
+                s.hid_kind,
+                s.hid_xfer_len,
+                s.tablet_layout,
+            )
         };
         if !claimed || buf_virt == 0 {
             return;
         }
         if code == COMP_SUCCESS || code == COMP_SHORT_PACKET {
-            let mut report = [0u8; 8];
+            let len = (xfer_len as usize).clamp(1, 64);
+            let mut report = [0u8; 64];
             unsafe {
                 let src = buf_virt as *const u8;
-                for i in 0..8 {
+                for i in 0..len {
                     report[i] = core::ptr::read_volatile(src.add(i));
                 }
             }
-            // Idle (all-zero) reports are filtered inside push_usb_report
-            // via previous-report tracking; still forward them to keep
-            // release detection accurate.
-            crate::drivers::keyboard::push_usb_report(report);
+            match kind {
+                HidKind::Keyboard => {
+                    let mut kbd = [0u8; 8];
+                    kbd.copy_from_slice(&report[..8]);
+                    // Idle (all-zero) reports are filtered inside
+                    // push_usb_report via previous-report tracking; still
+                    // forward them to keep release detection accurate.
+                    crate::drivers::keyboard::push_usb_report(kbd);
+                }
+                HidKind::Mouse => {
+                    // Boot mouse: buttons, dx, dy (, wheel). HID Y is
+                    // already screen-positive-down; no negation.
+                    let buttons = report[0];
+                    let dx = report[1] as i8 as i16;
+                    let dy = report[2] as i8 as i16;
+                    crate::drivers::mouse::push_usb_mouse(buttons, dx, dy);
+                }
+                HidKind::Tablet => {
+                    let layout = layout.unwrap_or(TabletLayout::qm_fallback());
+                    let buttons = report.get(layout.buttons_at).copied().unwrap_or(0);
+                    let x = u16::from_le_bytes([
+                        report.get(layout.x_at).copied().unwrap_or(0),
+                        report.get(layout.x_at + 1).copied().unwrap_or(0),
+                    ]) as u32;
+                    let y = u16::from_le_bytes([
+                        report.get(layout.y_at).copied().unwrap_or(0),
+                        report.get(layout.y_at + 1).copied().unwrap_or(0),
+                    ]) as u32;
+                    crate::drivers::mouse::push_usb_tablet(
+                        x.min(layout.x_max),
+                        y.min(layout.y_max),
+                        layout.x_max,
+                        layout.y_max,
+                        buttons,
+                    );
+                }
+                HidKind::None => {}
+            }
         } else {
             crate::serial_println!(
                 "[usb] xHCI HID xfer code {} slot {}",
@@ -1096,8 +1210,12 @@ crate::serial_println!(
             // Departed: tear down every slot owned by this root port so a
             // later plug can ENABLE_SLOT fresh instead of leaking slots.
             if self.slots.iter().any(|s| s.port == port) {
-                let ids: Vec<u32> =
-                    self.slots.iter().filter(|s| s.port == port).map(|s| s.id).collect();
+                let ids: Vec<u32> = self
+                    .slots
+                    .iter()
+                    .filter(|s| s.port == port)
+                    .map(|s| s.id)
+                    .collect();
                 for id in ids {
                     self.disable_slot(id);
                 }
@@ -1112,8 +1230,12 @@ crate::serial_println!(
         }
         // Drop stale unconfigured remnants for this port, then enumerate.
         if self.slots.iter().any(|s| s.port == port) {
-            let ids: Vec<u32> =
-                self.slots.iter().filter(|s| s.port == port).map(|s| s.id).collect();
+            let ids: Vec<u32> = self
+                .slots
+                .iter()
+                .filter(|s| s.port == port)
+                .map(|s| s.id)
+                .collect();
             for id in ids {
                 self.disable_slot(id);
             }
@@ -1127,8 +1249,9 @@ crate::serial_println!(
             return;
         };
         if self.identify(port, speed, None, 0, 0).is_some() {
-            // claim_hid_keyboards() is idempotent: skips claimed slots.
+            // Both claim passes are idempotent: skip claimed slots.
             self.claim_hid_keyboards();
+            self.claim_hid_pointers();
         }
     }
 
@@ -1440,10 +1563,7 @@ crate::serial_println!(
 
         // EP0 TR Dequeue Pointer + DCS=1.
         unsafe {
-            core::ptr::write_volatile(
-                (in_virt + ep0 + 0x08) as *mut u64,
-                ep0_phys | 1,
-            );
+            core::ptr::write_volatile((in_virt + ep0 + 0x08) as *mut u64, ep0_phys | 1);
         }
 
         // Average TRB Length.
@@ -1530,10 +1650,13 @@ crate::serial_println!(
             out_ctx_virt: out_virt,
             out_ctx_phys: out_phys,
             hid_claimed: false,
+            hid_kind: HidKind::None,
             hid_ep: 0,
             hid_dci: 0,
             hid_maxpacket: 0,
             hid_interval: 0,
+            hid_xfer_len: 8,
+            tablet_layout: None,
             int_virt: 0,
             int_phys: 0,
             int_idx: 0,
@@ -1638,7 +1761,13 @@ crate::serial_println!(
         let esz = self.ctx_size();
         let (in_virt, in_phys, out_virt, out_phys, maxp_cur) = {
             let s = &self.slots[idx];
-            (s.in_ctx_virt, s.in_ctx_phys, s.out_ctx_virt, s.out_ctx_phys, s.maxpacket0)
+            (
+                s.in_ctx_virt,
+                s.in_ctx_phys,
+                s.out_ctx_virt,
+                s.out_ctx_phys,
+                s.maxpacket0,
+            )
         };
         if maxp_cur == maxp {
             return true;
@@ -1884,7 +2013,7 @@ crate::serial_println!(
     /// HLT allows asynchronous USB completion work to run in the emulator.
     fn wait_xfer(&mut self, status_phys: u64, timeout_ms: usize) -> Option<(u32, u32)> {
         // Same IRQ-independent scheme as wait_completion (see above): PIT
-// channel 2 is the only clock that works with a dead legacy PIC.
+        // channel 2 is the only clock that works with a dead legacy PIC.
         let max_iters = timeout_ms.saturating_mul(50_000).max(500_000);
         let mut iters = 0usize;
 
@@ -1983,7 +2112,10 @@ crate::serial_println!(
             };
             // SET_PROTOCOL boot (0) â€” like EHCI; continue on fail.
             let setup_proto = setup_packet(0x21, 0x0B, 0, iface as u16, 0);
-            if self.control_xfer(idx, "hid-proto", setup_proto, 0).is_none() {
+            if self
+                .control_xfer(idx, "hid-proto", setup_proto, 0)
+                .is_none()
+            {
                 crate::println!(
                     "[usb] xHCI {:04x}:{:04x} SET_PROTOCOL failed, continuing",
                     vid,
@@ -2007,6 +2139,155 @@ crate::serial_println!(
                     "[usb] xHCI {:04x}:{:04x} HID claim failed (slot {})",
                     vid,
                     pid,
+                    slot_id
+                );
+            }
+        }
+    }
+
+    /// Number of claimed HID pointer endpoints (mice + tablets).
+    pub fn hid_pointer_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| {
+                s.hid_claimed && (s.hid_kind == HidKind::Mouse || s.hid_kind == HidKind::Tablet)
+            })
+            .count()
+    }
+
+    /// Claim all configured HID mice and tablets: boot mice get SET_PROTOCOL
+    /// + SET_IDLE like keyboards; tablets skip those (not boot devices) and
+    /// instead have their HID report descriptor fetched and parsed for the
+    /// absolute layout (QEMU-layout fallback, always logged). Called once
+    /// after `enumerate()`; safe to call again (skips claimed).
+    pub fn claim_hid_pointers(&mut self) {
+        let nslots = self.slots.len();
+        for idx in 0..nslots {
+            let (configured, claimed, vid, pid, slot_id) = {
+                let s = &self.slots[idx];
+                (s.configured, s.hid_claimed, s.vid, s.pid, s.id)
+            };
+            if !configured || claimed {
+                continue;
+            }
+            let (iface, ep_addr, max_raw, kind) = {
+                let s = &self.slots[idx];
+                if s.cfg.is_empty() {
+                    continue;
+                }
+                match find_hid_pointer(&s.cfg) {
+                    Some(v) => v,
+                    None => continue,
+                }
+            };
+            let binterval = {
+                let s = &self.slots[idx];
+                Self::hid_binterval(&s.cfg, ep_addr)
+            };
+            let (xfer_len, layout, label) = match kind {
+                HidPointerKind::BootMouse => {
+                    // SET_PROTOCOL boot (0); continue on fail like keyboards.
+                    let setup_proto = setup_packet(0x21, 0x0B, 0, iface as u16, 0);
+                    if self
+                        .control_xfer(idx, "hid-proto", setup_proto, 0)
+                        .is_none()
+                    {
+                        crate::println!(
+                            "[usb] xHCI {:04x}:{:04x} mouse SET_PROTOCOL failed, continuing",
+                            vid,
+                            pid
+                        );
+                    }
+                    let setup_idle = setup_packet(0x21, 0x0A, 0, iface as u16, 0);
+                    let _ = self.control_xfer(idx, "hid-idle", setup_idle, 0);
+                    (8u16, None, "mouse")
+                }
+                HidPointerKind::Tablet => {
+                    // Fetch the HID report descriptor (GET_DESCRIPTOR,
+                    // type 0x22) to learn the absolute layout for real
+                    // instead of assuming QEMU's. Dumped to serial so the
+                    // parsed result is always auditable.
+                    let setup_desc = setup_packet(0x81, 6, 0x2200, iface as u16, 255);
+                    let desc = self
+                        .control_xfer(idx, "hid-repdesc", setup_desc, 255)
+                        .unwrap_or_default();
+                    {
+                        let n = desc.len().min(64);
+                        let mut hex = [0u8; 64 * 3];
+                        let mut hlen = 0usize;
+                        for (k, b) in desc.iter().take(n).enumerate() {
+                            if k > 0 {
+                                hex[hlen] = b' ';
+                                hlen += 1;
+                            }
+                            const HEX: &[u8; 16] = b"0123456789abcdef";
+                            hex[hlen] = HEX[(b >> 4) as usize];
+                            hex[hlen + 1] = HEX[(b & 0x0F) as usize];
+                            hlen += 2;
+                        }
+                        let txt = core::str::from_utf8(&hex[..hlen]).unwrap_or("?");
+                        crate::serial_println!(
+                            "[usb] xHCI {:04x}:{:04x} tablet report desc[{}]: {}",
+                            vid,
+                            pid,
+                            desc.len(),
+                            txt
+                        );
+                    }
+                    match parse_tablet_layout(&desc) {
+                        Some(layout) => {
+                            crate::println!(
+                                "[usb] xHCI {:04x}:{:04x} tablet layout: btn@{}, X@{} max {}, Y@{} max {}, len {}",
+                                vid,
+                                pid,
+                                layout.buttons_at,
+                                layout.x_at,
+                                layout.x_max,
+                                layout.y_at,
+                                layout.y_max,
+                                layout.report_len
+                            );
+                            let len = (layout.report_len as u16).clamp(8, 64);
+                            (len, Some(layout), "tablet")
+                        }
+                        None => {
+                            let fb = TabletLayout::qm_fallback();
+                            crate::println!(
+                                "[usb] xHCI {:04x}:{:04x} tablet desc unparsed, QEMU fallback (X/Y max {})",
+                                vid,
+                                pid,
+                                fb.x_max
+                            );
+                            ((fb.report_len as u16).clamp(8, 64), Some(fb), "tablet*")
+                        }
+                    }
+                }
+            };
+
+            if self.configure_interrupt_ep(idx, iface, ep_addr, max_raw, binterval) {
+                {
+                    let s = &mut self.slots[idx];
+                    s.hid_kind = match kind {
+                        HidPointerKind::BootMouse => HidKind::Mouse,
+                        HidPointerKind::Tablet => HidKind::Tablet,
+                    };
+                    s.hid_xfer_len = xfer_len;
+                    s.tablet_layout = layout;
+                }
+                crate::println!(
+                    "[usb] xHCI {:04x}:{:04x} HID {} claimed (slot {}, ep {:#x})",
+                    vid,
+                    pid,
+                    label,
+                    slot_id,
+                    ep_addr
+                );
+            } else {
+                crate::println!(
+                    "[usb] xHCI {:04x}:{:04x} HID {} claim failed (slot {})",
+                    vid,
+                    pid,
+                    label,
                     slot_id
                 );
             }
@@ -2082,13 +2363,7 @@ crate::serial_println!(
         }
         let (slot_id, speed, in_virt, in_phys, out_virt) = {
             let s = &self.slots[idx];
-            (
-                s.id,
-                s.speed,
-                s.in_ctx_virt,
-                s.in_ctx_phys,
-                s.out_ctx_virt,
-            )
+            (s.id, s.speed, s.in_ctx_virt, s.in_ctx_phys, s.out_ctx_virt)
         };
         // Allocate interrupt transfer ring + HID report buffer (leaked).
         let (int_virt, int_phys, _) = match dma_page() {
@@ -2143,8 +2418,8 @@ crate::serial_println!(
             let dev_info = Self::ctx_r32(in_virt, esz);
             let old_last = (dev_info >> SLOT_LAST_CTX_SHIFT) & 0x1F;
             let new_last = old_last.max(dci);
-            let dev_info = (dev_info & !(0x1F << SLOT_LAST_CTX_SHIFT))
-                | (new_last << SLOT_LAST_CTX_SHIFT);
+            let dev_info =
+                (dev_info & !(0x1F << SLOT_LAST_CTX_SHIFT)) | (new_last << SLOT_LAST_CTX_SHIFT);
             Self::ctx_w32(in_virt, esz, dev_info);
         }
         // Copy EP0 context (output DCI1 at esz) -> input (esz*2).
@@ -2226,12 +2501,19 @@ crate::serial_println!(
 
     /// Enqueue one interrupt-IN Normal TRB and ring the endpoint doorbell.
     fn prime_interrupt(&mut self, idx: usize) -> bool {
-        let (int_virt, int_phys, buf_phys, slot_id, dci) = {
+        let (int_virt, int_phys, buf_phys, slot_id, dci, xfer_len) = {
             let s = &self.slots[idx];
             if !s.hid_claimed || s.int_virt == 0 || s.hid_buf_phys == 0 {
                 return false;
             }
-            (s.int_virt, s.int_phys, s.hid_buf_phys, s.id, s.hid_dci)
+            (
+                s.int_virt,
+                s.int_phys,
+                s.hid_buf_phys,
+                s.id,
+                s.hid_dci,
+                s.hid_xfer_len,
+            )
         };
         let (mut ei, mut cy) = {
             let s = &self.slots[idx];
@@ -2244,7 +2526,7 @@ crate::serial_println!(
             &mut cy,
             (buf_phys & 0xFFFF_FFFF) as u32,
             (buf_phys >> 32) as u32,
-            8,
+            (xfer_len as u32).clamp(8, 64),
             TRB_IOC | (TRB_NORMAL << TRB_TYPE_SHIFT),
         );
         {
@@ -2260,4 +2542,3 @@ crate::serial_println!(
         true
     }
 }
-

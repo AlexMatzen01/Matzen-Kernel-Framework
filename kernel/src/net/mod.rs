@@ -4,17 +4,32 @@
 
 //! Network stack implementation
 
-pub mod ethernet;
 pub mod arp;
-pub mod ip;
+pub mod debug;
+pub mod dns;
+#[cfg(feature = "net_tls")]
+pub mod entropy;
+pub mod ethernet;
+pub(crate) mod http;
 pub mod icmp;
-pub mod udp;
+pub mod ip;
+pub mod speedtest;
 pub mod tcp;
+#[cfg(feature = "net_tls")]
+pub mod tls;
+#[cfg(not(feature = "net_tls"))]
+#[path = "tls_stub.rs"]
+pub mod tls;
+pub mod udp;
+pub mod wget;
 
-use alloc::vec::Vec;
-use spin::Mutex;
-use lazy_static::lazy_static;
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+use lazy_static::lazy_static;
+use spin::Mutex;
+
+const MAX_RX_QUEUE: usize = 64;
+const MAX_RX_PER_PUMP: usize = 64;
 
 lazy_static! {
     static ref RX_QUEUE: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
@@ -25,16 +40,21 @@ pub fn init() {
 }
 
 pub fn process_packets() {
-    // Receive packets from driver
-    let mut packet_count = 0;
-    while let Some(packet) = crate::drivers::e1000::receive_packet() {
-        packet_count += 1;
+    for _ in 0..MAX_RX_PER_PUMP {
+        let Some(packet) = crate::drivers::e1000::receive_packet() else {
+            break;
+        };
         crate::serial_println!("RX: Received packet {} bytes", packet.len());
-        RX_QUEUE.lock().push_back(packet);
+        let mut queue = RX_QUEUE.lock();
+        if queue.len() >= MAX_RX_QUEUE {
+            queue.pop_front();
+        }
+        queue.push_back(packet);
     }
 
-    // Process received packets
-    while let Some(packet) = RX_QUEUE.lock().pop_front() {
+    for _ in 0..MAX_RX_PER_PUMP {
+        let packet = { RX_QUEUE.lock().pop_front() };
+        let Some(packet) = packet else { break };
         crate::serial_println!("Processing packet {} bytes", packet.len());
         ethernet::process_packet(&packet);
     }
