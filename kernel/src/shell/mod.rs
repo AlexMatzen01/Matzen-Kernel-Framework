@@ -1919,6 +1919,71 @@ pub fn write_file_contents(
     }
 }
 
+pub fn create_download_staging_file(
+    destination: &str,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) -> Result<alloc::string::String, &'static str> {
+    static NEXT_STAGING_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let mut guard = FILESYSTEM.lock();
+    let fs = guard.as_mut().ok_or("Filesystem not mounted")?;
+    let destination = destination.trim();
+    if destination.is_empty() || destination.ends_with('/') {
+        return Err("Invalid destination path");
+    }
+    let parent = match destination.rfind('/') {
+        Some(0) => "/",
+        Some(index) => &destination[..index],
+        None => ".",
+    };
+    for _ in 0..32 {
+        let id = NEXT_STAGING_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let name = alloc::format!(".wget-{:x}-{:x}.part", monotonic_ms(), id);
+        let path = if parent == "/" {
+            alloc::format!("/{}", name)
+        } else if parent == "." {
+            name
+        } else {
+            alloc::format!("{}/{}", parent, name)
+        };
+        match fs.create_file(device, &path) {
+            Ok(_) => return Ok(path),
+            Err("File already exists") => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err("Unable to create download staging file")
+}
+
+pub fn append_file_contents(
+    name: &str,
+    data: &[u8],
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) -> Result<(), &'static str> {
+    let mut guard = FILESYSTEM.lock();
+    let fs = guard.as_mut().ok_or("Filesystem not mounted")?;
+    let inode = fs.resolve_file_or_dir(device, name)?;
+    fs.append_file_by_inode(device, inode, data)
+}
+
+pub fn remove_file_contents(
+    name: &str,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) -> Result<(), &'static str> {
+    let mut guard = FILESYSTEM.lock();
+    let fs = guard.as_mut().ok_or("Filesystem not mounted")?;
+    fs.delete_file(device, name)
+}
+
+pub fn promote_download_file(
+    staging: &str,
+    destination: &str,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) -> Result<(), &'static str> {
+    let mut guard = FILESYSTEM.lock();
+    let fs = guard.as_mut().ok_or("Filesystem not mounted")?;
+    fs.rename_file(device, staging, destination)
+}
+
 // ── GUI bridge (shared by desktop File Explorer + Drive apps) ─────
 // These wrap the same FILESYSTEM + AtaBlockDevice logic as the CLI
 // commands so shell and desktop stay in sync. All helpers create

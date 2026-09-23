@@ -377,7 +377,7 @@ pub fn draw_help_ansi(scroll: usize) {
         "  ESC or ^G to close help",
         "",
         " Status bar shows filename, modified [*], and line/col.",
-        " Files limited to 6144 bytes (12 blocks) by SimplFS.",
+        " File size is limited by free disk space.",
         "",
         " Press any key to continue... (ESC/^G/^X to exit help)",
     ];

@@ -221,14 +221,29 @@ pub fn _print(args: fmt::Arguments) {
 }
 
 /// Serial print macro
+#[cfg(not(test))]
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => ($crate::drivers::serial::_print(format_args!($($arg)*)));
 }
 
+#[cfg(test)]
+#[macro_export]
+macro_rules! serial_print {
+    ($($arg:tt)*) => (std::print!($($arg)*));
+}
+
 /// Serial println macro
+#[cfg(not(test))]
 #[macro_export]
 macro_rules! serial_println {
     () => ($crate::serial_print!("\n"));
     ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)));
+}
+
+#[cfg(test)]
+#[macro_export]
+macro_rules! serial_println {
+    () => (std::println!());
+    ($($arg:tt)*) => (std::println!($($arg)*));
 }

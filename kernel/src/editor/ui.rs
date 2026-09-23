@@ -438,7 +438,7 @@ pub fn show_help_overlay() {
         " Status bar shows filename, modified [*], and line/col.",
         " Edit area shows $ at edges when line scrolled horizontally.",
         " Selection with mark is highlighted blue on white.",
-        " Files limited to 6144 bytes (12 blocks) by SimplFS.",
+        " File size is limited by free disk space.",
         "",
         " Press any key to continue... (ESC/^G/^X to exit help)",
     ];

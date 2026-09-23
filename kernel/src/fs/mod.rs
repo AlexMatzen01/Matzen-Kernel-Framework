@@ -27,6 +27,7 @@ pub const MAX_INODES: usize = 256;
 
 /// Maximum number of direct block pointers in an inode
 pub const INODE_DIRECT_BLOCKS: usize = 12;
+const INDIRECT_DATA_BLOCKS: usize = FS_BLOCK_SIZE / core::mem::size_of::<u64>() - 1;
 
 /// File types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +150,14 @@ impl Inode {
     pub fn get_type(&self) -> FileType {
         FileType::from(self.file_type)
     }
+
+    fn indirect_head(&self) -> u64 {
+        u64::from_le_bytes(self.reserved2[..8].try_into().unwrap())
+    }
+
+    fn set_indirect_head(&mut self, block: u64) {
+        self.reserved2[..8].copy_from_slice(&block.to_le_bytes());
+    }
 }
 
 /// Directory entry (64 bytes)
@@ -242,6 +251,8 @@ pub struct SimpleFilesystem {
     inodes: Vec<Inode>,
     current_dir_inode: u32,
     parent: Vec<Option<u32>>, // parent[inode] = Some(parent_inode)
+    allocated_blocks: Vec<u8>,
+    allocation_cursor: usize,
 }
 
 impl SimpleFilesystem {
@@ -276,6 +287,8 @@ impl SimpleFilesystem {
             inodes: Vec::new(),
             current_dir_inode: 0,
             parent: alloc::vec![None; MAX_INODES],
+            allocated_blocks: Vec::new(),
+            allocation_cursor: 0,
         }
     }
 
@@ -285,6 +298,11 @@ impl SimpleFilesystem {
 
         let total_blocks = device.block_count();
         let mut superblock = Superblock::new(total_blocks);
+        let data_block_start =
+            unsafe { core::ptr::addr_of!(superblock.data_block_start).read_unaligned() };
+        if total_blocks <= data_block_start {
+            return Err("Disk is too small for SimplFS");
+        }
 
         // Reserve 1 block for root directory
         unsafe {
@@ -361,6 +379,22 @@ impl SimpleFilesystem {
         if superblock.magic != Superblock::MAGIC {
             return Err("Invalid filesystem magic number");
         }
+        let stored_version = unsafe { core::ptr::addr_of!(superblock.version).read_unaligned() };
+        let stored_total = unsafe { core::ptr::addr_of!(superblock.total_blocks).read_unaligned() };
+        let stored_inode_blocks =
+            unsafe { core::ptr::addr_of!(superblock.inode_blocks).read_unaligned() };
+        let stored_data_start =
+            unsafe { core::ptr::addr_of!(superblock.data_block_start).read_unaligned() };
+        let minimum_inode_blocks =
+            (MAX_INODES * core::mem::size_of::<Inode>()).div_ceil(FS_BLOCK_SIZE);
+        if stored_version != Superblock::VERSION
+            || stored_total > device.block_count()
+            || (stored_inode_blocks as usize) < minimum_inode_blocks
+            || stored_data_start != 1 + stored_inode_blocks as u64
+            || stored_data_start >= stored_total
+        {
+            return Err("Invalid filesystem geometry");
+        }
 
         // Read inode table
         let inode_table_size = (superblock.inode_blocks as usize) * FS_BLOCK_SIZE;
@@ -386,7 +420,10 @@ impl SimpleFilesystem {
             inodes,
             current_dir_inode: 0, // Start at root
             parent: alloc::vec![None; MAX_INODES],
+            allocated_blocks: Vec::new(),
+            allocation_cursor: 0,
         };
+        fs.rebuild_allocation_bitmap(device)?;
         // Rebuild parent map from directory entries
         // Ignore errors during rebuild (e.g., corrupted entries) — keep None
         let _ = fs.rebuild_parents(device);
@@ -603,6 +640,97 @@ impl SimpleFilesystem {
             }
         }
         Err("Entry not found")
+    }
+
+    fn rename_entry_in_dir(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        dir_inode: u32,
+        child_inode: u32,
+        name: &str,
+    ) -> Result<(), &'static str> {
+        Self::validate_component(name)?;
+        let dir = *self
+            .inodes
+            .get(dir_inode as usize)
+            .ok_or("Invalid inode number")?;
+        for i in 0..INODE_DIRECT_BLOCKS {
+            let block = unsafe { core::ptr::addr_of!(dir.direct_blocks[i]).read_unaligned() };
+            if block == 0 {
+                break;
+            }
+            let mut buffer = [0u8; FS_BLOCK_SIZE];
+            device.read_blocks(block, 1, &mut buffer)?;
+            let entry_count = FS_BLOCK_SIZE / core::mem::size_of::<DirectoryEntry>();
+            for entry_index in 0..entry_count {
+                let offset = entry_index * core::mem::size_of::<DirectoryEntry>();
+                let entry = unsafe {
+                    core::ptr::read_unaligned(buffer.as_ptr().add(offset) as *const DirectoryEntry)
+                };
+                if entry.is_used() && entry.inode_number == child_inode {
+                    let replacement = DirectoryEntry::new_with_name(name, child_inode);
+                    unsafe {
+                        core::ptr::write_unaligned(
+                            buffer.as_mut_ptr().add(offset) as *mut DirectoryEntry,
+                            replacement,
+                        );
+                    }
+                    device.write_blocks(block, 1, &buffer)?;
+                    return Ok(());
+                }
+            }
+        }
+        Err("Entry not found")
+    }
+
+    pub fn rename_file(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<(), &'static str> {
+        let source = self.resolve_file_or_dir(device, old_path)?;
+        if !self.is_file(source) {
+            return Err("Not a file");
+        }
+        let (source_parent, _) = self.resolve_parent_and_name(device, old_path)?;
+        let (target_parent, target_name) = self.resolve_parent_and_name(device, new_path)?;
+        if old_path == new_path {
+            return Ok(());
+        }
+
+        let target = self.find_entry_in_dir(device, target_parent, &target_name)?;
+        if let Some(target_inode) = target {
+            if target_inode == source {
+                return Ok(());
+            }
+            if !self.is_file(target_inode) {
+                return Err("Is a directory");
+            }
+            self.remove_entry_from_dir(device, target_parent, target_inode)?;
+            if source_parent == target_parent {
+                self.rename_entry_in_dir(device, source_parent, source, &target_name)?;
+            } else {
+                self.add_entry_to_dir(device, target_parent, &target_name, source)?;
+                self.remove_entry_from_dir(device, source_parent, source)?;
+            }
+            self.release_file_storage(device, target_inode as usize)?;
+            self.inodes[target_inode as usize] = Inode::new();
+            unsafe {
+                let free = core::ptr::addr_of!(self.superblock.free_inodes)
+                    .read_unaligned()
+                    .saturating_add(1);
+                core::ptr::addr_of_mut!(self.superblock.free_inodes).write_unaligned(free);
+            }
+        } else if source_parent == target_parent {
+            self.rename_entry_in_dir(device, source_parent, source, &target_name)?;
+        } else {
+            self.add_entry_to_dir(device, target_parent, &target_name, source)?;
+            self.remove_entry_from_dir(device, source_parent, source)?;
+        }
+
+        self.write_inodes(device)?;
+        self.write_superblock(device)
     }
 
     /// Resolve path to inode number (must be directory for intermediate components)
@@ -860,7 +988,7 @@ impl SimpleFilesystem {
             return Err("File exists");
         }
         let free_inode = self.find_free_inode().ok_or("No free inodes")?;
-        let free_block = self.find_free_data_block().ok_or("No free blocks")?;
+        let free_block = self.allocate_data_block().ok_or("No free blocks")?;
         let mut new_dir_inode = Inode::new_directory();
         new_dir_inode.size = 0;
         new_dir_inode.blocks_used = 1;
@@ -878,9 +1006,6 @@ impl SimpleFilesystem {
             let free_inodes_ptr = core::ptr::addr_of!(self.superblock.free_inodes) as *mut u32;
             let cur = core::ptr::read_unaligned(free_inodes_ptr);
             core::ptr::write_unaligned(free_inodes_ptr, cur.saturating_sub(1));
-            let free_blocks_ptr = core::ptr::addr_of!(self.superblock.free_blocks) as *mut u64;
-            let cur2 = core::ptr::read_unaligned(free_blocks_ptr);
-            core::ptr::write_unaligned(free_blocks_ptr, cur2.saturating_sub(1));
         }
         self.write_inodes(device)?;
         self.write_superblock(device)?;
@@ -932,16 +1057,19 @@ impl SimpleFilesystem {
         // Remove entry from parent
         self.remove_entry_from_dir(device, parent_inode, target_inode)?;
         // Free inode and block
-        let blocks_used = self.inodes[target_inode as usize].blocks_used;
+        let inode = self.inodes[target_inode as usize];
+        for i in 0..INODE_DIRECT_BLOCKS {
+            let block = unsafe { core::ptr::addr_of!(inode.direct_blocks[i]).read_unaligned() };
+            if block != 0 {
+                self.free_data_block(block);
+            }
+        }
         self.inodes[target_inode as usize] = Inode::new();
         self.parent[target_inode as usize] = None;
         unsafe {
             let free_inodes_ptr = core::ptr::addr_of!(self.superblock.free_inodes) as *mut u32;
             let cur = core::ptr::read_unaligned(free_inodes_ptr);
             core::ptr::write_unaligned(free_inodes_ptr, cur.saturating_add(1));
-            let free_blocks_ptr = core::ptr::addr_of!(self.superblock.free_blocks) as *mut u64;
-            let cur2 = core::ptr::read_unaligned(free_blocks_ptr);
-            core::ptr::write_unaligned(free_blocks_ptr, cur2.saturating_add(blocks_used as u64));
         }
         self.write_inodes(device)?;
         self.write_superblock(device)?;
@@ -1039,21 +1167,149 @@ impl SimpleFilesystem {
         None
     }
 
-    /// Find a free data block
-    fn find_free_data_block(&self) -> Option<u64> {
-        // Simple linear search from data block start
-        // In a real implementation, this would use a bitmap
+    fn data_region(&self) -> (u64, usize) {
         let start =
             unsafe { core::ptr::addr_of!(self.superblock.data_block_start).read_unaligned() };
         let total = unsafe { core::ptr::addr_of!(self.superblock.total_blocks).read_unaligned() };
-        let free = unsafe { core::ptr::addr_of!(self.superblock.free_blocks).read_unaligned() };
+        (
+            start,
+            total.saturating_sub(start).min(usize::MAX as u64) as usize,
+        )
+    }
 
-        if free > 0 {
-            // For simplicity, just allocate sequentially
-            Some(start + (total - start - free))
+    fn block_bit(&self, index: usize) -> bool {
+        self.allocated_blocks
+            .get(index / 8)
+            .map(|byte| byte & (1 << (index % 8)) != 0)
+            .unwrap_or(true)
+    }
+
+    fn set_block_bit(&mut self, index: usize, allocated: bool) -> bool {
+        let Some(byte) = self.allocated_blocks.get_mut(index / 8) else {
+            return false;
+        };
+        let mask = 1 << (index % 8);
+        let was_allocated = *byte & mask != 0;
+        if allocated {
+            *byte |= mask;
         } else {
-            None
+            *byte &= !mask;
         }
+        was_allocated
+    }
+
+    fn mark_block_allocated(&mut self, block: u64) {
+        let (start, count) = self.data_region();
+        if block >= start && block - start < count as u64 {
+            self.set_block_bit((block - start) as usize, true);
+        }
+    }
+
+    fn allocate_data_block(&mut self) -> Option<u64> {
+        let (start, count) = self.data_region();
+        if count == 0 || self.allocated_blocks.is_empty() {
+            return None;
+        }
+        for step in 0..count {
+            let index = (self.allocation_cursor + step) % count;
+            if !self.block_bit(index) {
+                self.set_block_bit(index, true);
+                self.allocation_cursor = (index + 1) % count;
+                unsafe {
+                    let free = core::ptr::addr_of!(self.superblock.free_blocks)
+                        .read_unaligned()
+                        .saturating_sub(1);
+                    core::ptr::addr_of_mut!(self.superblock.free_blocks).write_unaligned(free);
+                }
+                return Some(start + index as u64);
+            }
+        }
+        None
+    }
+
+    fn free_data_block(&mut self, block: u64) {
+        let (start, count) = self.data_region();
+        if block < start || block - start >= count as u64 {
+            return;
+        }
+        if self.set_block_bit((block - start) as usize, false) {
+            unsafe {
+                let free = core::ptr::addr_of!(self.superblock.free_blocks)
+                    .read_unaligned()
+                    .saturating_add(1);
+                core::ptr::addr_of_mut!(self.superblock.free_blocks).write_unaligned(free);
+            }
+            self.allocation_cursor = self.allocation_cursor.min((block - start) as usize);
+        }
+    }
+
+    fn rebuild_allocation_bitmap(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+    ) -> Result<(), &'static str> {
+        let (start, count) = self.data_region();
+        let bitmap_len = count.saturating_add(7) / 8;
+        self.allocated_blocks = Vec::new();
+        self.allocated_blocks
+            .try_reserve_exact(bitmap_len)
+            .map_err(|_| "Unable to allocate filesystem bitmap")?;
+        self.allocated_blocks.resize(bitmap_len, 0);
+        self.allocation_cursor = 0;
+
+        for inode_index in 0..self.inodes.len() {
+            let inode = self.inodes[inode_index];
+            for direct in 0..INODE_DIRECT_BLOCKS {
+                let block =
+                    unsafe { core::ptr::addr_of!(inode.direct_blocks[direct]).read_unaligned() };
+                if block != 0 {
+                    self.mark_block_allocated(block);
+                }
+            }
+            let mut indirect = inode.indirect_head();
+            for _ in 0..count {
+                if indirect == 0 || indirect < start || indirect - start >= count as u64 {
+                    break;
+                }
+                self.mark_block_allocated(indirect);
+                let mut buffer = [0u8; FS_BLOCK_SIZE];
+                device.read_blocks(indirect, 1, &mut buffer)?;
+                let next = u64::from_le_bytes(buffer[..8].try_into().unwrap());
+                for slot in 0..INDIRECT_DATA_BLOCKS {
+                    let offset = 8 + slot * core::mem::size_of::<u64>();
+                    let block = u64::from_le_bytes(buffer[offset..offset + 8].try_into().unwrap());
+                    if block != 0 {
+                        self.mark_block_allocated(block);
+                    }
+                }
+                indirect = next;
+            }
+        }
+
+        let used = (0..count).filter(|&index| self.block_bit(index)).count() as u64;
+        unsafe {
+            let free = (count as u64).saturating_sub(used);
+            core::ptr::addr_of_mut!(self.superblock.free_blocks).write_unaligned(free);
+        }
+        self.write_superblock(device)
+    }
+
+    fn read_indirect_block(
+        &self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        block: u64,
+    ) -> Result<[u8; FS_BLOCK_SIZE], &'static str> {
+        let mut buffer = [0u8; FS_BLOCK_SIZE];
+        device.read_blocks(block, 1, &mut buffer)?;
+        Ok(buffer)
+    }
+
+    fn write_indirect_block(
+        &self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        block: u64,
+        buffer: &[u8; FS_BLOCK_SIZE],
+    ) -> Result<(), &'static str> {
+        device.write_blocks(block, 1, buffer)
     }
 
     /// Reload inode table from disk
@@ -1104,6 +1360,33 @@ impl SimpleFilesystem {
         }
 
         Ok(())
+    }
+
+    fn write_inode(
+        &self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        inode_index: usize,
+    ) -> Result<(), &'static str> {
+        if inode_index >= self.inodes.len() {
+            return Err("Invalid inode number");
+        }
+        let inode_size = core::mem::size_of::<Inode>();
+        let byte_offset = inode_index * inode_size;
+        let table_block = byte_offset / FS_BLOCK_SIZE;
+        if table_block >= self.superblock.inode_blocks as usize {
+            return Err("Invalid inode table offset");
+        }
+        let slot_offset = byte_offset % FS_BLOCK_SIZE;
+        let mut buffer = [0u8; FS_BLOCK_SIZE];
+        device.read_blocks(1 + table_block as u64, 1, &mut buffer)?;
+        let inode_bytes = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::addr_of!(self.inodes[inode_index]) as *const u8,
+                inode_size,
+            )
+        };
+        buffer[slot_offset..slot_offset + inode_size].copy_from_slice(inode_bytes);
+        device.write_blocks(1 + table_block as u64, 1, &buffer)
     }
 
     /// Write superblock back to disk
@@ -1191,70 +1474,233 @@ impl SimpleFilesystem {
         file_inode_num: u32,
         data: &[u8],
     ) -> Result<(), &'static str> {
-        // Validate inode number
-        if file_inode_num as usize >= MAX_INODES {
-            return Err("Invalid inode number");
-        }
-
-        // Check if inode is actually used
-        let inode = &self.inodes[file_inode_num as usize];
-        if !inode.is_used() {
-            return Err("Inode not in use");
-        }
-
-        if data.len() > INODE_DIRECT_BLOCKS * FS_BLOCK_SIZE {
-            return Err("File too large");
-        }
-
-        // Calculate blocks needed
-        let blocks_needed = if data.is_empty() {
-            0
-        } else {
-            (data.len() + FS_BLOCK_SIZE - 1) / FS_BLOCK_SIZE
-        };
-
-        // Allocate blocks if needed
-        for i in 0..blocks_needed {
-            let inode = &self.inodes[file_inode_num as usize];
-            let block_num = unsafe { core::ptr::addr_of!(inode.direct_blocks[i]).read_unaligned() };
-
-            if block_num == 0 {
-                // Allocate new block
-                let new_block = self.find_free_data_block().ok_or("No free blocks")?;
-
-                // Now mutably borrow inode to update it
-                let inode_mut = &mut self.inodes[file_inode_num as usize];
-                inode_mut.direct_blocks[i] = new_block;
-
-                // Update superblock
-                unsafe {
-                    let free_blocks_ptr =
-                        core::ptr::addr_of!(self.superblock.free_blocks) as *mut u64;
-                    let current_val = core::ptr::read_unaligned(free_blocks_ptr);
-                    core::ptr::write_unaligned(free_blocks_ptr, current_val.saturating_sub(1));
-                }
+        self.truncate_file_by_inode(device, file_inode_num)?;
+        match self.append_file_by_inode(device, file_inode_num, data) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = self.truncate_file_by_inode(device, file_inode_num);
+                Err(error)
             }
         }
+    }
 
-        // Write data to blocks
-        let inode = &self.inodes[file_inode_num as usize];
-        for (i, chunk) in data.chunks(FS_BLOCK_SIZE).enumerate() {
-            let block_num = unsafe { core::ptr::addr_of!(inode.direct_blocks[i]).read_unaligned() };
-
-            let mut block_buffer = [0u8; FS_BLOCK_SIZE];
-            block_buffer[..chunk.len()].copy_from_slice(chunk);
-            device.write_blocks(block_num, 1, &block_buffer)?;
+    pub fn append_file_by_inode(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        file_inode_num: u32,
+        data: &[u8],
+    ) -> Result<(), &'static str> {
+        let index = file_inode_num as usize;
+        if index >= self.inodes.len() || self.inodes[index].get_type() != FileType::File {
+            return Err("Not a file");
+        }
+        let (_, count) = self.data_region();
+        let max_file_bytes = count
+            .checked_mul(FS_BLOCK_SIZE)
+            .ok_or("File size overflow")?;
+        let current_size =
+            usize::try_from(self.inodes[index].size).map_err(|_| "File too large")?;
+        let final_size = current_size
+            .checked_add(data.len())
+            .ok_or("File size overflow")?;
+        if final_size > max_file_bytes {
+            return Err("No free blocks");
         }
 
-        // Update inode metadata
-        let inode = &mut self.inodes[file_inode_num as usize];
-        inode.size = data.len() as u64;
-        inode.blocks_used = blocks_needed as u32;
+        let append_result = (|| {
+            let mut consumed = 0;
+            while consumed < data.len() {
+                let size = self.inodes[index].size as usize;
+                let logical_block = size / FS_BLOCK_SIZE;
+                let block_offset = size % FS_BLOCK_SIZE;
+                let block = self.ensure_file_block(device, index, logical_block)?;
+                let mut buffer = [0u8; FS_BLOCK_SIZE];
+                if block_offset != 0 {
+                    device.read_blocks(block, 1, &mut buffer)?;
+                }
+                let count = (FS_BLOCK_SIZE - block_offset).min(data.len() - consumed);
+                buffer[block_offset..block_offset + count]
+                    .copy_from_slice(&data[consumed..consumed + count]);
+                device.write_blocks(block, 1, &buffer)?;
+                self.inodes[index].size += count as u64;
+                consumed += count;
+            }
+            Ok::<(), &'static str>(())
+        })();
+        if let Err(error) = append_result {
+            let _ = self.write_inode(device, index);
+            let _ = self.write_superblock(device);
+            return Err(error);
+        }
 
-        // Write updates to disk
-        self.write_inodes(device)?;
-        self.write_superblock(device)?;
+        let data_blocks = (self.inodes[index].size as usize).div_ceil(FS_BLOCK_SIZE);
+        let direct_blocks = data_blocks.min(INODE_DIRECT_BLOCKS);
+        let indirect_blocks = data_blocks.saturating_sub(direct_blocks);
+        let metadata_blocks = indirect_blocks.div_ceil(INDIRECT_DATA_BLOCKS);
+        self.inodes[index].blocks_used = (data_blocks + metadata_blocks) as u32;
+        self.write_inode(device, index)?;
+        self.write_superblock(device)
+    }
 
+    pub fn truncate_file_by_inode(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        file_inode_num: u32,
+    ) -> Result<(), &'static str> {
+        let index = file_inode_num as usize;
+        if index >= self.inodes.len() || self.inodes[index].get_type() != FileType::File {
+            return Err("Not a file");
+        }
+        self.release_file_storage(device, index)?;
+        self.write_inode(device, index)?;
+        self.write_superblock(device)
+    }
+
+    fn ensure_file_block(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        inode_index: usize,
+        logical_block: usize,
+    ) -> Result<u64, &'static str> {
+        if logical_block < INODE_DIRECT_BLOCKS {
+            let existing = unsafe {
+                core::ptr::addr_of!(self.inodes[inode_index].direct_blocks[logical_block])
+                    .read_unaligned()
+            };
+            if existing != 0 {
+                return Ok(existing);
+            }
+            let block = self.allocate_data_block().ok_or("No free blocks")?;
+            let zero = [0u8; FS_BLOCK_SIZE];
+            if let Err(error) = device.write_blocks(block, 1, &zero) {
+                self.free_data_block(block);
+                return Err(error);
+            }
+            self.inodes[inode_index].direct_blocks[logical_block] = block;
+            return Ok(block);
+        }
+
+        let indirect_index = logical_block - INODE_DIRECT_BLOCKS;
+        let node_index = indirect_index / INDIRECT_DATA_BLOCKS;
+        let slot = indirect_index % INDIRECT_DATA_BLOCKS;
+        if self.inodes[inode_index].indirect_head() == 0 {
+            let root = self.allocate_data_block().ok_or("No free blocks")?;
+            let zero = [0u8; FS_BLOCK_SIZE];
+            if let Err(error) = device.write_blocks(root, 1, &zero) {
+                self.free_data_block(root);
+                return Err(error);
+            }
+            self.inodes[inode_index].set_indirect_head(root);
+        }
+
+        let mut node = self.inodes[inode_index].indirect_head();
+        for _ in 0..node_index {
+            let mut buffer = self.read_indirect_block(device, node)?;
+            let next = u64::from_le_bytes(buffer[..8].try_into().unwrap());
+            if next != 0 {
+                node = next;
+                continue;
+            }
+            let next = self.allocate_data_block().ok_or("No free blocks")?;
+            let zero = [0u8; FS_BLOCK_SIZE];
+            if let Err(error) = device.write_blocks(next, 1, &zero) {
+                self.free_data_block(next);
+                return Err(error);
+            }
+            buffer[..8].copy_from_slice(&next.to_le_bytes());
+            if let Err(error) = self.write_indirect_block(device, node, &buffer) {
+                self.free_data_block(next);
+                return Err(error);
+            }
+            node = next;
+        }
+
+        let mut buffer = self.read_indirect_block(device, node)?;
+        let offset = 8 + slot * core::mem::size_of::<u64>();
+        let existing = u64::from_le_bytes(buffer[offset..offset + 8].try_into().unwrap());
+        if existing != 0 {
+            return Ok(existing);
+        }
+        let block = self.allocate_data_block().ok_or("No free blocks")?;
+        let zero = [0u8; FS_BLOCK_SIZE];
+        if let Err(error) = device.write_blocks(block, 1, &zero) {
+            self.free_data_block(block);
+            return Err(error);
+        }
+        buffer[offset..offset + 8].copy_from_slice(&block.to_le_bytes());
+        if let Err(error) = self.write_indirect_block(device, node, &buffer) {
+            self.free_data_block(block);
+            return Err(error);
+        }
+        Ok(block)
+    }
+
+    fn file_block_at(
+        &self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        inode_index: usize,
+        logical_block: usize,
+    ) -> Result<Option<u64>, &'static str> {
+        if logical_block < INODE_DIRECT_BLOCKS {
+            let block = unsafe {
+                core::ptr::addr_of!(self.inodes[inode_index].direct_blocks[logical_block])
+                    .read_unaligned()
+            };
+            return Ok((block != 0).then_some(block));
+        }
+        let indirect_index = logical_block - INODE_DIRECT_BLOCKS;
+        let node_index = indirect_index / INDIRECT_DATA_BLOCKS;
+        let slot = indirect_index % INDIRECT_DATA_BLOCKS;
+        let mut node = self.inodes[inode_index].indirect_head();
+        for current_index in 0..=node_index {
+            if node == 0 {
+                return Ok(None);
+            }
+            let buffer = self.read_indirect_block(device, node)?;
+            let offset = 8 + slot * core::mem::size_of::<u64>();
+            if current_index == node_index {
+                let block = u64::from_le_bytes(buffer[offset..offset + 8].try_into().unwrap());
+                return Ok((block != 0).then_some(block));
+            }
+            node = u64::from_le_bytes(buffer[..8].try_into().unwrap());
+        }
+        Ok(None)
+    }
+
+    fn release_file_storage(
+        &mut self,
+        device: &mut dyn crate::drivers::block::BlockDevice,
+        inode_index: usize,
+    ) -> Result<(), &'static str> {
+        let inode = self.inodes[inode_index];
+        for i in 0..INODE_DIRECT_BLOCKS {
+            let block = unsafe { core::ptr::addr_of!(inode.direct_blocks[i]).read_unaligned() };
+            if block != 0 {
+                self.free_data_block(block);
+            }
+            self.inodes[inode_index].direct_blocks[i] = 0;
+        }
+        let mut node = inode.indirect_head();
+        let (_, max_nodes) = self.data_region();
+        for _ in 0..max_nodes {
+            if node == 0 {
+                break;
+            }
+            let buffer = self.read_indirect_block(device, node)?;
+            let next = u64::from_le_bytes(buffer[..8].try_into().unwrap());
+            for slot in 0..INDIRECT_DATA_BLOCKS {
+                let offset = 8 + slot * core::mem::size_of::<u64>();
+                let block = u64::from_le_bytes(buffer[offset..offset + 8].try_into().unwrap());
+                if block != 0 {
+                    self.free_data_block(block);
+                }
+            }
+            self.free_data_block(node);
+            node = next;
+        }
+        self.inodes[inode_index].set_indirect_head(0);
+        self.inodes[inode_index].size = 0;
+        self.inodes[inode_index].blocks_used = 0;
         Ok(())
     }
 
@@ -1283,16 +1729,16 @@ impl SimpleFilesystem {
             return Ok(Vec::new());
         }
 
-        let mut data = Vec::with_capacity(file_size);
-        let blocks_to_read = inode.blocks_used as usize;
+        let mut data = Vec::new();
+        data.try_reserve_exact(file_size)
+            .map_err(|_| "Unable to allocate file buffer")?;
+        let blocks_to_read = file_size.div_ceil(FS_BLOCK_SIZE);
 
         // Read data from blocks
         for i in 0..blocks_to_read {
-            let block_num = unsafe { core::ptr::addr_of!(inode.direct_blocks[i]).read_unaligned() };
-
-            if block_num == 0 {
-                break;
-            }
+            let Some(block_num) = self.file_block_at(device, file_inode_num as usize, i)? else {
+                return Err("File block map is incomplete");
+            };
 
             let mut block_buffer = [0u8; FS_BLOCK_SIZE];
             device.read_blocks(block_num, 1, &mut block_buffer)?;
@@ -1322,24 +1768,15 @@ impl SimpleFilesystem {
         // Need parent to remove entry
         let (parent_inode, _) = self.resolve_parent_and_name(device, trimmed)?;
         // Actually parent/name split already, but we have file_inode_num; do direct remove
-        let inode = &mut self.inodes[file_inode_num as usize];
-        let blocks_used = inode.blocks_used;
-        *inode = Inode::new(); // Clear to empty
-
         self.remove_entry_from_dir(device, parent_inode, file_inode_num)?;
+        self.release_file_storage(device, file_inode_num as usize)?;
+        self.inodes[file_inode_num as usize] = Inode::new();
 
         // Update superblock
         unsafe {
             let free_inodes_ptr = core::ptr::addr_of!(self.superblock.free_inodes) as *mut u32;
             let current_inodes = core::ptr::read_unaligned(free_inodes_ptr);
             core::ptr::write_unaligned(free_inodes_ptr, current_inodes.saturating_add(1));
-
-            let free_blocks_ptr = core::ptr::addr_of!(self.superblock.free_blocks) as *mut u64;
-            let current_blocks = core::ptr::read_unaligned(free_blocks_ptr);
-            core::ptr::write_unaligned(
-                free_blocks_ptr,
-                current_blocks.saturating_add(blocks_used as u64),
-            );
         }
 
         // Write updates to disk
@@ -1347,5 +1784,82 @@ impl SimpleFilesystem {
         self.write_superblock(device)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SimpleFilesystem, FS_BLOCK_SIZE};
+    use crate::drivers::block::{BlockDevice, RamDisk};
+
+    #[test]
+    fn file_data_round_trips_across_multiple_indirect_blocks() {
+        let mut disk = RamDisk::new(2048);
+        SimpleFilesystem::format(&mut disk).unwrap();
+        let mut fs = SimpleFilesystem::mount(&mut disk).unwrap();
+        let inode = fs.create_file(&mut disk, "/large.bin").unwrap();
+        let data_len = (12 + 63 + 5) * FS_BLOCK_SIZE + 137;
+        let data: alloc::vec::Vec<u8> = (0..data_len).map(|index| (index % 251) as u8).collect();
+
+        fs.write_file_by_inode(&mut disk, inode, &data).unwrap();
+        assert_eq!(fs.read_file(&mut disk, "/large.bin").unwrap(), data);
+    }
+
+    #[test]
+    fn deleting_indirect_file_releases_its_blocks() {
+        let mut disk = RamDisk::new(2048);
+        SimpleFilesystem::format(&mut disk).unwrap();
+        let mut fs = SimpleFilesystem::mount(&mut disk).unwrap();
+        let initial_free =
+            unsafe { core::ptr::addr_of!(fs.superblock.free_blocks).read_unaligned() };
+        let inode = fs.create_file(&mut disk, "/large.bin").unwrap();
+        let data = alloc::vec![0xA5; (12 + 70) * FS_BLOCK_SIZE];
+        fs.write_file_by_inode(&mut disk, inode, &data).unwrap();
+        fs.delete_file(&mut disk, "/large.bin").unwrap();
+        let final_free = unsafe { core::ptr::addr_of!(fs.superblock.free_blocks).read_unaligned() };
+        assert_eq!(final_free, initial_free);
+    }
+
+    #[test]
+    fn streamed_appends_promote_and_replace_destination() {
+        let mut disk = RamDisk::new(2048);
+        SimpleFilesystem::format(&mut disk).unwrap();
+        let mut fs = SimpleFilesystem::mount(&mut disk).unwrap();
+        let staging_inode = fs.create_file(&mut disk, "/download.part").unwrap();
+        let destination_inode = fs.create_file(&mut disk, "/download.bin").unwrap();
+        fs.write_file_by_inode(&mut disk, destination_inode, b"old contents")
+            .unwrap();
+
+        let first = alloc::vec![0x31; 781];
+        let second = alloc::vec![0x92; (12 + 67) * FS_BLOCK_SIZE];
+        let mut expected = first.clone();
+        expected.extend_from_slice(&second);
+        fs.append_file_by_inode(&mut disk, staging_inode, &first)
+            .unwrap();
+        fs.append_file_by_inode(&mut disk, staging_inode, &second)
+            .unwrap();
+        fs.rename_file(&mut disk, "/download.part", "/download.bin")
+            .unwrap();
+
+        assert_eq!(fs.read_file(&mut disk, "/download.bin").unwrap(), expected);
+        assert!(fs.read_file(&mut disk, "/download.part").is_err());
+    }
+
+    #[test]
+    fn failed_full_disk_append_can_be_cleaned_up() {
+        let mut disk = RamDisk::new(256);
+        SimpleFilesystem::format(&mut disk).unwrap();
+        let mut fs = SimpleFilesystem::mount(&mut disk).unwrap();
+        let initial_free =
+            unsafe { core::ptr::addr_of!(fs.superblock.free_blocks).read_unaligned() };
+        let inode = fs.create_file(&mut disk, "/download.part").unwrap();
+        let data = alloc::vec![0x7B; 190 * FS_BLOCK_SIZE];
+        assert_eq!(
+            fs.append_file_by_inode(&mut disk, inode, &data),
+            Err("No free blocks")
+        );
+        fs.delete_file(&mut disk, "/download.part").unwrap();
+        let final_free = unsafe { core::ptr::addr_of!(fs.superblock.free_blocks).read_unaligned() };
+        assert_eq!(final_free, initial_free);
     }
 }

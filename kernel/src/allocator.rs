@@ -8,7 +8,7 @@
 
 use linked_list_allocator::LockedHeap;
 
-#[global_allocator]
+#[cfg_attr(not(test), global_allocator)]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 /// Static heap buffer (512 KiB)

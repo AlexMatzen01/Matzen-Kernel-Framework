@@ -16,11 +16,6 @@ use super::interpreter;
 use super::version;
 use crate::shell::{clear_interrupt, is_interrupted};
 
-/// Upper bound for a `.class` file we attempt to handle. SimplFS caps
-/// files at 12 direct blocks (6144 bytes), so anything larger already
-/// failed at write/bundle time; this guard keeps the error clear.
-pub const MAX_CLASS_BYTES: usize = 12 * 512;
-
 /// Validate and execute a Java class.
 ///
 /// `data` is the raw `.class` bytes, `path` the guest path for messages,
@@ -28,16 +23,6 @@ pub const MAX_CLASS_BYTES: usize = 12 * 512;
 pub fn run_class(data: &[u8], path: &str, args: &[&str]) -> Result<i32, &'static str> {
     if data.is_empty() {
         return Err("Empty class file");
-    }
-    if data.len() > MAX_CLASS_BYTES {
-        crate::println!(
-            "[java] '{}' is {} bytes; SimplFS max is {} bytes.",
-            path,
-            data.len(),
-            MAX_CLASS_BYTES
-        );
-        crate::println!("  Split into smaller classes or wait for Phase 0 large-file support.");
-        return Err("Class file too large");
     }
     let info = class::parse_header(data)?;
 

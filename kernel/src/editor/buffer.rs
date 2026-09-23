@@ -104,7 +104,6 @@ impl TextBuffer {
         if lines.is_empty() {
             lines.push(Vec::new());
         }
-        // Cap total size: if file > 6144, truncate handled before; but lines already built
         Self {
             lines,
             cursor_row: 0,
@@ -840,9 +839,6 @@ impl TextBuffer {
             return Err("Filesystem not mounted");
         }
         let data = self.to_bytes();
-        if data.len() > crate::fs::INODE_DIRECT_BLOCKS * crate::fs::FS_BLOCK_SIZE {
-            return Err("File too large (max 6144 bytes)");
-        }
         // Use shell's helper to write – it creates if not exists
         let mut device = crate::drivers::block::AtaBlockDevice::new();
         crate::shell::write_file_contents(name, &data, &mut device)?;

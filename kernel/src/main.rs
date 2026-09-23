@@ -6,8 +6,8 @@
 //!
 //! This kernel provides a basic terminal interface that runs on bare metal x86_64.
 
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 #![feature(abi_x86_interrupt)]
 
 extern crate alloc;
@@ -37,6 +37,7 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     config
 };
 
+#[cfg(not(test))]
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 /// Main entry point for the kernel
@@ -163,6 +164,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 }
 
 /// Panic handler - prints error message and halts
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // Try to print to serial first (always works)

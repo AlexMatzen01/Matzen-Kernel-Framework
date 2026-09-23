@@ -26,8 +26,7 @@ java /apps/java/Hello.class
 ```
 
 The existing host bundler injects files under `apps/examples` into `/apps`.
-Use individual `.class` files until JAR/ZIP loading and large-file support are
-implemented.
+The runtime accepts `.class` files up to available filesystem and kernel memory.
 
 ## Phase 2 and Phase 3 status
 

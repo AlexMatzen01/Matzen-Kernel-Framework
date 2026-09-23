@@ -17,7 +17,7 @@
     },
     {
       "path": "target/extra-disk2.img",
-      "size": "32M",
+      "size": "4G",
       "boot": false
     }
   ]

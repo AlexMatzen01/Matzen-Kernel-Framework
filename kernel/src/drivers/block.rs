@@ -76,9 +76,10 @@ impl BlockDevice for AtaBlockDevice {
     }
 
     fn block_count(&self) -> u64 {
-        // Default to a reasonable size - this should be detected from the drive
-        // For now, assume 100MB (204800 sectors of 512 bytes)
-        204800
+        crate::drivers::ata::drive_info(1)
+            .filter(|info| info.exists)
+            .map(|info| info.total_sectors)
+            .unwrap_or(0)
     }
 }
 

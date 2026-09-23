@@ -11,9 +11,8 @@
 //! Usage: `wget [-td=5s|--timeout=5s] <http-url> <local-file>`
 //! URL format: `http(s)://<host>[:port][/path]` (default ports 80/443).
 //! Up to 3 HTTP(S) redirects are followed.
-//! Limits: response body capped at the SimplFS max file size
-//! (`INODE_DIRECT_BLOCKS * FS_BLOCK_SIZE`, currently 6144 bytes);
-//! larger files are refused gracefully before writing anything.
+//! Response bodies stream to a staged SimplFS file. The mounted disk's
+//! available blocks, rather than a fixed application limit, bound downloads.
 
 use super::http::{
     build_get, cleanup, connect_wait, find_headers_end, interrupted, is_chunked, now_ms,
@@ -24,8 +23,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use embedded_io::{Read, Write};
 
-/// Max savable body: SimplFS files are direct-blocks only.
-const MAX_FILE_BYTES: usize = crate::fs::INODE_DIRECT_BLOCKS * crate::fs::FS_BLOCK_SIZE;
 const WGET_TIMEOUT_MS: u64 = 25000;
 const MAX_PATH_LEN: usize = 128;
 /// Same-scheme redirects followed per invocation.
@@ -201,26 +198,174 @@ fn resolve_location(
 
 /// Outcome of one HTTP request: a complete body, or a redirect target.
 enum FetchResult {
-    Body(Vec<u8>),
+    Complete,
     Redirect(Vec<u8>),
+}
+
+#[derive(Clone, Copy)]
+enum ChunkState {
+    SizeLine,
+    Data(usize),
+    DataTerminator(u8),
+    Trailers,
+    Done,
+}
+
+struct ChunkedDecoder {
+    state: ChunkState,
+    line: Vec<u8>,
+}
+
+impl ChunkedDecoder {
+    fn new() -> Self {
+        Self {
+            state: ChunkState::SizeLine,
+            line: Vec::new(),
+        }
+    }
+
+    fn feed<F>(&mut self, bytes: &[u8], sink: &mut F) -> Result<(usize, bool), &'static str>
+    where
+        F: FnMut(&[u8]) -> Result<(), &'static str>,
+    {
+        let mut cursor = 0;
+        let mut output_bytes = 0usize;
+        while cursor < bytes.len() {
+            match self.state {
+                ChunkState::SizeLine => {
+                    let byte = bytes[cursor];
+                    cursor += 1;
+                    if byte == b'\n' {
+                        if self.line.last() == Some(&b'\r') {
+                            self.line.pop();
+                        }
+                        let line =
+                            core::str::from_utf8(&self.line).map_err(|_| "Invalid chunk size")?;
+                        let size = line.split(';').next().ok_or("Invalid chunk size")?.trim();
+                        if size.is_empty() || size.len() > 16 {
+                            return Err("Invalid chunk size");
+                        }
+                        let size =
+                            usize::from_str_radix(size, 16).map_err(|_| "Invalid chunk size")?;
+                        self.line.clear();
+                        self.state = if size == 0 {
+                            ChunkState::Trailers
+                        } else {
+                            ChunkState::Data(size)
+                        };
+                    } else if self.line.len() < 128 {
+                        self.line.push(byte);
+                    } else {
+                        return Err("HTTP chunk header too large");
+                    }
+                }
+                ChunkState::Data(remaining) => {
+                    let count = remaining.min(bytes.len() - cursor);
+                    sink(&bytes[cursor..cursor + count])?;
+                    cursor += count;
+                    output_bytes = output_bytes.saturating_add(count);
+                    self.state = if count == remaining {
+                        ChunkState::DataTerminator(0)
+                    } else {
+                        ChunkState::Data(remaining - count)
+                    };
+                }
+                ChunkState::DataTerminator(stage) => {
+                    let expected = if stage == 0 { b'\r' } else { b'\n' };
+                    if bytes[cursor] != expected {
+                        return Err("Invalid HTTP chunk terminator");
+                    }
+                    cursor += 1;
+                    self.state = if stage == 0 {
+                        ChunkState::DataTerminator(1)
+                    } else {
+                        ChunkState::SizeLine
+                    };
+                }
+                ChunkState::Trailers => {
+                    let byte = bytes[cursor];
+                    cursor += 1;
+                    if byte == b'\n' {
+                        if self.line.last() == Some(&b'\r') {
+                            self.line.pop();
+                        }
+                        if self.line.is_empty() {
+                            self.state = ChunkState::Done;
+                        } else {
+                            self.line.clear();
+                        }
+                    } else if self.line.len() < 4096 {
+                        self.line.push(byte);
+                    } else {
+                        return Err("HTTP trailers too large");
+                    }
+                }
+                ChunkState::Done => break,
+            }
+        }
+        Ok((output_bytes, matches!(self.state, ChunkState::Done)))
+    }
+
+    fn is_done(&self) -> bool {
+        matches!(self.state, ChunkState::Done)
+    }
+}
+
+fn stream_body<F>(
+    bytes: &[u8],
+    chunked: bool,
+    decoder: &mut Option<ChunkedDecoder>,
+    content_length: Option<u64>,
+    body_written: &mut u64,
+    sink: &mut F,
+) -> Result<(), &'static str>
+where
+    F: FnMut(&[u8]) -> Result<(), &'static str>,
+{
+    if chunked {
+        let decoder = decoder.get_or_insert_with(ChunkedDecoder::new);
+        let (written, _) = decoder.feed(bytes, sink)?;
+        *body_written = body_written.saturating_add(written as u64);
+    } else {
+        let available = content_length
+            .map(|length| length.saturating_sub(*body_written).min(usize::MAX as u64) as usize)
+            .unwrap_or(bytes.len());
+        let count = bytes.len().min(available);
+        if count > 0 {
+            sink(&bytes[..count])?;
+            *body_written = body_written.saturating_add(count as u64);
+        }
+    }
+    Ok(())
+}
+
+fn discard_staging_file(
+    staging: &mut Option<String>,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+) {
+    if let Some(path) = staging.take() {
+        let _ = crate::shell::remove_file_contents(&path, device);
+    }
 }
 
 fn is_redirect(code: u16) -> bool {
     matches!(code, 301 | 302 | 303 | 307 | 308)
 }
 
-/// Fetch a URL body into memory (capped), following no redirects.
-/// Redirect responses return `FetchResult::Redirect` for the caller.
-fn fetch_once(
+fn fetch_once<F>(
     secure: bool,
     host: &str,
     port: u16,
     path: &str,
     ip: [u8; 4],
     timeout_ms: u64,
-) -> Result<FetchResult, &'static str> {
+    sink: &mut F,
+) -> Result<FetchResult, &'static str>
+where
+    F: FnMut(&[u8]) -> Result<(), &'static str>,
+{
     if secure {
-        return fetch_https_once(host, port, path, ip, timeout_ms);
+        return fetch_https_once(host, port, path, ip, timeout_ms, sink);
     }
     let local = connect_wait(ip, port, core::cmp::min(CONNECT_TIMEOUT_MS, timeout_ms))?;
     let req = build_get(host, path);
@@ -230,17 +375,23 @@ fn fetch_once(
         let mut headers: Vec<u8> = Vec::new();
         let mut header_len: Option<usize> = None;
         let mut content_len: Option<u64> = None;
-        let mut body: Vec<u8> = Vec::new();
+        let mut chunked = false;
+        let mut chunk_decoder: Option<ChunkedDecoder> = None;
+        let mut body_written = 0u64;
         let mut last_data = now_ms();
         loop {
             pump();
             if let Some(chunk) = crate::net::tcp::read_data(local) {
                 last_data = now_ms();
                 if header_len.is_some() {
-                    if body.len() + chunk.len() > MAX_FILE_BYTES {
-                        return Err("File too large (limit 6144 bytes)");
-                    }
-                    body.extend_from_slice(&chunk);
+                    stream_body(
+                        &chunk,
+                        chunked,
+                        &mut chunk_decoder,
+                        content_len,
+                        &mut body_written,
+                        sink,
+                    )?;
                 } else {
                     headers.extend_from_slice(&chunk);
                     if headers.len() > MAX_HEADER + super::http::TCP_CHUNK
@@ -259,29 +410,33 @@ fn fetch_once(
                         if code != 200 {
                             return Err("Download failed (HTTP status)");
                         }
-                        if is_chunked(&headers[..end]) {
-                            return Err("Chunked encoding not supported");
-                        }
-                        content_len = parse_content_length(&headers[..end]);
-                        if let Some(cl) = content_len {
-                            if cl > MAX_FILE_BYTES as u64 {
-                                return Err("File too large (limit 6144 bytes)");
-                            }
-                        }
+                        chunked = is_chunked(&headers[..end]);
+                        content_len = if chunked {
+                            None
+                        } else {
+                            parse_content_length(&headers[..end])
+                        };
                         let rest = &headers[end..];
-                        if body.len() + rest.len() > MAX_FILE_BYTES {
-                            return Err("File too large (limit 6144 bytes)");
-                        }
-                        body.extend_from_slice(rest);
+                        stream_body(
+                            rest,
+                            chunked,
+                            &mut chunk_decoder,
+                            content_len,
+                            &mut body_written,
+                            sink,
+                        )?;
                         header_len = Some(end);
                         headers.truncate(end);
                     }
                 }
-                if let Some(cl) = content_len {
-                    if (body.len() as u64) >= cl && cl > 0 {
-                        body.truncate(cl as usize);
-                        break;
-                    }
+                if chunked
+                    && chunk_decoder
+                        .as_ref()
+                        .map(ChunkedDecoder::is_done)
+                        .unwrap_or(false)
+                    || content_len.map(|cl| body_written >= cl).unwrap_or(false)
+                {
+                    break;
                 }
             }
             if interrupted() {
@@ -292,10 +447,14 @@ fn fetch_once(
                 if header_len.is_none() {
                     return Err("Download timed out (no data)");
                 }
-                if let Some(cl) = content_len {
-                    if (body.len() as u64) < cl {
-                        return Err("Download incomplete (timeout)");
-                    }
+                if chunked
+                    && !chunk_decoder
+                        .as_ref()
+                        .map(ChunkedDecoder::is_done)
+                        .unwrap_or(false)
+                    || (!chunked && content_len.map(|cl| body_written < cl).unwrap_or(true))
+                {
+                    return Err("Download incomplete (timeout)");
                 }
                 break;
             }
@@ -306,10 +465,14 @@ fn fetch_once(
                         if header_len.is_none() {
                             return Err("Server closed connection (no data)");
                         }
-                        if let Some(cl) = content_len {
-                            if (body.len() as u64) < cl {
-                                return Err("Download incomplete (server closed)");
-                            }
+                        if chunked
+                            && !chunk_decoder
+                                .as_ref()
+                                .map(ChunkedDecoder::is_done)
+                                .unwrap_or(false)
+                            || content_len.map(|cl| body_written < cl).unwrap_or(false)
+                        {
+                            return Err("Download incomplete (server closed)");
                         }
                         break;
                     }
@@ -317,19 +480,23 @@ fn fetch_once(
                 _ => {}
             }
         }
-        Ok(FetchResult::Body(body))
+        Ok(FetchResult::Complete)
     })();
     cleanup(local);
     res
 }
 
-fn fetch_https_once(
+fn fetch_https_once<F>(
     host: &str,
     port: u16,
     path: &str,
     ip: [u8; 4],
     timeout_ms: u64,
-) -> Result<FetchResult, &'static str> {
+    sink: &mut F,
+) -> Result<FetchResult, &'static str>
+where
+    F: FnMut(&[u8]) -> Result<(), &'static str>,
+{
     let mut root_storage = Vec::new();
     root_storage.resize(2048, 0);
     let root = super::tls::load_default_root(&mut root_storage)?;
@@ -353,9 +520,11 @@ fn fetch_https_once(
         .map_err(|_| "TLS request failed")?;
 
     let mut headers = Vec::new();
-    let mut body = Vec::new();
     let mut header_len = None;
     let mut content_len = None;
+    let mut chunked = false;
+    let mut chunk_decoder: Option<ChunkedDecoder> = None;
+    let mut body_written = 0u64;
     let start = now_ms();
     let mut incoming = Vec::new();
     incoming.resize(super::http::TCP_CHUNK, 0);
@@ -368,10 +537,14 @@ fn fetch_https_once(
         }
         let chunk = &incoming[..count];
         if header_len.is_some() {
-            if body.len() + chunk.len() > MAX_FILE_BYTES {
-                return Err("File too large (limit 6144 bytes)");
-            }
-            body.extend_from_slice(chunk);
+            stream_body(
+                chunk,
+                chunked,
+                &mut chunk_decoder,
+                content_len,
+                &mut body_written,
+                sink,
+            )?;
         } else {
             headers.extend_from_slice(chunk);
             if headers.len() > MAX_HEADER + super::http::TCP_CHUNK
@@ -389,28 +562,33 @@ fn fetch_https_once(
                 if code != 200 {
                     return Err("Download failed (HTTP status)");
                 }
-                if is_chunked(&headers[..end]) {
-                    return Err("Chunked encoding not supported");
-                }
-                content_len = parse_content_length(&headers[..end]);
-                if let Some(cl) = content_len {
-                    if cl > MAX_FILE_BYTES as u64 {
-                        return Err("File too large (limit 6144 bytes)");
-                    }
-                }
+                chunked = is_chunked(&headers[..end]);
+                content_len = if chunked {
+                    None
+                } else {
+                    parse_content_length(&headers[..end])
+                };
                 let rest = &headers[end..];
-                if rest.len() > MAX_FILE_BYTES {
-                    return Err("File too large (limit 6144 bytes)");
-                }
-                body.extend_from_slice(rest);
+                stream_body(
+                    rest,
+                    chunked,
+                    &mut chunk_decoder,
+                    content_len,
+                    &mut body_written,
+                    sink,
+                )?;
                 header_len = Some(end);
+                headers.truncate(end);
             }
         }
-        if let Some(cl) = content_len {
-            if body.len() as u64 >= cl {
-                body.truncate(cl as usize);
-                break;
-            }
+        if chunked
+            && chunk_decoder
+                .as_ref()
+                .map(ChunkedDecoder::is_done)
+                .unwrap_or(false)
+            || content_len.map(|cl| body_written >= cl).unwrap_or(false)
+        {
+            break;
         }
         if interrupted() {
             return Err("Cancelled");
@@ -422,12 +600,16 @@ fn fetch_https_once(
     if header_len.is_none() {
         return Err("TLS response contained no HTTP headers");
     }
-    if let Some(cl) = content_len {
-        if (body.len() as u64) < cl {
-            return Err("Download incomplete");
-        }
+    if chunked
+        && !chunk_decoder
+            .as_ref()
+            .map(ChunkedDecoder::is_done)
+            .unwrap_or(false)
+        || content_len.map(|cl| body_written < cl).unwrap_or(false)
+    {
+        return Err("Download incomplete");
     }
-    Ok(FetchResult::Body(body))
+    Ok(FetchResult::Complete)
 }
 
 /// Entry point for `wget <http-url> <local-file>`.
@@ -449,7 +631,7 @@ pub fn cmd_run(args: &str) {
         crate::println!("  Requires mounted FS ('mount').");
         crate::println!("  Follows up to 3 HTTP(S) redirects.");
         crate::println!("  Timeout: -td=5s or --timeout=5s (also ms and m; default 25s).");
-        crate::println!("  Max file size 6144 bytes; larger files are refused.");
+        crate::println!("  Downloads stream to disk and are limited by free filesystem space.");
         crate::println!("  Ctrl+C cancels. Clock granularity is 10 ms.");
         return;
     }
@@ -492,33 +674,55 @@ pub fn cmd_run(args: &str) {
         port,
         path
     );
-    let mut body: Option<Vec<u8>> = None;
+    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut staging: Option<String> = None;
+    let mut downloaded = 0u64;
+    let mut complete = false;
     for hop in 0..=MAX_REDIRECTS {
         if interrupted() {
+            discard_staging_file(&mut staging, &mut device);
             crate::println!("wget cancelled.");
             crate::shell::clear_interrupt();
             return;
         }
         let elapsed = now_ms().saturating_sub(start);
         if elapsed >= timeout_ms {
+            discard_staging_file(&mut staging, &mut device);
             crate::println!("wget failed: operation timed out");
             return;
         }
-        match fetch_once(
-            secure,
-            &host,
-            port,
-            &path,
-            ip,
-            timeout_ms.saturating_sub(elapsed),
-        ) {
-            Ok(FetchResult::Body(data)) => {
-                body = Some(data);
+        let response = {
+            let mut sink = |bytes: &[u8]| {
+                if staging.is_none() {
+                    staging = Some(crate::shell::create_download_staging_file(
+                        dest,
+                        &mut device,
+                    )?);
+                }
+                let path = staging.as_ref().ok_or("Staging file unavailable")?;
+                crate::shell::append_file_contents(path, bytes, &mut device)?;
+                downloaded = downloaded.saturating_add(bytes.len() as u64);
+                Ok(())
+            };
+            fetch_once(
+                secure,
+                &host,
+                port,
+                &path,
+                ip,
+                timeout_ms.saturating_sub(elapsed),
+                &mut sink,
+            )
+        };
+        match response {
+            Ok(FetchResult::Complete) => {
+                complete = true;
                 break;
             }
             Ok(FetchResult::Redirect(loc)) => {
                 if hop >= MAX_REDIRECTS {
                     crate::println!("wget failed: Too many redirects");
+                    discard_staging_file(&mut staging, &mut device);
                     return;
                 }
                 match resolve_location(secure, &host, port, &path, &loc) {
@@ -540,6 +744,7 @@ pub fn cmd_run(args: &str) {
                             Ok(ip) => ip,
                             Err(e) => {
                                 crate::println!("DNS failed for '{}': {}", host, e);
+                                discard_staging_file(&mut staging, &mut device);
                                 return;
                             }
                         };
@@ -547,39 +752,77 @@ pub fn cmd_run(args: &str) {
                     }
                     Err(e) => {
                         crate::println!("wget failed: {}", e);
+                        discard_staging_file(&mut staging, &mut device);
                         return;
                     }
                 }
             }
             Err(e) => {
                 if interrupted() {
+                    discard_staging_file(&mut staging, &mut device);
                     crate::println!("wget cancelled.");
                     crate::shell::clear_interrupt();
                 } else {
+                    discard_staging_file(&mut staging, &mut device);
                     crate::println!("wget failed: {}", e);
                 }
                 return;
             }
         }
     }
-    let body = match body {
-        Some(b) => b,
-        None => {
-            crate::println!("wget failed: Too many redirects");
-            return;
-        }
-    };
+    if !complete {
+        discard_staging_file(&mut staging, &mut device);
+        crate::println!("wget failed: Too many redirects");
+        return;
+    }
     if interrupted() {
+        discard_staging_file(&mut staging, &mut device);
         crate::println!("wget cancelled.");
         crate::shell::clear_interrupt();
         return;
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
-    match crate::shell::write_file_contents(dest, &body, &mut device) {
-        Ok(()) => crate::println!("Saved {} bytes to '{}'", body.len(), dest),
-        Err(e) => crate::println!("Failed to save '{}': {}", dest, e),
+    if staging.is_none() {
+        match crate::shell::create_download_staging_file(dest, &mut device) {
+            Ok(path) => staging = Some(path),
+            Err(error) => {
+                crate::println!("Failed to create staging file: {}", error);
+                return;
+            }
+        }
+    }
+    let staged_path = staging.take().unwrap();
+    match crate::shell::promote_download_file(&staged_path, dest, &mut device) {
+        Ok(()) => crate::println!("Saved {} bytes to '{}'", downloaded, dest),
+        Err(error) => {
+            let _ = crate::shell::remove_file_contents(&staged_path, &mut device);
+            crate::println!("Failed to save '{}': {}", dest, error);
+        }
     }
     if interrupted() {
         crate::shell::clear_interrupt();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChunkedDecoder;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn chunked_decoder_handles_split_framing_and_trailers() {
+        let wire = b"4;ext=x\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Test: ok\r\n\r\n";
+        let mut decoder = ChunkedDecoder::new();
+        let mut decoded = Vec::new();
+        for byte in wire {
+            let (written, _) = decoder
+                .feed(core::slice::from_ref(byte), &mut |part| {
+                    decoded.extend_from_slice(part);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(written <= 1);
+        }
+        assert!(decoder.is_done());
+        assert_eq!(decoded, b"Wikipedia");
     }
 }
