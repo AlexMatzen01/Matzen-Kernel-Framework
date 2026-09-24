@@ -24,6 +24,7 @@ mod memory;
 mod net;
 mod pic;
 mod shell;
+mod sysinfo;
 mod time;
 
 use bootloader_api::config::Mapping;
@@ -184,6 +185,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     } else {
         net::init();
     }
+
+    drivers::nvidia::probe(phys_mem_offset);
 
     // Enable interrupts
     x86_64::instructions::interrupts::enable();

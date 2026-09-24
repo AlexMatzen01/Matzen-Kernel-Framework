@@ -355,7 +355,7 @@ fn cmd_help() {
     println!("  version   - Display kernel version");
     println!("  uptime    - Show system uptime");
     println!("  memory    - Display memory information");
-    println!("  cpuinfo   - Display CPU information");
+    println!("  cpuinfo   - Display CPU identity and topology");
     println!("  calc      - Calculator (e.g., 'calc 5 + 3')");
     println!("  color     - Change text color (green/white/cyan/yellow/red/blue/pink)");
     println!("  test      - Run system tests");
@@ -524,103 +524,32 @@ fn cmd_version() {
 fn cmd_cpuinfo() {
     println!("CPU Information:");
 
-    // Get vendor string using CPUID leaf 0
-    let vendor = get_cpu_vendor();
+    let (brand, brand_len, brand_present) = crate::sysinfo::cpu_brand();
+    let name = if brand_present && brand_len > 0 {
+        core::str::from_utf8(&brand[..brand_len]).unwrap_or("Unknown")
+    } else {
+        "Unknown"
+    };
+    println!("  Name: {}", name);
+
+    let vendor = crate::sysinfo::cpu_vendor_string();
     println!("  Vendor: {}", vendor);
 
-    // Get CPU features using CPUID leaf 1
-    let (family, model, stepping) = get_cpu_signature();
+    let (family, model, stepping, ..) = crate::sysinfo::cpu_signature();
     println!(
         "  Family: {}, Model: {}, Stepping: {}",
         family, model, stepping
     );
 
-    // Check for some common features
-    let features = get_cpu_features();
+    let topology = crate::sysinfo::cpu_topology();
+    match topology.physical_cores {
+        Some(cores) => println!("  Physical cores: {}", cores),
+        None => println!("  Physical cores: Unknown"),
+    }
+    println!("  Logical threads: {}", topology.logical_threads);
+
+    let features = crate::sysinfo::cpu_features();
     println!("  Features: {}", features);
-}
-
-/// Gets CPU vendor string from CPUID
-fn get_cpu_vendor() -> &'static str {
-    let ebx: u32;
-    let ecx: u32;
-    let edx: u32;
-
-    unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "mov {ebx:e}, ebx",
-            "pop rbx",
-            inout("eax") 0u32 => _,
-            ebx = out(reg) ebx,
-            out("ecx") ecx,
-            out("edx") edx,
-        );
-    }
-
-    // Vendor string is in EBX, EDX, ECX (in that order)
-    // Check for common vendors
-    if ebx == 0x756e6547 && edx == 0x49656e69 && ecx == 0x6c65746e {
-        "GenuineIntel"
-    } else if ebx == 0x68747541 && edx == 0x69746e65 && ecx == 0x444d4163 {
-        "AuthenticAMD"
-    } else {
-        "Unknown"
-    }
-}
-
-/// Gets CPU signature (family, model, stepping)
-fn get_cpu_signature() -> (u32, u32, u32) {
-    let eax: u32;
-
-    unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "pop rbx",
-            inout("eax") 1u32 => eax,
-            out("ecx") _,
-            out("edx") _,
-        );
-    }
-
-    let stepping = eax & 0xF;
-    let model = (eax >> 4) & 0xF;
-    let family = (eax >> 8) & 0xF;
-
-    (family, model, stepping)
-}
-
-/// Gets a string of CPU feature flags
-fn get_cpu_features() -> &'static str {
-    let ecx: u32;
-    let edx: u32;
-
-    unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "pop rbx",
-            inout("eax") 1u32 => _,
-            out("ecx") ecx,
-            out("edx") edx,
-        );
-    }
-
-    // Check for SSE2 (bit 26 of EDX)
-    let has_sse2 = (edx & (1 << 26)) != 0;
-    // Check for SSE3 (bit 0 of ECX)
-    let has_sse3 = (ecx & 1) != 0;
-    // Check for 64-bit (bit 29 of EDX via extended CPUID, but we know we're x86_64)
-
-    if has_sse3 && has_sse2 {
-        "SSE2 SSE3 x86_64"
-    } else if has_sse2 {
-        "SSE2 x86_64"
-    } else {
-        "x86_64"
-    }
 }
 
 /// Calculator command
@@ -819,7 +748,7 @@ fn cmd_test() {
 
     // Test 3: CPUID
     print!("  [TEST] CPUID:           ");
-    let vendor = get_cpu_vendor();
+    let vendor = crate::sysinfo::cpu_vendor_string();
     if vendor != "Unknown" {
         println!("PASS ({})", vendor);
     } else {

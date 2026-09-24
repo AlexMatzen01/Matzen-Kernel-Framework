@@ -15,6 +15,7 @@ pub mod fb;
 pub mod fb_gfx;
 pub mod keyboard;
 pub mod mouse;
+pub mod nvidia;
 pub mod pci;
 pub mod pit;
 pub mod pm_timer;

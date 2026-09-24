@@ -36,6 +36,7 @@ DEFAULTS = {
     "kernel": "target/x86_64-mfk/debug/mfk-kernel",
     "hypervisor": "qemu",       # qemu | vbox
     "firmware": "bios",         # bios | uefi
+    "ovmf_code": "OVMF/OVMF_CODE_4M.fd",
     "keyboard": "ps2",          # ps2 | ehci | xhci | uhci
     "bundle_apps": False,
     "data_disk_size": "10M",
@@ -43,12 +44,110 @@ DEFAULTS = {
     "vnc_port": 5900,           # VNC WebSocket port
     "web_ui": False,            # Launch noVNC web UI (implies vnc)
     "web_ui_port": 8084,        # Web UI HTTP port
+    "gpu_passthrough": "",
+    "gpu_audio": "",
+    "gpu_rom": "",
     "extras": [
         # {"path": "target/extra-disk.img", "size": "64M", "boot": False}
     ],
 }
 
 VALID_KBD = ("ps2", "ehci", "xhci", "uhci")
+
+
+def is_valid_pci_bdf(value: str) -> bool:
+    value = value.strip().lower()
+    if value.startswith("0000:"):
+        value = value[5:]
+    parts = value.split(":")
+    if len(parts) != 2:
+        return False
+    bus, device_function = parts
+    if len(bus) != 2 or "." not in device_function:
+        return False
+    device, function = device_function.split(".", 1)
+    if len(device) != 2 or len(function) != 1:
+        return False
+    try:
+        return (int(bus, 16) <= 0xFF
+                and int(device, 16) <= 0x1F
+                and int(function, 16) <= 7)
+    except ValueError:
+        return False
+
+
+def is_wsl2() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text().lower()
+    except OSError:
+        return False
+
+
+def normalize_gpu_config(cfg: dict) -> None:
+    for key in ("gpu_passthrough", "gpu_audio", "gpu_rom"):
+        value = str(cfg.get(key, "") or "").strip()
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            value = ""
+        cfg[key] = value
+    if cfg["gpu_passthrough"] and not is_valid_pci_bdf(cfg["gpu_passthrough"]):
+        cfg["gpu_passthrough"] = ""
+    if not cfg["gpu_passthrough"]:
+        cfg["gpu_audio"] = ""
+        cfg["gpu_rom"] = ""
+    if cfg["gpu_audio"] and not is_valid_pci_bdf(cfg["gpu_audio"]):
+        cfg["gpu_audio"] = ""
+    if cfg["gpu_passthrough"]:
+        cfg["hypervisor"] = "qemu"
+        cfg["firmware"] = "uefi"
+    if cfg["gpu_passthrough"] and is_wsl2():
+        out("[yellow]GPU passthrough is configured, but WSL2 does not expose raw PCI passthrough.[/yellow]")
+        out("[yellow]Use native Linux/VFIO or a Hyper-V Discrete Device Assignment VM for testing.[/yellow]")
+    if cfg["gpu_passthrough"] and os.name == "nt":
+        out("[yellow]GPU passthrough is configured, but native Windows does not support Linux vfio-pci passthrough.[/yellow]")
+        out("[yellow]Use QEMU's emulated GPU on Windows, or assign the GPU to a Hyper-V VM with DDA.[/yellow]")
+
+
+def gpu_passthrough_status(cfg: dict) -> str:
+    if not cfg.get("gpu_passthrough"):
+        return "OFF"
+    if is_wsl2():
+        return "BLOCKED (WSL2)"
+    if os.name == "nt":
+        return "BLOCKED (Windows)"
+    return "ON"
+
+
+def find_runner_binary() -> Path | None:
+    name = "mfk-runner.exe" if os.name == "nt" else "mfk-runner"
+    for profile in ("release", "debug"):
+        candidate = REPO_ROOT / "target" / profile / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def normalize_ovmf_config(cfg: dict) -> None:
+    value = str(cfg.get("ovmf_code", "") or "").strip()
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        value = ""
+    cfg["ovmf_code"] = value
+
+
+def resolve_ovmf_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
+
+
+def ovmf_status(cfg: dict) -> str:
+    value = cfg.get("ovmf_code", "")
+    if not value:
+        return "AUTO"
+    return "FOUND" if resolve_ovmf_path(value).is_file() else "MISSING"
+
 
 try:
     from rich.console import Console
@@ -85,6 +184,8 @@ def load_config() -> dict:
             out(f"[yellow]Warning: could not read {CONFIG_PATH}: {e}; using defaults.[/yellow]")
     # normalize extras (back-compat: entries without "bus" get "auto";
     # "auto" = first 2 on IDE, rest on virtio-blk, matching the runner)
+    normalize_gpu_config(cfg)
+    normalize_ovmf_config(cfg)
     norm = []
     for e in cfg.get("extras", []):
         if isinstance(e, dict) and e.get("path"):
@@ -145,6 +246,12 @@ def to_runner_args(cfg: dict) -> list[str]:
     if cfg.get("web_ui"):
         args.append("--web-ui")
         args.append(f"--web-ui-port={cfg.get('web_ui_port', 8084)}")
+    if cfg.get("gpu_passthrough"):
+        args.append(f"--gpu-passthrough={cfg['gpu_passthrough']}")
+        if cfg.get("gpu_audio"):
+            args.append(f"--gpu-audio={cfg['gpu_audio']}")
+        if cfg.get("gpu_rom"):
+            args.append(f"--gpu-rom={cfg['gpu_rom']}")
     for e in cfg.get("extras", []):
         args.append(f"--extra-disk={e['path']}")
         args.append(f"--extra-disk-size={e['size']}")
@@ -157,6 +264,16 @@ def to_runner_args(cfg: dict) -> list[str]:
     return args
 
 
+def runner_environment(cfg: dict) -> dict[str, str] | None:
+    env = os.environ.copy()
+    if cfg.get("firmware") == "uefi" and cfg.get("ovmf_code"):
+        path = resolve_ovmf_path(cfg["ovmf_code"])
+        if not path.is_file():
+            return None
+        env["OVMF_CODE"] = str(path)
+    return env
+
+
 def show_config(cfg: dict) -> None:
     if RICH:
         t = Table(title="MFK launch config (auto-saved to .mfk-launch.json)")
@@ -165,6 +282,8 @@ def show_config(cfg: dict) -> None:
         t.add_row("kernel", cfg["kernel"])
         t.add_row("hypervisor", cfg["hypervisor"])
         t.add_row("firmware", cfg["firmware"])
+        t.add_row("ovmf_code", cfg["ovmf_code"] or "AUTO")
+        t.add_row("ovmf_status", ovmf_status(cfg))
         t.add_row("keyboard", cfg["keyboard"])
         t.add_row("bundle_apps", str(cfg["bundle_apps"]))
         t.add_row("data_disk_size", cfg["data_disk_size"])
@@ -172,6 +291,10 @@ def show_config(cfg: dict) -> None:
         t.add_row("vnc_port", str(cfg["vnc_port"]))
         t.add_row("web_ui", "ON" if cfg["web_ui"] else "OFF")
         t.add_row("web_ui_port", str(cfg["web_ui_port"]))
+        t.add_row("gpu_passthrough", cfg["gpu_passthrough"] or "OFF")
+        t.add_row("gpu_audio", cfg["gpu_audio"] or "-")
+        t.add_row("gpu_rom", cfg["gpu_rom"] or "-")
+        t.add_row("gpu_status", gpu_passthrough_status(cfg))
         console.print(t)
         d = Table(title=f"Extra drives ({len(cfg['extras'])}/{MAX_EXTRAS}: "
                         f"{MAX_EXTRA_IDE} IDE + {MAX_EXTRA_VIRTIO} virtio)")
@@ -190,9 +313,16 @@ def show_config(cfg: dict) -> None:
                             title="Runner preview"))
     else:
         out("== MFK launch config ==")
-        for k in ("kernel", "hypervisor", "firmware", "keyboard",
-                  "bundle_apps", "data_disk_size", "vnc", "vnc_port", "web_ui", "web_ui_port"):
-            out(f"  {k}: {cfg[k]}")
+        for k in ("kernel", "hypervisor", "firmware", "ovmf_code", "ovmf_status", "keyboard",
+                  "bundle_apps", "data_disk_size", "vnc", "vnc_port", "web_ui", "web_ui_port",
+                  "gpu_passthrough", "gpu_audio", "gpu_rom", "gpu_status"):
+            if k == "ovmf_status":
+                value = ovmf_status(cfg)
+            elif k == "gpu_status":
+                value = gpu_passthrough_status(cfg)
+            else:
+                value = cfg[k]
+            out(f"  {k}: {value}")
         out(f"  extras ({len(cfg['extras'])}/{MAX_EXTRAS}: "
             f"{MAX_EXTRA_IDE} IDE + {MAX_EXTRA_VIRTIO} virtio):")
         for i, e in enumerate(cfg["extras"]):
@@ -317,6 +447,17 @@ def edit_value(label: str, current: str) -> str:
 
         value = input("> ").strip()
         return value if value else current
+    except (EOFError, KeyboardInterrupt):
+        return current
+
+
+def edit_optional_value(label: str, current: str) -> str:
+    clear_screen()
+    out(f"[bold]{label}[/bold]")
+    out(f"Current: {current or '(empty)'}")
+    out("Type a value and press Enter. Press Enter with no value to clear. Escape is not available here.")
+    try:
+        return input("> ").strip()
     except (EOFError, KeyboardInterrupt):
         return current
 
@@ -483,6 +624,10 @@ def menu_loop(cfg: dict) -> bool:
         "VNC port",
         "Web UI",
         "Web UI port",
+        "GPU passthrough",
+        "GPU audio BDF",
+        "GPU ROM path",
+        "OVMF code path",
         "Add extra drive",
         "Edit extra drive",
         "Remove extra drive",
@@ -510,6 +655,7 @@ def menu_loop(cfg: dict) -> bool:
             f"[bold]Firmware:[/bold] {cfg['firmware']}    "
             f"[bold]Keyboard:[/bold] {cfg['keyboard']}"
         )
+        out(f"[bold]OVMF code:[/bold] {cfg['ovmf_code'] or 'AUTO'} ({ovmf_status(cfg)})")
         out(
             f"[bold]Bundle apps:[/bold] {'ON' if cfg['bundle_apps'] else 'OFF'}    "
             f"[bold]Data disk:[/bold] {cfg['data_disk_size']}"
@@ -522,6 +668,11 @@ def menu_loop(cfg: dict) -> bool:
             f"[bold]Web UI:[/bold] {'ON' if cfg['web_ui'] else 'OFF'}    "
             f"[bold]Web UI port:[/bold] {cfg['web_ui_port']}"
         )
+        out(
+            f"[bold]GPU passthrough:[/bold] {gpu_passthrough_status(cfg)}    "
+            f"[bold]GPU audio:[/bold] {cfg['gpu_audio'] or '-'}"
+        )
+        out(f"[bold]GPU ROM:[/bold] {cfg['gpu_rom'] or '-'}")
         out(f"[bold]Kernel:[/bold] {cfg['kernel']}")
         out(f"[bold]Extra drives:[/bold] {len(cfg['extras'])}/{MAX_EXTRAS} "
             f"({MAX_EXTRA_IDE} IDE + {MAX_EXTRA_VIRTIO} virtio)")
@@ -550,19 +701,21 @@ def menu_loop(cfg: dict) -> bool:
             elif i == 9:
                 value = f" : {cfg['web_ui_port']}"
             elif i == 10:
-                value = ""
+                value = f" : {cfg['gpu_passthrough'] or 'OFF'}"
             elif i == 11:
-                value = ""
+                value = f" : {cfg['gpu_audio'] or '-'}"
             elif i == 12:
-                value = ""
+                value = f" : {cfg['gpu_rom'] or '-'}"
+            elif i == 13:
+                value = f" : {cfg['ovmf_code'] or 'AUTO'}"
             else:
                 value = ""
 
-            if i == 13:
+            if i == 17:
                 prefix_text = "▶ "
-            elif i == 14:
+            elif i == 18:
                 prefix_text = "💾 "
-            elif i == 15:
+            elif i == 19:
                 prefix_text = "✕ "
             else:
                 prefix_text = "  "
@@ -691,9 +844,44 @@ def menu_loop(cfg: dict) -> bool:
                 save_config(cfg)
 
             elif selected == 10:
-                add_extra_menu(cfg)
+                value = edit_optional_value("GPU passthrough BDF", cfg["gpu_passthrough"])
+                if value and is_valid_pci_bdf(value):
+                    cfg["gpu_passthrough"] = value
+                    cfg["hypervisor"] = "qemu"
+                    cfg["firmware"] = "uefi"
+                elif not value:
+                    cfg["gpu_passthrough"] = ""
+                    cfg["gpu_audio"] = ""
+                    cfg["gpu_rom"] = ""
+                else:
+                    out("[red]Invalid PCI BDF; previous value was kept.[/red]")
+                save_config(cfg)
 
             elif selected == 11:
+                value = edit_optional_value("GPU audio BDF", cfg["gpu_audio"])
+                if value and (not cfg["gpu_passthrough"] or not is_valid_pci_bdf(value)):
+                    out("[red]GPU audio requires a valid GPU passthrough BDF.[/red]")
+                elif value:
+                    cfg["gpu_audio"] = value
+                else:
+                    cfg["gpu_audio"] = ""
+                save_config(cfg)
+
+            elif selected == 12:
+                cfg["gpu_rom"] = edit_optional_value("GPU ROM path", cfg["gpu_rom"])
+                save_config(cfg)
+
+            elif selected == 13:
+                value = edit_optional_value("OVMF code path", cfg["ovmf_code"])
+                if value and not resolve_ovmf_path(value).is_file():
+                    out(f"[yellow]OVMF file not found yet: {value}[/yellow]")
+                cfg["ovmf_code"] = value
+                save_config(cfg)
+
+            elif selected == 14:
+                add_extra_menu(cfg)
+
+            elif selected == 15:
                 if not cfg["extras"]:
                     clear_screen()
                     out("[yellow]No extra drives yet.[/yellow]")
@@ -725,14 +913,14 @@ def menu_loop(cfg: dict) -> bool:
                         elif k == "escape":
                             break
 
-            elif selected == 12:
+            elif selected == 16:
                 remove_extra_menu(cfg)
 
-            elif selected == 13:
+            elif selected == 17:
                 save_config(cfg)
                 return True
 
-            elif selected == 14:
+            elif selected == 18:
                 save_config(cfg)
                 clear_screen()
                 out(f"[green]Saved to {CONFIG_PATH}[/green]")
@@ -740,19 +928,31 @@ def menu_loop(cfg: dict) -> bool:
                 out("Press any key to continue...")
                 read_key()
 
-            elif selected == 15:
+            elif selected == 19:
                 return False
 
 
 def launch(cfg: dict) -> int:
-    runner_bin = REPO_ROOT / "target" / "release" / "mfk-runner"
+    if cfg.get("gpu_passthrough") and is_wsl2():
+        out("[red]GPU passthrough is blocked under WSL2: raw PCI passthrough is unavailable.[/red]")
+        out("Use a native Linux host with VFIO, or a Hyper-V VM with Discrete Device Assignment.")
+        return 2
+    if cfg.get("gpu_passthrough") and os.name == "nt":
+        out("[red]GPU passthrough is unavailable on native Windows.[/red]")
+        out("Use QEMU's emulated GPU, or assign the GPU to a Hyper-V VM with Discrete Device Assignment.")
+        return 2
+    runner_env = runner_environment(cfg)
+    if runner_env is None:
+        out(f"[red]OVMF file not found: {cfg['ovmf_code']}[/red]")
+        return 2
+    runner_bin = find_runner_binary()
     runner_args = to_runner_args(cfg)
-    if runner_bin.exists():
+    if runner_bin is not None:
         cmd = [str(runner_bin)] + runner_args
     else:
-        cmd = ["cargo", "run", "-p", "mfk-runner", "--release", "--"] + runner_args
+        cmd = ["cargo", "run", "-p", "mfk-runner", "--bin", "mfk-runner", "--release", "--"] + runner_args
     out(f"[bold]Launching:[/bold] {' '.join(cmd)}")
-    return subprocess.call(cmd, cwd=str(REPO_ROOT))
+    return subprocess.call(cmd, cwd=str(REPO_ROOT), env=runner_env)
 
 
 def textual_app(cfg: dict):
@@ -773,6 +973,11 @@ def textual_app(cfg: dict):
                        ", ".join(e["path"] for e in cfg["extras"]) or "none"),
                 Static("Hypervisor: " + cfg["hypervisor"] + "  Firmware: " +
                        cfg["firmware"] + "  Kbd: " + cfg["keyboard"]),
+                Static("OVMF code: " + (cfg["ovmf_code"] or "AUTO") +
+                       " (" + ovmf_status(cfg) + ")"),
+                Static("GPU passthrough: " + gpu_passthrough_status(cfg) +
+                       "  BDF: " + (cfg["gpu_passthrough"] or "-") +
+                       "  Audio: " + (cfg["gpu_audio"] or "-")),
                 Static("Runner: mfk-runner " + " ".join(to_runner_args(cfg))),
                 Button("Launch", id="go", variant="success"),
                 Button("Quit (saved)", id="quit"),

@@ -33,7 +33,7 @@ echo   Kernel: %KERNEL_PATH%
 echo   Hypervisor: %HYPERVISOR%
 echo.
 
-cargo run -p mfk-runner --release -- %KERNEL_PATH% %HYPERVISOR%
+cargo run -p mfk-runner --bin mfk-runner --release -- %KERNEL_PATH% %HYPERVISOR%
 if errorlevel 1 (
     echo.
     echo ERROR: Runner failed

@@ -42,13 +42,17 @@ Matzen Kernel Framework (MFK)
 ```
 
 ### `cpuinfo`
-Display CPU information (vendor, model, features).
+Display CPU name, vendor, signature, topology, and features.
 
 ```bash
 mfk> cpuinfo
 CPU Information:
-  Vendor: GenuineIntel (or AuthenticAMD)
-  ...
+  Name: Intel(R) Core(TM) i7-...
+  Vendor: GenuineIntel
+  Family: 6, Model: 142, Stepping: 10
+  Physical cores: 8
+  Logical threads: 16
+  Features: FPU ...
 ```
 
 ## Display & Terminal

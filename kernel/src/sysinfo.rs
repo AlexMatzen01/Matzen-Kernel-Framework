@@ -174,8 +174,7 @@ pub fn region_kind_name(tag: u8, extra: u32, buf: &mut [u8; 32]) -> &str {
 
 // ── CPUID helpers ────────────────────────────────────────────
 
-/// Raw CPUID with subleaf 0. Returns (eax, ebx, ecx, edx).
-fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
+fn cpuid_subleaf(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     let eax: u32;
     let ebx: u32;
     let ecx: u32;
@@ -188,11 +187,16 @@ fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
             "pop rbx",
             inout("eax") leaf => eax,
             ebx = out(reg) ebx,
-            inout("ecx") 0u32 => ecx,
+            inout("ecx") subleaf => ecx,
             out("edx") edx,
         );
     }
     (eax, ebx, ecx, edx)
+}
+
+/// Raw CPUID with subleaf 0. Returns (eax, ebx, ecx, edx).
+fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
+    cpuid_subleaf(leaf, 0)
 }
 
 /// 12 raw vendor bytes in CPUID order (EBX, EDX, ECX).
@@ -227,6 +231,65 @@ pub fn cpu_max_basic() -> u32 {
 /// Maximum extended CPUID leaf (EAX from leaf 0x80000000).
 pub fn cpu_max_extended() -> u32 {
     cpuid(0x8000_0000).0
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuTopology {
+    pub logical_threads: u32,
+    pub physical_cores: Option<u32>,
+}
+
+fn topology_from_counts(
+    logical_threads: u32,
+    has_htt: bool,
+    threads_per_core: Option<u32>,
+) -> CpuTopology {
+    let logical_threads = if has_htt { logical_threads.max(1) } else { 1 };
+    let physical_cores = if !has_htt {
+        Some(1)
+    } else {
+        threads_per_core.and_then(|threads| {
+            if threads == 0 || logical_threads % threads != 0 {
+                None
+            } else {
+                Some(logical_threads / threads)
+            }
+        })
+    };
+    CpuTopology {
+        logical_threads,
+        physical_cores,
+    }
+}
+
+pub fn cpu_topology() -> CpuTopology {
+    let max_basic = cpu_max_basic();
+    if max_basic < 1 {
+        return CpuTopology {
+            logical_threads: 1,
+            physical_cores: Some(1),
+        };
+    }
+
+    let (_, ebx, _, edx) = cpuid(1);
+    let logical_threads = ((ebx >> 16) & 0xff) + 1;
+    let has_htt = edx & (1 << 28) != 0;
+    let threads_per_core = if max_basic >= 0x0000_000b {
+        let (eax, ebx, _, _) = cpuid_subleaf(0x0000_000b, 0);
+        if eax != 0 && eax & 0x1f == 1 {
+            let count = ebx & 0xffff;
+            if count == 0 {
+                None
+            } else {
+                Some(count)
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    topology_from_counts(logical_threads, has_htt, threads_per_core)
 }
 
 /// 48-byte CPU brand string (leaves 0x80000002..04).
@@ -408,4 +471,41 @@ pub fn record_app_exit(path: &str, exit_code: i32, elapsed_ms: u64) {
 /// Returns a copy of the last-app snapshot, if any app has run.
 pub fn last_app() -> Option<LastApp> {
     LAST_APP.lock().clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::topology_from_counts;
+
+    #[test]
+    fn topology_reports_single_threaded_cpu() {
+        assert_eq!(
+            topology_from_counts(1, false, None),
+            super::CpuTopology {
+                logical_threads: 1,
+                physical_cores: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn topology_divides_threads_by_smt_width() {
+        assert_eq!(
+            topology_from_counts(8, true, Some(2)),
+            super::CpuTopology {
+                logical_threads: 8,
+                physical_cores: Some(4),
+            }
+        );
+    }
+
+    #[test]
+    fn topology_rejects_zero_smt_width() {
+        assert_eq!(topology_from_counts(8, true, Some(0)).physical_cores, None);
+    }
+
+    #[test]
+    fn topology_rejects_uneven_thread_count() {
+        assert_eq!(topology_from_counts(7, true, Some(2)).physical_cores, None);
+    }
 }

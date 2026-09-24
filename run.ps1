@@ -33,6 +33,7 @@ Write-Host ""
 $runnerCmd = @(
     "run",
     "-p", "mfk-runner",
+    "--bin", "mfk-runner",
     "--release",
     "--",
     $KernelPath,

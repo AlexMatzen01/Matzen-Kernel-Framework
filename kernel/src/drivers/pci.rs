@@ -12,6 +12,7 @@ const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
 
 pub const PCI_VENDOR_INTEL: u16 = 0x8086;
+pub const PCI_VENDOR_NVIDIA: u16 = 0x10DE;
 
 pub struct PciDevice {
     pub bus: u8,
@@ -19,112 +20,83 @@ pub struct PciDevice {
     pub function: u8,
     pub vendor_id: u16,
     pub device_id: u16,
+    pub subsystem_vendor_id: u16,
+    pub subsystem_id: u16,
+    pub revision_id: u8,
     pub class_code: u8,
     pub subclass: u8,
     pub prog_if: u8,
     pub bar0: u32,
     pub bar1: u32,
+    pub bars: [u32; 6],
     pub irq_line: u8,
+}
+
+fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+    0x80000000u32
+        | ((bus as u32) << 16)
+        | ((device as u32) << 11)
+        | ((function as u32) << 8)
+        | ((offset as u32) & 0xFC)
+}
+
+fn read_config_at(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+    unsafe {
+        let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
+        let mut data_port = Port::<u32>::new(CONFIG_DATA);
+        addr_port.write(config_address(bus, device, function, offset));
+        data_port.read()
+    }
 }
 
 impl PciDevice {
     pub fn read_config(&self, offset: u8) -> u32 {
-        let address = 0x80000000u32
-            | ((self.bus as u32) << 16)
-            | ((self.device as u32) << 11)
-            | ((self.function as u32) << 8)
-            | ((offset as u32) & 0xFC);
+        read_config_at(self.bus, self.device, self.function, offset)
+    }
 
-        unsafe {
-            let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-            let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-            addr_port.write(address);
-            data_port.read()
+    pub fn from_address(bus: u8, device: u8, function: u8) -> Option<Self> {
+        let vendor_device = read_config_at(bus, device, function, 0x00);
+        let vendor_id = (vendor_device & 0xFFFF) as u16;
+        if vendor_id == 0xFFFF {
+            return None;
         }
+
+        let class_info = read_config_at(bus, device, function, 0x08);
+        let subsystem_info = read_config_at(bus, device, function, 0x2C);
+        let mut bars = [0u32; 6];
+        for (index, bar) in bars.iter_mut().enumerate() {
+            *bar = read_config_at(bus, device, function, 0x10 + (index as u8 * 4));
+        }
+
+        Some(Self {
+            bus,
+            device,
+            function,
+            vendor_id,
+            device_id: (vendor_device >> 16) as u16,
+            subsystem_vendor_id: (subsystem_info & 0xFFFF) as u16,
+            subsystem_id: (subsystem_info >> 16) as u16,
+            revision_id: (class_info & 0xFF) as u8,
+            class_code: ((class_info >> 24) & 0xFF) as u8,
+            subclass: ((class_info >> 16) & 0xFF) as u8,
+            prog_if: ((class_info >> 8) & 0xFF) as u8,
+            bar0: bars[0],
+            bar1: bars[1],
+            bars,
+            irq_line: (read_config_at(bus, device, function, 0x3C) & 0xFF) as u8,
+        })
     }
 }
 
 pub fn enumerate_devices() -> alloc::vec::Vec<PciDevice> {
     let mut devices = alloc::vec::Vec::new();
 
-    for bus in 0..256u16 {
+    for bus in 0..=255u8 {
         for device in 0..32u8 {
             for function in 0..8u8 {
-                let address = 0x80000000u32
-                    | ((bus as u32) << 16)
-                    | ((device as u32) << 11)
-                    | ((function as u32) << 8);
-
-                let vendor_device = unsafe {
-                    let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                    let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                    addr_port.write(address);
-                    data_port.read()
-                };
-
-                let vendor_id = (vendor_device & 0xFFFF) as u16;
-                let device_id = (vendor_device >> 16) as u16;
-
-                // Check if device exists (vendor ID != 0xFFFF)
-                if vendor_id == 0xFFFF {
-                    continue;
+                if let Some(pci) = PciDevice::from_address(bus, device, function) {
+                    devices.push(pci);
                 }
-
-                // Read class code
-                let class_info = unsafe {
-                    let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                    let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                    addr_port.write(address | 0x08);
-                    data_port.read()
-                };
-
-                let class_code = ((class_info >> 24) & 0xFF) as u8;
-                let subclass = ((class_info >> 16) & 0xFF) as u8;
-                let prog_if = ((class_info >> 8) & 0xFF) as u8;
-
-                // Read BAR0
-                let bar0 = unsafe {
-                    let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                    let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                    addr_port.write(address | 0x10);
-                    data_port.read()
-                };
-
-                // Read BAR1
-                let bar1 = unsafe {
-                    let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                    let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                    addr_port.write(address | 0x14);
-                    data_port.read()
-                };
-
-                // Read IRQ line
-                let irq_line = unsafe {
-                    let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                    let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                    addr_port.write(address | 0x3C);
-                    (data_port.read() & 0xFF) as u8
-                };
-
-                devices.push(PciDevice {
-                    bus: bus as u8,
-                    device,
-                    function,
-                    vendor_id,
-                    device_id,
-                    class_code,
-                    subclass,
-                    prog_if,
-                    bar0,
-                    bar1,
-                    irq_line,
-                });
             }
         }
     }
@@ -138,151 +110,22 @@ pub fn enumerate_bus(bus: u8) -> alloc::vec::Vec<PciDevice> {
     let mut devices = alloc::vec::Vec::new();
     for device in 0..32u8 {
         for function in 0..8u8 {
-            let address = 0x80000000u32
-                | ((bus as u32) << 16)
-                | ((device as u32) << 11)
-                | ((function as u32) << 8);
-
-            let vendor_device = unsafe {
-                let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                addr_port.write(address);
-                data_port.read()
-            };
-
-            let vendor_id = (vendor_device & 0xFFFF) as u16;
-            let device_id = (vendor_device >> 16) as u16;
-
-            if vendor_id == 0xFFFF {
-                continue;
+            if let Some(pci) = PciDevice::from_address(bus, device, function) {
+                devices.push(pci);
             }
-
-            let class_info = unsafe {
-                let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                addr_port.write(address | 0x08);
-                data_port.read()
-            };
-
-            let bar0 = unsafe {
-                let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                addr_port.write(address | 0x10);
-                data_port.read()
-            };
-
-            let bar1 = unsafe {
-                let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                addr_port.write(address | 0x14);
-                data_port.read()
-            };
-
-            let irq_line = unsafe {
-                let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                addr_port.write(address | 0x3C);
-                (data_port.read() & 0xFF) as u8
-            };
-
-            devices.push(PciDevice {
-                bus,
-                device,
-                function,
-                vendor_id,
-                device_id,
-                class_code: ((class_info >> 24) & 0xFF) as u8,
-                subclass: ((class_info >> 16) & 0xFF) as u8,
-                prog_if: ((class_info >> 8) & 0xFF) as u8,
-                bar0,
-                bar1,
-                irq_line,
-            });
         }
     }
     devices
 }
 
 pub fn find_device(vendor_id: u16, device_id: u16) -> Option<PciDevice> {
-    // Only scan first few buses to avoid slow boot
-    for bus in 0..8u16 {
+    for bus in 0..8u8 {
         for device in 0..32u8 {
             for function in 0..8u8 {
-                let address = 0x80000000u32
-                    | ((bus as u32) << 16)
-                    | ((device as u32) << 11)
-                    | ((function as u32) << 8);
-
-                let vendor_device = unsafe {
-                    let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                    let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                    addr_port.write(address);
-                    data_port.read()
-                };
-
-                let vid = (vendor_device & 0xFFFF) as u16;
-                let did = (vendor_device >> 16) as u16;
-
-                if vid == vendor_id && did == device_id {
-                    // Read class code
-                    let class_info = unsafe {
-                        let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                        let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                        addr_port.write(address | 0x08);
-                        data_port.read()
-                    };
-
-                    let class_code = ((class_info >> 24) & 0xFF) as u8;
-                    let subclass = ((class_info >> 16) & 0xFF) as u8;
-                    let prog_if = ((class_info >> 8) & 0xFF) as u8;
-
-                    // Read BAR0
-                    let bar0 = unsafe {
-                        let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                        let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                        addr_port.write(address | 0x10);
-                        data_port.read()
-                    };
-
-                    // Read BAR1
-                    let bar1 = unsafe {
-                        let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                        let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                        addr_port.write(address | 0x14);
-                        data_port.read()
-                    };
-
-                    // Read IRQ line
-                    let irq_line = unsafe {
-                        let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-                        let mut data_port = Port::<u32>::new(CONFIG_DATA);
-
-                        addr_port.write(address | 0x3C);
-                        (data_port.read() & 0xFF) as u8
-                    };
-
-                    return Some(PciDevice {
-                        bus: bus as u8,
-                        device,
-                        function,
-                        vendor_id: vid,
-                        device_id: did,
-                        class_code,
-                        subclass,
-                        prog_if,
-                        bar0,
-                        bar1,
-                        irq_line,
-                    });
+                if let Some(pci) = PciDevice::from_address(bus, device, function) {
+                    if pci.vendor_id == vendor_id && pci.device_id == device_id {
+                        return Some(pci);
+                    }
                 }
             }
         }
@@ -291,8 +134,72 @@ pub fn find_device(vendor_id: u16, device_id: u16) -> Option<PciDevice> {
     None
 }
 
-/// Returns true for USB xHCI controllers (class 0x0C, subclass 0x03, prog-if 0x30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PciCapability {
+    pub id: u8,
+    pub offset: u8,
+}
+
 impl PciDevice {
+    pub fn bar(&self, index: usize) -> Option<u32> {
+        self.bars.get(index).copied()
+    }
+
+    pub fn bar_base(&self, index: usize) -> Option<u64> {
+        let raw = self.bar(index)?;
+        if raw & 0x01 != 0 {
+            return None;
+        }
+        if raw & 0x06 == 0x04 {
+            let high = self.bar(index + 1)?;
+            Some(((raw & 0xFFFF_FFF0) as u64) | ((high as u64) << 32))
+        } else {
+            Some((raw & 0xFFFF_FFF0) as u64)
+        }
+    }
+
+    pub fn bar_is_io(&self, index: usize) -> bool {
+        self.bar(index).map(|raw| raw & 0x01 != 0).unwrap_or(true)
+    }
+
+    pub fn bar_is_64bit(&self, index: usize) -> bool {
+        self.bar(index)
+            .map(|raw| raw & 0x06 == 0x04)
+            .unwrap_or(false)
+    }
+
+    pub fn bar_is_prefetchable(&self, index: usize) -> bool {
+        self.bar(index).map(|raw| raw & 0x08 != 0).unwrap_or(false)
+    }
+
+    pub fn capability(&self, id: u8) -> Option<PciCapability> {
+        let status = self.read_config(0x06);
+        if status & (1 << 20) == 0 {
+            return None;
+        }
+
+        let mut offset = (self.read_config(0x34) & 0xFF) as u8;
+        let mut visited = 0;
+        while offset >= 0x40 && visited < 48 {
+            visited += 1;
+            let value = self.read_config(offset);
+            let shift = (offset & 0x03) * 8;
+            let capability_id = ((value >> shift) & 0xFF) as u8;
+            let next = ((value >> (shift + 8)) & 0xFF) as u8;
+            if capability_id == id {
+                return Some(PciCapability {
+                    id: capability_id,
+                    offset,
+                });
+            }
+            if next == offset || next < 0x40 {
+                break;
+            }
+            offset = next;
+        }
+        None
+    }
+
     pub fn is_xhci(&self) -> bool {
         self.class_code == 0x0c && self.subclass == 0x03 && self.prog_if == 0x30
     }
@@ -307,19 +214,8 @@ impl PciDevice {
         self.class_code == 0x0c && self.subclass == 0x03 && self.prog_if == 0x00
     }
 
-    /// BAR0 MMIO base as a 64-bit physical address. Handles 64-bit BARs via BAR1.
     pub fn mmio_base(&self) -> Option<u64> {
-        if self.bar0 & 0x01 != 0 {
-            return None; // I/O space, not memory
-        }
-        if self.bar0 & 0x06 == 0x04 {
-            // 64-bit BAR: upper half in BAR1.
-            let lo = (self.bar0 & 0xFFFF_FFF0) as u64;
-            let hi = (self.bar1 & 0xFFFF_FFFF) as u64;
-            Some(lo | (hi << 32))
-        } else {
-            Some((self.bar0 & 0xFFFF_FFF0) as u64)
-        }
+        self.bar_base(0)
     }
 
     /// Enable I/O space, memory space, and bus mastering in PCI COMMAND.

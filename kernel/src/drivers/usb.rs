@@ -406,11 +406,15 @@ pub fn init(phys_mem_offset: u64) {
             function: pci.function,
             vendor_id: pci.vendor_id,
             device_id: pci.device_id,
+            subsystem_vendor_id: pci.subsystem_vendor_id,
+            subsystem_id: pci.subsystem_id,
+            revision_id: pci.revision_id,
             class_code: pci.class_code,
             subclass: pci.subclass,
             prog_if: pci.prog_if,
             bar0: pci.bar0,
             bar1: pci.bar1,
+            bars: pci.bars,
             irq_line: pci.irq_line,
         };
         match EhciController::new(dev_copy, phys_mem_offset) {
@@ -461,11 +465,15 @@ pub fn init(phys_mem_offset: u64) {
             function: pci.function,
             vendor_id: pci.vendor_id,
             device_id: pci.device_id,
+            subsystem_vendor_id: pci.subsystem_vendor_id,
+            subsystem_id: pci.subsystem_id,
+            revision_id: pci.revision_id,
             class_code: pci.class_code,
             subclass: pci.subclass,
             prog_if: pci.prog_if,
             bar0: pci.bar0,
             bar1: pci.bar1,
+            bars: pci.bars,
             irq_line: pci.irq_line,
         };
         match XhciController::new(dev_copy, phys_mem_offset) {
