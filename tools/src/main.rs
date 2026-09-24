@@ -1414,7 +1414,8 @@ fn run_qemu_uefi(
 
     qemu.args([
         "-cpu",
-        "max",
+        "host",
+        "-enable-kvm",
 
         // Use the legacy PC machine because the kernel's disk driver uses
         // the legacy ATA PIO ports; Q35 exposes AHCI instead.

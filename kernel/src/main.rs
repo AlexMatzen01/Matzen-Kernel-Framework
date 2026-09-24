@@ -58,10 +58,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("VGA initialized");
 
     // Initialize heap allocator (required before fb init: fb uses alloc).
-    // The heap is carved from the memory map, NOT .bss: a 32 MiB static
-    // array balloons the kernel ELF and collides with bootloader mappings
-    // on real hardware (GDT frame PageAlreadyMapped panic). Carving is
-    // stack-only, so it runs before the heap exists.
+    // Carve the heap from the memory map instead of storing it in .bss to
+    // keep the kernel ELF compact and the carved range physically mapped.
     let (heap_phys, heap_size) =
         allocator::carve_heap_run(&boot_info.memory_regions, allocator::HEAP_SIZE as u64)
             .unwrap_or((0, 0));
