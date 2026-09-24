@@ -284,7 +284,7 @@ impl E1000 {
         self.tx_current = (self.tx_current + 1) % TX_DESC_COUNT;
         self.write_reg(REG_TXDESCTAIL, self.tx_current as u32);
 
-        crate::serial_println!(
+        crate::net_log!(
             "E1000: TX packet {} bytes, desc={}, tail={}",
             data.len(),
             desc_index,
@@ -315,7 +315,7 @@ impl E1000 {
             let errors =
                 unsafe { core::ptr::read_volatile(&self.rx_descriptors[desc_index].errors) };
             if length == 0 || length > BUFFER_SIZE || errors != 0 {
-                crate::serial_println!(
+                crate::net_log!(
                     "E1000: dropping invalid RX descriptor {} (length={}, status={:#x}, errors={:#x})",
                     desc_index,
                     length,
@@ -326,7 +326,7 @@ impl E1000 {
                 continue;
             }
 
-            crate::serial_println!(
+            crate::net_log!(
                 "E1000: RX descriptor {} has packet, length={}, status={:#x}",
                 desc_index,
                 length,

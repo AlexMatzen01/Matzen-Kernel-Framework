@@ -53,8 +53,8 @@ const DL_FILE: &str = "garbage.php";
 const UL_FILE: &str = "empty.php";
 const PING_FILE: &str = "empty.php";
 
-// Small single-stream profile (fits the 512 KiB heap by streaming and
-// the minimal TCP implementation without retransmission).
+// Small single-stream profile (streams to fit the kernel heap; minimal
+// TCP implementation without retransmission).
 const PING_SAMPLES: usize = 8;
 const PING_TIMEOUT_MS: u64 = 5000;
 const DOWNLOAD_CKSIZE_MB: u64 = 1;

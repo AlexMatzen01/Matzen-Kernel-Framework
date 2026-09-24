@@ -1,6 +1,6 @@
 # App runtime smoke test
-mkfs
-mount
+mkfs 1 --yes
+mount 1
 # script app via mkapp
 mkapp hello /apps/hello.app
 ls /apps

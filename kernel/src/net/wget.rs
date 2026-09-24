@@ -8,7 +8,7 @@
 //! header parsing) — no second stack. Saves the response body
 //! to SimplFS via `shell::write_file_contents`.
 //!
-//! Usage: `wget [-td=5s|--timeout=5s] <http-url> <local-file>`
+//! Usage: `wget [-td=5s|--td=5s|--timeout=5s] <http-url> <local-file>`
 //! URL format: `http(s)://<host>[:port][/path]` (default ports 80/443).
 //! Up to 3 HTTP(S) redirects are followed.
 //! Response bodies stream to a staged SimplFS file. The mounted disk's
@@ -55,13 +55,21 @@ fn parse_wget_args(args: &str) -> Result<(u64, String), &'static str> {
     for token in args.split_whitespace() {
         let value = token
             .strip_prefix("-td=")
+            .or_else(|| token.strip_prefix("--td="))
             .or_else(|| token.strip_prefix("--timeout="));
         if let Some(value) = value {
             timeout = parse_timeout(value)?;
             continue;
         }
-        if token == "-td" || token == "--timeout" {
+        if token == "-td" || token == "--td" || token == "--timeout" {
             return Err("timeout must use =, e.g. --timeout=5s");
+        }
+        // Anything else starting with '-' is an unknown option. Reject it
+        // instead of silently treating it as the URL/destination (that once
+        // swallowed `--td=120s`, leaving the default 25 s timeout in place
+        // and appending junk to the destination path).
+        if token.starts_with('-') {
+            return Err("unknown option (see 'wget --help')");
         }
         if !positional.is_empty() {
             positional.push(' ');
@@ -625,12 +633,12 @@ pub fn cmd_run(args: &str) {
     let args = args_cleaned.as_str();
     let args = args.trim();
     if args.is_empty() || args == "--help" || args == "-h" || args == "help" {
-        crate::println!("Usage: wget [-d|--debug] [-td=5s|--timeout=5s] <http-url> <local-file>");
+        crate::println!("Usage: wget [-d|--debug] [-td=5s|--td=5s|--timeout=5s] <http-url> <local-file>");
         crate::println!("  e.g. wget http://10.0.2.2:8000/hello.txt /docs/hello.txt");
         crate::println!("  HTTP works by default; HTTPS requires a net_tls-enabled build.");
         crate::println!("  Requires mounted FS ('mount').");
         crate::println!("  Follows up to 3 HTTP(S) redirects.");
-        crate::println!("  Timeout: -td=5s or --timeout=5s (also ms and m; default 25s).");
+        crate::println!("  Timeout: -td=5s, --td=5s or --timeout=5s (also ms and m; default 25s).");
         crate::println!("  Downloads stream to disk and are limited by free filesystem space.");
         crate::println!("  Ctrl+C cancels. Clock granularity is 10 ms.");
         return;
@@ -674,10 +682,24 @@ pub fn cmd_run(args: &str) {
         port,
         path
     );
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = crate::shell::mounted_device();
     let mut staging: Option<String> = None;
     let mut downloaded = 0u64;
     let mut complete = false;
+    // Create the staging file up front so an unwritable destination fails
+    // fast (before any networking) with the drive in the message.
+    match crate::shell::create_download_staging_file(dest, &mut device) {
+        Ok(path) => staging = Some(path),
+        Err(error) => {
+            crate::println!(
+                "wget: cannot write '{}' on drive {}: {}",
+                dest,
+                crate::shell::mounted_drive(),
+                error
+            );
+            return;
+        }
+    }
     for hop in 0..=MAX_REDIRECTS {
         if interrupted() {
             discard_staging_file(&mut staging, &mut device);
@@ -785,7 +807,12 @@ pub fn cmd_run(args: &str) {
         match crate::shell::create_download_staging_file(dest, &mut device) {
             Ok(path) => staging = Some(path),
             Err(error) => {
-                crate::println!("Failed to create staging file: {}", error);
+                crate::println!(
+                    "Failed to create staging file for '{}' on drive {}: {}",
+                    dest,
+                    crate::shell::mounted_drive(),
+                    error
+                );
                 return;
             }
         }
@@ -806,6 +833,7 @@ pub fn cmd_run(args: &str) {
 #[cfg(test)]
 mod tests {
     use super::ChunkedDecoder;
+    use super::{parse_wget_args, WGET_TIMEOUT_MS};
     use alloc::vec::Vec;
 
     #[test]
@@ -824,5 +852,35 @@ mod tests {
         }
         assert!(decoder.is_done());
         assert_eq!(decoded, b"Wikipedia");
+    }
+
+    #[test]
+    fn wget_timeout_flags_are_parsed() {
+        let (timeout, rest) = parse_wget_args("http://h/f /f").unwrap();
+        assert_eq!(timeout, WGET_TIMEOUT_MS);
+        assert_eq!(rest, "http://h/f /f");
+        let (timeout, rest) = parse_wget_args("-td=120s http://h/f /f").unwrap();
+        assert_eq!(timeout, 120_000);
+        assert_eq!(rest, "http://h/f /f");
+        let (timeout, rest) = parse_wget_args("http://h/f /f --td=2m").unwrap();
+        assert_eq!(timeout, 120_000);
+        assert_eq!(rest, "http://h/f /f");
+        let (timeout, _) = parse_wget_args("--timeout=500ms http://h/f /f").unwrap();
+        assert_eq!(timeout, 500);
+    }
+
+    #[test]
+    fn wget_unknown_option_is_rejected_not_swallowed() {
+        // `--td=` used to slip into the positional args: the timeout stayed
+        // at its default and junk got appended to the destination path.
+        assert!(parse_wget_args("http://h/f /f --td=120s").is_ok());
+        assert_eq!(
+            parse_wget_args("http://h/f /f --bogus=1"),
+            Err("unknown option (see 'wget --help')")
+        );
+        assert_eq!(
+            parse_wget_args("wget --td 5s").map(|_| ()),
+            Err("timeout must use =, e.g. --timeout=5s")
+        );
     }
 }

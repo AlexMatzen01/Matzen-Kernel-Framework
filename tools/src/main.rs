@@ -85,8 +85,12 @@ fn main() {
     // Extra drives from mfk_launch.py: --data-disk-size=10M plus repeatable
     // --extra-disk=<path> --extra-disk-size=<size> pairs in order, with an
     // optional --boot-extra-disk[=N] (1-based among extras, bare = first).
-    // QEMU legacy IDE only has room for 2 extras (index 2/secondary-master
-    // and index 3/secondary-slave); more need a virtio-blk guest driver.
+    // The first 2 extras use legacy IDE slots (index 2/secondary-master and
+    // index 3/secondary-slave); extras beyond that attach as virtio-blk-pci
+    // devices and appear in the guest as unified drive indices 4+ (needs the
+    // kernel virtio-blk driver, compiled in with the default `usb` feature).
+    const MAX_EXTRA_IDE: usize = 2;
+    const MAX_EXTRAS: usize = 8;
     let data_disk_size: String = args
         .iter()
         .find_map(|a| a.strip_prefix("--data-disk-size="))
@@ -112,12 +116,13 @@ fn main() {
             (p, s)
         })
         .collect();
-    if extra_disks.len() > 2 {
+    if extra_disks.len() > MAX_EXTRAS {
         eprintln!(
-            "Warning: {} extra disks given, only 2 IDE slots (index 2-3); ignoring the rest.",
-            extra_disks.len()
+            "Warning: {} extra disks given, max {} (2 IDE + 6 virtio); ignoring the rest.",
+            extra_disks.len(),
+            MAX_EXTRAS
         );
-        extra_disks.truncate(2);
+        extra_disks.truncate(MAX_EXTRAS);
     }
     let boot_extra: Option<usize> = args.iter().find_map(|a| {
         if a == "--boot-extra-disk" {
@@ -222,11 +227,13 @@ fn main() {
     }
     println!("  Data disk:  target/disk.img ({})", data_disk_size);
     for (i, (p, s)) in extra_disks.iter().enumerate() {
+        let bus = if i < MAX_EXTRA_IDE { "IDE" } else { "virtio" };
         println!(
-            "  Extra #{}:   {} ({}){}",
+            "  Extra #{}:   {} ({}) [{}]{}",
             i + 1,
             p,
             s,
+            bus,
             if boot_extra == Some(i) { " [boot]" } else { "" }
         );
     }
@@ -1283,16 +1290,29 @@ fn run_qemu_bios(
         ]);
     }
 
-    // Extra data disks on the secondary IDE channel (index 2/3).
+    // Extra data disks: first 2 on the secondary IDE channel (index 2/3),
+    // the rest as virtio-blk-pci devices (guest drive indices 4+).
     for (i, (path, _)) in extra_disks.iter().enumerate() {
-        qemu.args([
-            "-drive",
-            &format!(
-                "file={},format=raw,if=ide,index={},media=disk,cache=none,readonly=off",
-                path,
-                2 + i
-            ),
-        ]);
+        if i < 2 {
+            qemu.args([
+                "-drive",
+                &format!(
+                    "file={},format=raw,if=ide,index={},media=disk,cache=none,readonly=off",
+                    path,
+                    2 + i
+                ),
+            ]);
+        } else {
+            let id = format!("vd{}", i - 2);
+            qemu.args([
+                "-drive",
+                &format!(
+                    "file={},format=raw,if=none,id={},cache=none,readonly=off",
+                    path, id
+                ),
+            ]);
+            qemu.args(["-device", &format!("virtio-blk-pci,drive={}", id)]);
+        }
     }
 
     if xhci_kbd {
@@ -1457,16 +1477,29 @@ fn run_qemu_uefi(
         ]);
     }
 
-    // Extra data disks on the secondary IDE channel (index 2/3).
+    // Extra data disks: first 2 on the secondary IDE channel (index 2/3),
+    // the rest as virtio-blk-pci devices (guest drive indices 4+).
     for (i, (path, _)) in extra_disks.iter().enumerate() {
-        qemu.args([
-            "-drive",
-            &format!(
-                "file={},format=raw,if=ide,index={},media=disk,cache=none,readonly=off",
-                path,
-                2 + i
-            ),
-        ]);
+        if i < 2 {
+            qemu.args([
+                "-drive",
+                &format!(
+                    "file={},format=raw,if=ide,index={},media=disk,cache=none,readonly=off",
+                    path,
+                    2 + i
+                ),
+            ]);
+        } else {
+            let id = format!("vd{}", i - 2);
+            qemu.args([
+                "-drive",
+                &format!(
+                    "file={},format=raw,if=none,id={},cache=none,readonly=off",
+                    path, id
+                ),
+            ]);
+            qemu.args(["-device", &format!("virtio-blk-pci,drive={}", id)]);
+        }
     }
 
     if xhci_kbd {
@@ -1711,7 +1744,7 @@ fn print_usage(program: &str) {
     );
 
     eprintln!(
-        "  --extra-disk=<path>       Extra IDE data disk (repeatable, max 2)"
+        "  --extra-disk=<path>       Extra data disk (repeatable, max 8: first 2 IDE, rest virtio-blk)"
     );
 
     eprintln!(

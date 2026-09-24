@@ -2,13 +2,18 @@
 //! Author: Alexander Matzen
 //! Licensed under the MIT license.
 
-//! MFK installer — arrow-key menu to install MFK to disk.
+//! MFK installer — interactive install of MFK to disk.
 //!
 //! Install means a sector clone of the running boot disk (Primary Master)
 //! onto a selected target disk, which then boots MFK on its own. The boot
 //! disk itself is the payload, so no image needs to be embedded in the
-//! kernel. The data disk (Primary Slave, SimplFS) is left untouched; use
-//! the "Format data disk" entry (same as the `mkfs` command) to provision it.
+//! kernel. Works with any unified drive index (0-3 ATA IDE, 4+ virtio-blk):
+//! `install` opens the fullscreen arrow-key menu, `install <drive>`
+//! jumps straight to the confirm+copy flow for that target,
+//! `install --list` prints the drive table, `install --verify [drive]`
+//! compares a disk against the source. The data disk (Primary Slave,
+//! SimplFS) is left untouched; use the "Format data disk" entry (same as
+//! `mkfs 1 --yes`) to provision it.
 
 use alloc::format;
 use alloc::string::String;
@@ -17,6 +22,7 @@ use alloc::vec::Vec;
 use crate::println;
 
 use crate::drivers::block::{BlockDevice, BLOCK_SIZE};
+use crate::drivers::drives;
 use crate::drivers::keyboard::{Key, KeyEvent};
 use crate::drivers::vga::{self, Color, VGA_HEIGHT, VGA_WIDTH};
 
@@ -25,7 +31,7 @@ const SOURCE_INDEX: usize = 0;
 /// Sectors per copy/verify step (16 KiB heap buffer, fits the u8 ATA count).
 const CHUNK_SECTORS: usize = 32;
 
-/// BlockDevice adapter for any probed ATA drive slot.
+/// BlockDevice adapter for any unified drive slot (ATA or virtio-blk).
 pub struct DriveBlockDevice {
     index: usize,
 }
@@ -47,7 +53,7 @@ impl BlockDevice for DriveBlockDevice {
         if buffer.len() < count * BLOCK_SIZE {
             return Err("Buffer too small");
         }
-        crate::drivers::ata::read_sectors_from(self.index, start_block, count_u8, buffer)
+        crate::drivers::drives::read_sectors_from(self.index, start_block, count_u8, buffer)
     }
 
     fn write_blocks(
@@ -60,11 +66,11 @@ impl BlockDevice for DriveBlockDevice {
         if buffer.len() < count * BLOCK_SIZE {
             return Err("Buffer too small");
         }
-        crate::drivers::ata::write_sectors_to(self.index, start_block, count_u8, buffer)
+        crate::drivers::drives::write_sectors_to(self.index, start_block, count_u8, buffer)
     }
 
     fn block_count(&self) -> u64 {
-        crate::drivers::ata::drive_info(self.index)
+        crate::drivers::drives::drive_info(self.index)
             .map(|info| info.total_sectors)
             .unwrap_or(0)
     }
@@ -152,59 +158,24 @@ const MAIN_ITEMS: [&str; 5] = [
     "Quit",
 ];
 
-/// Short human name for a drive slot: "Primary Master", ...
-fn slot_name(index: usize) -> &'static str {
-    match index {
-        0 => "Primary Master",
-        1 => "Primary Slave",
-        2 => "Secondary Master",
-        3 => "Secondary Slave",
-        _ => "Unknown",
-    }
+/// Short human name for a drive slot (unified index).
+fn slot_name(index: usize) -> String {
+    drives::slot_name(index)
 }
 
 /// One-line description for the drive picker, e.g.
-/// "Primary Slave: 20480 sectors (10 MB) [DATA]".
+/// "1 Primary Slave: 20480 sectors (10 MB) [ATA] [DATA - SimplFS]".
 fn drive_label(index: usize) -> String {
-    let base = slot_name(index);
-    let Some(info) = crate::drivers::ata::drive_info(index) else {
-        return format!("{}: probe data unavailable", base);
-    };
-    if !info.exists {
-        return format!(
-            "{}: absent ({})",
-            base,
-            info.last_error.unwrap_or("not detected")
-        );
-    }
-    let mut label = format!(
-        "{}: {} sectors ({} MB)",
-        base,
-        info.total_sectors,
-        info.total_sectors / 2048
-    );
+    let mut label = drives::drive_label(index);
     if index == SOURCE_INDEX {
         label.push_str(" [BOOT SOURCE - locked]");
-    } else if index == 1 {
-        label.push_str(" [DATA - SimplFS]");
     }
     label
 }
 
 /// Target candidates: existing drives other than the boot source.
 fn target_candidates() -> Vec<usize> {
-    let mut out = Vec::new();
-    for i in 0..4 {
-        if i == SOURCE_INDEX {
-            continue;
-        }
-        if let Some(info) = crate::drivers::ata::drive_info(i) {
-            if info.exists {
-                out.push(i);
-            }
-        }
-    }
-    out
+    drives::target_candidates()
 }
 
 /// Whether the boot source looks like an MFK boot disk (present + MBR sig).
@@ -343,7 +314,7 @@ fn pick_drive(title: &str, candidates: &[usize]) -> Option<usize> {
         wait_any_key_no_redraw();
         return None;
     }
-    let mut all: Vec<usize> = (0..4).collect();
+    let mut all: Vec<usize> = (0..drives::drive_count()).collect();
     // Order: candidates first so arrows start on something usable.
     all.sort_by_key(|i| if candidates.contains(i) { 0 } else { 1 });
     let mut selected = 0usize;
@@ -355,7 +326,7 @@ fn pick_drive(title: &str, candidates: &[usize]) -> Option<usize> {
             &body,
             &labels,
             selected,
-            "Up/Down/1-4 + Enter, Esc cancels",
+            "Up/Down/1-9 + Enter, Esc cancels",
         );
         match next_key().key {
             Key::ArrowUp => selected = (selected + all.len() - 1) % all.len(),
@@ -366,7 +337,7 @@ fn pick_drive(title: &str, candidates: &[usize]) -> Option<usize> {
                     return Some(slot);
                 }
             }
-            Key::Char(c @ '1'..='4') => {
+            Key::Char(c @ '1'..='9') => {
                 let slot = (c as usize) - ('1' as usize);
                 if candidates.contains(&slot) {
                     return Some(slot);
@@ -518,17 +489,7 @@ fn action_verify() {
         return;
     }
     // Any existing non-source disk can be checked against the source.
-    let mut candidates = Vec::new();
-    for i in 0..4 {
-        if i == SOURCE_INDEX {
-            continue;
-        }
-        if let Some(info) = crate::drivers::ata::drive_info(i) {
-            if info.exists {
-                candidates.push(i);
-            }
-        }
-    }
+    let candidates = target_candidates();
     let Some(dst) = pick_drive("Verify installation", &candidates) else {
         return;
     };
@@ -574,10 +535,225 @@ fn action_verify() {
 fn action_format_data() {
     // Leave fullscreen so mkfs output scrolls normally, then come back.
     restore_shell_screen();
-    println!("MFK Installer: formatting data disk (Primary Slave) with SimplFS...");
-    crate::shell::execute_command("mkfs");
-    println!("Type 'mount' (or re-run install) to use it.");
+    println!("MFK Installer: formatting data disk (drive 1) with SimplFS...");
+    crate::shell::execute_command("mkfs 1 --yes");
+    println!("Type 'mount 1' (or re-run install) to use it.");
     wait_any_key("Press any key to return to the installer...");
+}
+
+/// Print the drive table to the shell (used by `install --list`).
+fn print_drive_list() {
+    crate::serial_println!("[install] drive list requested");
+    println!(
+        "Drives ({} total: 0-3 ATA, 4+ virtio-blk):",
+        drives::drive_count()
+    );
+    for i in 0..drives::drive_count() {
+        println!("  {}", drive_label(i));
+    }
+}
+
+/// Parse a drive index token (`"4"`, `"drive4"`).
+fn parse_target(tok: &str) -> Result<usize, &'static str> {
+    let t = tok.trim();
+    let num = t
+        .strip_prefix("drive")
+        .or_else(|| t.strip_prefix("DRIVE"))
+        .unwrap_or(t);
+    match num.parse::<usize>() {
+        Ok(n) if n < drives::drive_count() => Ok(n),
+        _ => Err("Invalid drive index (see 'install --list')"),
+    }
+}
+
+/// Non-fullscreen verify used by `install --verify [drive]`.
+fn verify_cli(dst: usize) {
+    let (ready, sectors) = source_ready();
+    if !ready {
+        println!("install: boot source not recognized; nothing to compare against.");
+        return;
+    }
+    if dst == SOURCE_INDEX {
+        println!("install: refusing to verify the source against itself.");
+        return;
+    }
+    let Some(info) = drives::drive_info(dst) else {
+        println!("install: drive {} out of range.", dst);
+        return;
+    };
+    if !info.exists {
+        println!("install: drive {} absent.", dst);
+        return;
+    }
+    println!(
+        "Comparing drive {} against source ({} sectors) ...",
+        dst, sectors
+    );
+    let mut src = DriveBlockDevice::new(SOURCE_INDEX);
+    let mut target = DriveBlockDevice::new(dst);
+    let mut last_pct = u64::MAX;
+    match verify_disks(&mut src, &mut target, |done, total| {
+        let pct = done * 100 / total.max(1);
+        if pct != last_pct {
+            last_pct = pct;
+            println!("Verifying... {}% ({}/{} sectors)", pct, done, total);
+        }
+    }) {
+        Ok(v) => println!("Verify OK: drive {} matches source ({} sectors).", dst, v),
+        Err(e) => println!("Verify FAILED for drive {}: {}", dst, e),
+    }
+}
+
+/// Interactive entry point for the `install` shell command.
+///
+/// - `install` → fullscreen arrow-key menu (same as before).
+/// - `install --list` → print drive table, no screen takeover.
+/// - `install --verify [drive]` → non-destructive compare, no menu.
+/// - `install <drive>` → fullscreen confirm + copy for that target
+///   (skips the picker but keeps the destructive confirmation).
+pub fn run_with_args(args: &str) {
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    if tokens.is_empty() {
+        run();
+        return;
+    }
+    match tokens[0] {
+        "--list" | "list" => print_drive_list(),
+        "--verify" | "verify" => {
+            if tokens.len() > 2 {
+                println!("Usage: install --verify [drive]");
+                return;
+            }
+            if tokens.len() == 2 {
+                match parse_target(tokens[1]) {
+                    Ok(dst) => verify_cli(dst),
+                    Err(e) => println!("install: {}", e),
+                }
+                return;
+            }
+            // No drive given: fall into the fullscreen picker.
+            run_with_verify_first();
+        }
+        "--help" | "help" => {
+            println!("Usage:");
+            println!("  install             Interactive installer menu");
+            println!("  install --list      Show all drives (0-3 ATA, 4+ virtio-blk)");
+            println!("  install <drive>     Install to drive (asks for confirmation)");
+            println!("  install --verify [drive]  Compare disk against boot source");
+        }
+        tok => match parse_target(tok) {
+            Ok(dst) => {
+                if tokens.len() > 1 {
+                    println!("Usage: install [<drive>|--list|--verify [drive]]");
+                    return;
+                }
+                install_to_target(dst);
+            }
+            Err(e) => println!("install: {}. See 'install --help'.", e),
+        },
+    }
+}
+
+/// `install --verify` without a drive: menu first, then fullscreen progress.
+fn run_with_verify_first() {
+    clear_takeover();
+    let candidates = target_candidates();
+    let Some(dst) = pick_drive("Verify installation", &candidates) else {
+        restore_shell_screen();
+        return;
+    };
+    restore_shell_screen();
+    verify_cli(dst);
+}
+
+/// `install <drive>`: fullscreen destructive confirm + copy, no picker.
+fn install_to_target(dst: usize) {
+    if dst == SOURCE_INDEX {
+        println!("install: drive 0 is the boot source itself; pick another target.");
+        return;
+    }
+    let Some(info) = drives::drive_info(dst) else {
+        println!("install: drive {} out of range.", dst);
+        return;
+    };
+    if !info.exists {
+        println!(
+            "install: drive {} absent ({}).",
+            dst,
+            info.last_error.unwrap_or("not detected")
+        );
+        return;
+    }
+    let (ready, sectors) = source_ready();
+    if !ready {
+        println!("install: boot source not recognized; cannot install.");
+        return;
+    }
+    clear_takeover();
+    let dst_sectors = DriveBlockDevice::new(dst).block_count();
+    let summary = alloc::vec![
+        format!(
+            "Source: {} ({} sectors, {} MB)",
+            slot_name(SOURCE_INDEX),
+            sectors,
+            sectors / 2048
+        ),
+        format!(
+            "Target: {} ({} sectors, {} MB)",
+            slot_name(dst),
+            dst_sectors,
+            dst_sectors / 2048
+        ),
+        String::from(""),
+        String::from("ALL DATA ON THE TARGET DISK WILL BE DESTROYED."),
+        String::from("The target will become a bootable MFK disk."),
+    ];
+    if !confirm_action(&summary) {
+        restore_shell_screen();
+        return;
+    }
+    draw_page(
+        "Install MFK",
+        &alloc::vec![format!("Installing to {} ...", slot_name(dst))],
+        &[],
+        0,
+        "Do not power off.",
+    );
+    let copy_res = copy_with_progress(SOURCE_INDEX, dst);
+    // Reuse the shared completion pages from the menu flow.
+    match copy_res {
+        Ok(done) => {
+            crate::serial_println!("[install] copied {} sectors, verifying...", done);
+            match verify_with_progress(SOURCE_INDEX, dst) {
+                Ok(v) => {
+                    let body = alloc::vec![
+                        format!("Copied {} sectors, verified {} sectors.", done, v),
+                        format!("{} is now a bootable MFK disk.", slot_name(dst)),
+                        String::from("Reboot and boot from it to test."),
+                    ];
+                    draw_page("Install complete", &body, &[], 0, "Press any key");
+                    wait_any_key_no_redraw();
+                }
+                Err(e) => {
+                    let body = alloc::vec![
+                        format!("Copied {} sectors, but verify failed: {}", done, e),
+                        String::from("Do not boot from the target; retry install."),
+                    ];
+                    draw_page("Install FAILED", &body, &[], 0, "Press any key");
+                    wait_any_key_no_redraw();
+                }
+            }
+        }
+        Err(e) => {
+            let body = alloc::vec![
+                format!("Install failed: {}", e),
+                String::from("Target left in an unknown state; retry or re-pick."),
+            ];
+            draw_page("Install FAILED", &body, &[], 0, "Press any key");
+            wait_any_key_no_redraw();
+        }
+    }
+    restore_shell_screen();
 }
 
 /// Installer entry point: fullscreen arrow-key menu. Returns to the shell

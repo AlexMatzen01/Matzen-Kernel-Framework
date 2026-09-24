@@ -48,6 +48,11 @@ impl AtaBlockDevice {
     pub fn new() -> Self {
         AtaBlockDevice {}
     }
+
+    /// ATA disk wrapper for a specific unified drive index.
+    pub fn for_drive(index: usize) -> DriveBlockDevice {
+        DriveBlockDevice::new(index)
+    }
 }
 
 impl BlockDevice for AtaBlockDevice {
@@ -77,6 +82,57 @@ impl BlockDevice for AtaBlockDevice {
 
     fn block_count(&self) -> u64 {
         crate::drivers::ata::drive_info(1)
+            .filter(|info| info.exists)
+            .map(|info| info.total_sectors)
+            .unwrap_or(0)
+    }
+}
+
+/// Block device for any unified drive index (0-3 ATA, 4+ virtio-blk).
+/// Used by indexed `mkfs`/`mount`, the installer, and the desktop.
+pub struct DriveBlockDevice {
+    index: usize,
+}
+
+impl DriveBlockDevice {
+    pub fn new(index: usize) -> Self {
+        Self { index }
+    }
+
+    pub fn index(&self) -> usize {
+        self.index
+    }
+}
+
+impl BlockDevice for DriveBlockDevice {
+    fn read_blocks(
+        &mut self,
+        start_block: u64,
+        count: usize,
+        buffer: &mut [u8],
+    ) -> Result<(), &'static str> {
+        if count > 255 {
+            return Err("Too many blocks requested");
+        }
+        let count_u8 = count as u8;
+        crate::drivers::drives::read_sectors_from(self.index, start_block, count_u8, buffer)
+    }
+
+    fn write_blocks(
+        &mut self,
+        start_block: u64,
+        count: usize,
+        buffer: &[u8],
+    ) -> Result<(), &'static str> {
+        if count > 255 {
+            return Err("Too many blocks requested");
+        }
+        let count_u8 = count as u8;
+        crate::drivers::drives::write_sectors_to(self.index, start_block, count_u8, buffer)
+    }
+
+    fn block_count(&self) -> u64 {
+        crate::drivers::drives::drive_info(self.index)
             .filter(|info| info.exists)
             .map(|info| info.total_sectors)
             .unwrap_or(0)

@@ -66,7 +66,7 @@ pub fn process_packet(packet: &[u8], src_ip: [u8; 4]) {
     }
     let payload = &packet[8..length];
 
-    crate::serial_println!(
+    crate::net_log!(
         "Received UDP packet from {}.{}.{}.{}:{} -> port {}",
         src_ip[0],
         src_ip[1],

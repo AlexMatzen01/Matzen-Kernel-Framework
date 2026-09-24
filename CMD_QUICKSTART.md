@@ -60,8 +60,8 @@ ping 8.8.8.8
 ### Try Filesystem
 
 ```bash
-mkfs
-mount
+mkfs 1 --yes
+mount 1
 touch myfile.txt
 write myfile.txt "Hello"
 cat myfile.txt

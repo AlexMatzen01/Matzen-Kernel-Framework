@@ -15,7 +15,9 @@
 //! discovered by re-enumerating PCI; see `ata::rescan_silent`.
 
 use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::vec::Vec;
 use core::sync::atomic::{fence, Ordering};
+use spin::Mutex;
 use x86_64::instructions::port::Port;
 
 use crate::drivers::pci::PciDevice;
@@ -477,4 +479,88 @@ fn dma_phys(virt: u64, len: usize) -> Option<u64> {
 fn dma_single_page() -> Option<(u64, u64)> {
     let (virt, phys, _) = crate::drivers::usb::dma_page()?;
     Some((virt, phys))
+}
+
+// ── Device registry (drive indices 4+ in the unified drive layer) ──
+
+/// Probed virtio-blk devices in PCI enumeration order (bus, device,
+/// function). Index `i` here is unified drive index `4 + i`.
+static DEVICES: Mutex<Option<Vec<VirtioBlkDevice>>> = Mutex::new(None);
+
+/// Probe all PCI buses for legacy virtio-blk devices and (re)initialize
+/// them. Keeps a placeholder entry for failed devices so indices stay
+/// stable and `diskinfo` can show the error.
+pub fn rescan() {
+    let mut found: Vec<VirtioBlkDevice> = Vec::new();
+    for bus in 0..8u8 {
+        for d in crate::drivers::pci::enumerate_bus(bus) {
+            if d.vendor_id != VIRTIO_VENDOR_ID || d.device_id != VIRTIO_BLK_LEGACY_DEVICE_ID
+            {
+                continue;
+            }
+            match VirtioBlkDevice::new(&d) {
+                Ok(dev) => found.push(dev),
+                Err(e) => found.push(VirtioBlkDevice::failed(d.bus, d.device, d.function, e)),
+            }
+        }
+    }
+    // Stable order: sort by PCI address.
+    found.sort_by_key(|d| (d.bus, d.device, d.function));
+    *DEVICES.lock() = Some(found);
+}
+
+/// Initialize the virtio-blk driver (called once at boot).
+pub fn init() {
+    rescan();
+    let n = DEVICES.lock().as_ref().map(|v| v.len()).unwrap_or(0);
+    crate::serial_println!("virtio-blk initialized ({} device(s) found)", n);
+}
+
+/// Number of probed virtio-blk devices (both healthy and failed).
+pub fn count() -> usize {
+    DEVICES.lock().as_ref().map(|v| v.len()).unwrap_or(0)
+}
+
+/// Read sectors from virtio device `index` (0-based within virtio).
+pub fn read_sectors(index: usize, lba: u64, count: u8, buffer: &mut [u8]) -> Result<(), &'static str> {
+    let mut guard = DEVICES.lock();
+    match guard.as_mut().and_then(|v| v.get_mut(index)) {
+        Some(dev) => dev.read_sectors(lba, count, buffer),
+        None => Err("Invalid virtio drive index"),
+    }
+}
+
+/// Write sectors to virtio device `index` (0-based within virtio).
+pub fn write_sectors(index: usize, lba: u64, count: u8, buffer: &[u8]) -> Result<(), &'static str> {
+    let mut guard = DEVICES.lock();
+    match guard.as_mut().and_then(|v| v.get_mut(index)) {
+        Some(dev) => dev.write_sectors(lba, count, buffer),
+        None => Err("Invalid virtio drive index"),
+    }
+}
+
+/// Info snapshot for virtio device `index`.
+pub struct VirtioDriveInfo {
+    pub exists: bool,
+    pub total_sectors: u64,
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub last_error: Option<&'static str>,
+}
+
+/// Wrapper for the unified drive layer.
+pub fn drive_info(index: usize) -> Option<VirtioDriveInfo> {
+    let guard = DEVICES.lock();
+    match guard.as_ref().and_then(|v| v.get(index)) {
+        Some(dev) => Some(VirtioDriveInfo {
+            exists: dev.exists,
+            total_sectors: if dev.exists { dev.total_sectors() } else { 0 },
+            bus: dev.bus,
+            device: dev.device,
+            function: dev.function,
+            last_error: dev.last_error,
+        }),
+        None => None,
+    }
 }

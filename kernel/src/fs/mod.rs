@@ -94,7 +94,8 @@ impl Superblock {
     }
 }
 
-/// Inode structure (128 bytes)
+/// Inode structure (144 bytes; does NOT divide the 512 B block, so some
+/// table slots straddle two blocks — see `write_inode`).
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct Inode {
@@ -269,6 +270,16 @@ impl SimpleFilesystem {
             return false;
         }
         self.inodes[ino as usize].get_type() == FileType::File
+    }
+    /// File size in bytes from the inode (no disk I/O, no allocation).
+    pub fn file_size(&self, ino: u32) -> Result<u64, &'static str> {
+        if (ino as usize) >= self.inodes.len() {
+            return Err("Invalid inode number");
+        }
+        if self.inodes[ino as usize].get_type() != FileType::File {
+            return Err("Not a file");
+        }
+        Ok(self.inodes[ino as usize].size)
     }
     /// Get file type
     pub fn inode_type(&self, ino: u32) -> FileType {
@@ -1373,20 +1384,39 @@ impl SimpleFilesystem {
         let inode_size = core::mem::size_of::<Inode>();
         let byte_offset = inode_index * inode_size;
         let table_block = byte_offset / FS_BLOCK_SIZE;
-        if table_block >= self.superblock.inode_blocks as usize {
+        let inode_blocks = self.superblock.inode_blocks as usize;
+        if table_block >= inode_blocks {
             return Err("Invalid inode table offset");
         }
         let slot_offset = byte_offset % FS_BLOCK_SIZE;
-        let mut buffer = [0u8; FS_BLOCK_SIZE];
-        device.read_blocks(1 + table_block as u64, 1, &mut buffer)?;
         let inode_bytes = unsafe {
             core::slice::from_raw_parts(
                 core::ptr::addr_of!(self.inodes[inode_index]) as *const u8,
                 inode_size,
             )
         };
-        buffer[slot_offset..slot_offset + inode_size].copy_from_slice(inode_bytes);
-        device.write_blocks(1 + table_block as u64, 1, &buffer)
+        if slot_offset + inode_size <= FS_BLOCK_SIZE {
+            // Fast path: the whole slot lives in one table block.
+            let mut buffer = [0u8; FS_BLOCK_SIZE];
+            device.read_blocks(1 + table_block as u64, 1, &mut buffer)?;
+            buffer[slot_offset..slot_offset + inode_size].copy_from_slice(inode_bytes);
+            return device.write_blocks(1 + table_block as u64, 1, &buffer);
+        }
+        // Slow path: Inode (144 B) does not divide the 512 B block, so some
+        // slots straddle two table blocks (e.g. index 3 spans bytes 432-576).
+        // Splice the slot across both blocks with read-modify-write.
+        if table_block + 1 >= inode_blocks {
+            return Err("Invalid inode table offset");
+        }
+        let head_len = FS_BLOCK_SIZE - slot_offset;
+        let mut head = [0u8; FS_BLOCK_SIZE];
+        let mut tail = [0u8; FS_BLOCK_SIZE];
+        device.read_blocks(1 + table_block as u64, 1, &mut head)?;
+        device.read_blocks(1 + table_block as u64 + 1, 1, &mut tail)?;
+        head[slot_offset..].copy_from_slice(&inode_bytes[..head_len]);
+        tail[..inode_size - head_len].copy_from_slice(&inode_bytes[head_len..]);
+        device.write_blocks(1 + table_block as u64, 1, &head)?;
+        device.write_blocks(1 + table_block as u64 + 1, 1, &tail)
     }
 
     /// Write superblock back to disk
@@ -1861,5 +1891,84 @@ mod tests {
         fs.delete_file(&mut disk, "/download.part").unwrap();
         let final_free = unsafe { core::ptr::addr_of!(fs.superblock.free_blocks).read_unaligned() };
         assert_eq!(final_free, initial_free);
+    }
+
+    /// Regression test: Inode is 144 B, which does not divide the 512 B
+    /// block, so slots like index 3 (bytes 432-576) straddle two table
+    /// blocks. `write_inode` used to slice a single block and panic
+    /// (`range end index 576 out of range`) on the first streamed append
+    /// (this killed `wget` downloads once inode 3 was reached).
+    #[test]
+    fn straddling_inode_slot_survives_streamed_appends() {
+        let mut disk = RamDisk::new(2048);
+        SimpleFilesystem::format(&mut disk).unwrap();
+        let mut fs = SimpleFilesystem::mount(&mut disk).unwrap();
+        // root = 0; take 1 and 2 so the staged download lands on inode 3.
+        fs.create_directory(&mut disk, "/backgrounds").unwrap();
+        let black = fs.create_file(&mut disk, "/black.png").unwrap();
+        fs.write_file_by_inode(&mut disk, black, b"placeholder")
+            .unwrap();
+        let staging = fs.create_file(&mut disk, "/bg.part").unwrap();
+        assert_eq!(staging, 3);
+
+        // Stream chunks the way wget's sink does (append per packet).
+        let chunk_a = alloc::vec![0xAB; 1440];
+        let chunk_b = alloc::vec![0xCD; 1440];
+        fs.append_file_by_inode(&mut disk, staging, &chunk_a)
+            .unwrap();
+        fs.append_file_by_inode(&mut disk, staging, &chunk_b)
+            .unwrap();
+        let mut expected = chunk_a.clone();
+        expected.extend_from_slice(&chunk_b);
+        assert_eq!(fs.read_file(&mut disk, "/bg.part").unwrap(), expected);
+        // Neighbor slots must be untouched by the split-block write.
+        assert_eq!(
+            fs.read_file(&mut disk, "/black.png").unwrap(),
+            b"placeholder"
+        );
+
+        // The table on disk must be coherent across a remount.
+        drop(fs);
+        let mut fs = SimpleFilesystem::mount(&mut disk).unwrap();
+        assert_eq!(fs.read_file(&mut disk, "/bg.part").unwrap(), expected);
+        assert_eq!(
+            fs.read_file(&mut disk, "/black.png").unwrap(),
+            b"placeholder"
+        );
+    }
+
+    /// Every early slot (including straddlers 3, 7, 10, 14) round-trips
+    /// its data through single-slot writes and a remount. Files are spread
+    /// across subdirectories (root holds 8 entries per block, legacy).
+    #[test]
+    fn all_early_inode_slots_round_trip() {
+        let mut disk = RamDisk::new(4096);
+        SimpleFilesystem::format(&mut disk).unwrap();
+        let mut fs = SimpleFilesystem::mount(&mut disk).unwrap();
+        // inodes interleave dirs and files; files land on 2-5, 7-10,
+        // 12-15, 17-20 — covering straddlers 3, 7, 10, 14, 17.
+        for d in 0..4u32 {
+            let dir = alloc::format!("/d{}", d);
+            fs.create_directory(&mut disk, &dir).unwrap();
+            for f in 0..4u32 {
+                let i = d * 4 + f;
+                let name = alloc::format!("/d{}/f{}", d, f);
+                let inode = fs.create_file(&mut disk, &name).unwrap();
+                let data =
+                    alloc::vec![(i as u8).wrapping_mul(37).wrapping_add(11); 700];
+                fs.write_file_by_inode(&mut disk, inode, &data).unwrap();
+            }
+        }
+        drop(fs);
+        let mut fs = SimpleFilesystem::mount(&mut disk).unwrap();
+        for d in 0..4u32 {
+            for f in 0..4u32 {
+                let i = d * 4 + f;
+                let name = alloc::format!("/d{}/f{}", d, f);
+                let expected =
+                    alloc::vec![(i as u8).wrapping_mul(37).wrapping_add(11); 700];
+                assert_eq!(fs.read_file(&mut disk, &name).unwrap(), expected);
+            }
+        }
     }
 }

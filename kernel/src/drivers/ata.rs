@@ -174,6 +174,17 @@ impl AtaDrive {
 
                 // Check if LBA48 is supported (word 83, bit 10).
                 self.lba48_supported = (identify_data[83] & (1 << 10)) != 0;
+                // Total sectors: LBA48 words 100-103 when supported,
+                // else LBA28 words 60-61.
+                if self.lba48_supported {
+                    self.total_sectors_ = (identify_data[100] as u64)
+                        | ((identify_data[101] as u64) << 16)
+                        | ((identify_data[102] as u64) << 32)
+                        | ((identify_data[103] as u64) << 48);
+                } else {
+                    self.total_sectors_ = (identify_data[60] as u64)
+                        | ((identify_data[61] as u64) << 16);
+                }
                 self.exists = true;
                 return Ok(());
             }
@@ -474,6 +485,22 @@ pub fn write_sectors_to(
     } else {
         Err("ATA not initialized")
     }
+}
+
+/// Number of fixed ATA IDE slots (indices 0-3).
+pub const ATA_COUNT: usize = 4;
+
+/// Re-probe all ATA slots without serial spam (hot-attach + virtio rescan
+/// path). Also re-enumerates virtio-blk PCI devices so QEMU `device_add`
+/// disks appear without a reboot.
+pub fn rescan_silent() {
+    if let Some(drives_array) = DRIVES.lock().as_mut() {
+        for drive in drives_array.iter_mut() {
+            let _ = drive.init();
+        }
+    }
+    #[cfg(feature = "usb")]
+    crate::drivers::virtio_blk::rescan();
 }
 
 /// Drive information for the installer

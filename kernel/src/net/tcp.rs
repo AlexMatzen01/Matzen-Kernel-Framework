@@ -151,7 +151,7 @@ pub fn process_packet(packet: &[u8], src_ip: [u8; 4], _src_mac: [u8; 6]) {
         return;
     }
 
-    crate::serial_println!(
+    crate::net_log!(
         "TCP: Received packet from {}.{}.{}.{}:{} to port {}, flags={:#x}, seq={}, ack={}",
         src_ip[0],
         src_ip[1],
@@ -179,7 +179,7 @@ pub fn process_packet(packet: &[u8], src_ip: [u8; 4], _src_mac: [u8; 6]) {
                 );
             }
         } else if flags & TCP_SYN != 0 {
-            crate::serial_println!("TCP: Received SYN on port {} but not listening", dst_port);
+            crate::net_log!("TCP: Received SYN on port {} but not listening", dst_port);
         }
     }
     for reply in replies {
@@ -192,7 +192,7 @@ pub fn process_packet(packet: &[u8], src_ip: [u8; 4], _src_mac: [u8; 6]) {
             reply.flags,
             &[],
         ) {
-            crate::serial_println!("TCP reply send failed: {}", error);
+            crate::net_log!("TCP reply send failed: {}", error);
         }
     }
 }
@@ -205,7 +205,7 @@ fn handle_connection_packet(
     data: &[u8],
     replies: &mut Vec<TcpReply>,
 ) {
-    crate::serial_println!(
+    crate::net_log!(
         "TCP: Handling packet in state {:?}, flags={:#x}",
         conn.state,
         flags
@@ -214,7 +214,7 @@ fn handle_connection_packet(
     match conn.state {
         TcpState::SynSent => {
             if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 && ack == conn.seq_num.wrapping_add(1) {
-                crate::serial_println!("TCP: Received SYN-ACK");
+                crate::net_log!("TCP: Received SYN-ACK");
                 conn.seq_num = conn.seq_num.wrapping_add(1);
                 conn.ack_num = seq.wrapping_add(1);
                 conn.state = TcpState::Established;
@@ -250,7 +250,7 @@ fn handle_connection_packet(
                 });
             }
             if flags & TCP_FIN != 0 {
-                crate::serial_println!("TCP: Received FIN");
+                crate::net_log!("TCP: Received FIN");
                 conn.ack_num = seq.wrapping_add(data.len() as u32).wrapping_add(1);
                 conn.state = TcpState::CloseWait;
                 replies.push(TcpReply {
@@ -295,7 +295,7 @@ fn send_tcp_packet(
     segment[16] = (checksum >> 8) as u8;
     segment[17] = (checksum & 0xFF) as u8;
 
-    crate::serial_println!(
+    crate::net_log!(
         "TCP: Sending packet to {}.{}.{}.{}:{}, flags={:#x}, seq={}, ack={}, data_len={}",
         dst_ip[0],
         dst_ip[1],
@@ -342,7 +342,7 @@ pub fn connect(remote_ip: [u8; 4], remote_port: u16) -> Result<u16, &'static str
         return Err(error);
     }
 
-    crate::serial_println!(
+    crate::net_log!(
         "TCP: Sent SYN to {}.{}.{}.{}:{} from port {}",
         remote_ip[0],
         remote_ip[1],

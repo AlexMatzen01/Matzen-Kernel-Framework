@@ -46,6 +46,51 @@ impl BootFrameAllocator {
             self.regions.len()
         );
     }
+
+    /// Remove `[reserve_start, reserve_end)` from the usable ranges (e.g.
+    /// the pages backing the kernel heap). Regions are clamped or split;
+    /// the bump cursor is moved out if it sat inside the reserved span.
+    /// Must be called before any frame is handed out past the reservation.
+    pub fn reserve_range(&mut self, reserve_start: u64, reserve_end: u64) {
+        if reserve_start >= reserve_end {
+            return;
+        }
+        let mut kept: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in self.regions.iter().copied() {
+            if end <= reserve_start || start >= reserve_end {
+                kept.push((start, end));
+                continue;
+            }
+            if start < reserve_start {
+                kept.push((start, reserve_start));
+            }
+            if end > reserve_end {
+                kept.push((reserve_end, end));
+            }
+        }
+        self.regions = kept;
+        // Re-seat the cursor: first range containing it, else first range.
+        let mut seated = false;
+        for (i, (start, end)) in self.regions.iter().enumerate() {
+            if self.current_addr >= *start && self.current_addr < *end {
+                self.current_region = i;
+                seated = true;
+                break;
+            }
+        }
+        if !seated {
+            self.current_region = 0;
+            if let Some((start, _)) = self.regions.first() {
+                self.current_addr = *start;
+            }
+        }
+        crate::serial_println!(
+            "[mem] Reserved {:#x}-{:#x}; {} usable region(s) remain",
+            reserve_start,
+            reserve_end,
+            self.regions.len()
+        );
+    }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootFrameAllocator {
@@ -83,4 +128,9 @@ pub fn frame_allocator() -> GlobalFrameAllocator {
 
 pub fn init_from_memory_map(memory_regions: &[MemoryRegion]) {
     FRAME_ALLOCATOR.lock().init_from_memory_map(memory_regions);
+}
+
+/// Carve `[start, end)` out of future frame allocation (heap backing).
+pub fn reserve_range(start: u64, end: u64) {
+    FRAME_ALLOCATOR.lock().reserve_range(start, end);
 }

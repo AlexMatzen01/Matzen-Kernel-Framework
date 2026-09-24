@@ -1,5 +1,5 @@
-mkfs
-mount
+mkfs 1 --yes
+mount 1
 write test.txt Hello
 cat test.txt
 write data.txt This_is_a_longer_test_file_with_more_content

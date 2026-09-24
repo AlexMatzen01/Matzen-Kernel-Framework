@@ -126,7 +126,7 @@ fn send_arp_reply(target_mac: [u8; 6], target_ip: [u8; 4]) {
         crate::net::ethernet::ETHERTYPE_ARP,
         packet_bytes,
     ) {
-        crate::serial_println!("ARP reply send failed: {}", error);
+        crate::net_log!("ARP reply send failed: {}", error);
     }
 }
 

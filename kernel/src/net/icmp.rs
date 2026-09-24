@@ -65,7 +65,7 @@ pub fn process_packet(packet: &[u8], src_ip: [u8; 4], _src_mac: [u8; 6]) {
     }
 
     if packet[0] == ICMP_ECHO_REQUEST {
-        crate::serial_println!(
+        crate::net_log!(
             "Received ping from {}.{}.{}.{}",
             src_ip[0],
             src_ip[1],
@@ -82,10 +82,10 @@ pub fn process_packet(packet: &[u8], src_ip: [u8; 4], _src_mac: [u8; 6]) {
         reply[3] = (checksum & 0xFF) as u8;
 
         if let Err(error) = crate::net::ip::send_packet(src_ip, 1, &reply) {
-            crate::serial_println!("ICMP reply send failed: {}", error);
+            crate::net_log!("ICMP reply send failed: {}", error);
         }
 
-        crate::println!(
+        crate::net_log!(
             "Ping reply sent to {}.{}.{}.{}",
             src_ip[0],
             src_ip[1],
@@ -96,7 +96,7 @@ pub fn process_packet(packet: &[u8], src_ip: [u8; 4], _src_mac: [u8; 6]) {
         let identifier = u16::from_be_bytes([packet[4], packet[5]]);
         let sequence = u16::from_be_bytes([packet[6], packet[7]]);
 
-        crate::serial_println!(
+        crate::net_log!(
             "ICMP: Received echo reply from {}.{}.{}.{}, id={}, seq={}",
             src_ip[0],
             src_ip[1],
@@ -116,7 +116,7 @@ pub fn process_packet(packet: &[u8], src_ip: [u8; 4], _src_mac: [u8; 6]) {
             let current_time = crate::shell::monotonic_ms();
             let rtt_ms = current_time.saturating_sub(request.sent_time);
 
-            crate::serial_println!(
+            crate::net_log!(
                 "Received ping reply from {}.{}.{}.{} (seq={}, rtt={}ms)",
                 src_ip[0],
                 src_ip[1],
@@ -160,7 +160,7 @@ pub fn send_ping(dst_ip: [u8; 4], identifier: u16, sequence: u16) -> Result<(), 
         },
     );
 
-    crate::serial_println!(
+    crate::net_log!(
         "ICMP: Sending ping to {}.{}.{}.{}, seq={}",
         dst_ip[0],
         dst_ip[1],

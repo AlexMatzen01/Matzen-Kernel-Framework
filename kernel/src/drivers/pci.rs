@@ -132,6 +132,82 @@ pub fn enumerate_devices() -> alloc::vec::Vec<PciDevice> {
     devices
 }
 
+/// Enumerate all PCI functions on a single bus (used by virtio-blk
+/// hot-add detection; see `ata::rescan_silent`).
+pub fn enumerate_bus(bus: u8) -> alloc::vec::Vec<PciDevice> {
+    let mut devices = alloc::vec::Vec::new();
+    for device in 0..32u8 {
+        for function in 0..8u8 {
+            let address = 0x80000000u32
+                | ((bus as u32) << 16)
+                | ((device as u32) << 11)
+                | ((function as u32) << 8);
+
+            let vendor_device = unsafe {
+                let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
+                let mut data_port = Port::<u32>::new(CONFIG_DATA);
+
+                addr_port.write(address);
+                data_port.read()
+            };
+
+            let vendor_id = (vendor_device & 0xFFFF) as u16;
+            let device_id = (vendor_device >> 16) as u16;
+
+            if vendor_id == 0xFFFF {
+                continue;
+            }
+
+            let class_info = unsafe {
+                let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
+                let mut data_port = Port::<u32>::new(CONFIG_DATA);
+
+                addr_port.write(address | 0x08);
+                data_port.read()
+            };
+
+            let bar0 = unsafe {
+                let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
+                let mut data_port = Port::<u32>::new(CONFIG_DATA);
+
+                addr_port.write(address | 0x10);
+                data_port.read()
+            };
+
+            let bar1 = unsafe {
+                let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
+                let mut data_port = Port::<u32>::new(CONFIG_DATA);
+
+                addr_port.write(address | 0x14);
+                data_port.read()
+            };
+
+            let irq_line = unsafe {
+                let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
+                let mut data_port = Port::<u32>::new(CONFIG_DATA);
+
+                addr_port.write(address | 0x3C);
+                (data_port.read() & 0xFF) as u8
+            };
+
+            devices.push(PciDevice {
+                bus,
+                device,
+                function,
+                vendor_id,
+                device_id,
+                class_code: ((class_info >> 24) & 0xFF) as u8,
+                subclass: ((class_info >> 16) & 0xFF) as u8,
+                prog_if: ((class_info >> 8) & 0xFF) as u8,
+                bar0,
+                bar1,
+                irq_line,
+            });
+        }
+    }
+    devices
+}
+
 pub fn find_device(vendor_id: u16, device_id: u16) -> Option<PciDevice> {
     // Only scan first few buses to avoid slow boot
     for bus in 0..8u16 {

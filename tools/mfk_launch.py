@@ -6,7 +6,8 @@
   `--textual` is passed and textual is installed).
 - Config auto-saves to .mfk-launch.json in the repo root on every change.
 - Translates config into mfk-runner flags (repeatable --extra-disk).
-- Max 2 extras on IDE (indices 2-3); more need a virtio-blk guest driver.
+- First 2 extras use IDE slots (indices 2-3); extras 3-8 attach as
+  virtio-blk-pci devices (guest drive indices 4+, needs kernel virtio driver).
 
 Usage:
     python tools/mfk_launch.py              # interactive menu
@@ -27,6 +28,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = REPO_ROOT / ".mfk-launch.json"
 MAX_EXTRA_IDE = 2
+MAX_EXTRA_VIRTIO = 6
+MAX_EXTRAS = MAX_EXTRA_IDE + MAX_EXTRA_VIRTIO
+VALID_BUS = ("auto", "ide", "virtio")
 
 DEFAULTS = {
     "kernel": "target/x86_64-mfk/debug/mfk-kernel",
@@ -79,14 +83,19 @@ def load_config() -> dict:
                     cfg[k] = saved[k]
         except (json.JSONDecodeError, OSError) as e:
             out(f"[yellow]Warning: could not read {CONFIG_PATH}: {e}; using defaults.[/yellow]")
-    # normalize extras
+    # normalize extras (back-compat: entries without "bus" get "auto";
+    # "auto" = first 2 on IDE, rest on virtio-blk, matching the runner)
     norm = []
     for e in cfg.get("extras", []):
         if isinstance(e, dict) and e.get("path"):
+            bus = str(e.get("bus", "auto")).lower()
+            if bus not in VALID_BUS:
+                bus = "auto"
             norm.append({"path": str(e["path"]),
                          "size": str(e.get("size", "64M")),
-                         "boot": bool(e.get("boot", False))})
-    cfg["extras"] = norm[:MAX_EXTRA_IDE]
+                         "boot": bool(e.get("boot", False)),
+                         "bus": bus})
+    cfg["extras"] = norm[:MAX_EXTRAS]
     return cfg
 
 
@@ -97,7 +106,14 @@ def save_config(cfg: dict) -> None:
     os.replace(tmp, CONFIG_PATH)
 
 
-def slot_name(n: int) -> str:
+def slot_name(n: int, bus: str = "auto") -> str:
+    """Human slot for extra #n (0-based). First 2 default to IDE 2/3,
+    the rest (or explicit virtio) are virtio-blk (guest drive 4+n)."""
+    bus = (bus or "auto").lower()
+    if bus == "virtio" or (bus == "auto" and n >= MAX_EXTRA_IDE):
+        return f"virtio-blk #{n - MAX_EXTRA_IDE} (drive {4 + n - MAX_EXTRA_IDE})"
+    if bus == "ide" and n >= MAX_EXTRA_IDE:
+        return f"IDE ? (only 2 IDE slots; will use virtio)"
     return "Secondary Master (IDE 2)" if n == 0 else "Secondary Slave (IDE 3)"
 
 
@@ -157,7 +173,8 @@ def show_config(cfg: dict) -> None:
         t.add_row("web_ui", "ON" if cfg["web_ui"] else "OFF")
         t.add_row("web_ui_port", str(cfg["web_ui_port"]))
         console.print(t)
-        d = Table(title=f"Extra drives ({len(cfg['extras'])}/{MAX_EXTRA_IDE} IDE slots)")
+        d = Table(title=f"Extra drives ({len(cfg['extras'])}/{MAX_EXTRAS}: "
+                        f"{MAX_EXTRA_IDE} IDE + {MAX_EXTRA_VIRTIO} virtio)")
         d.add_column("#")
         d.add_column("Path")
         d.add_column("Size")
@@ -165,7 +182,7 @@ def show_config(cfg: dict) -> None:
         d.add_column("Boot")
         d.add_column("Probe")
         for i, e in enumerate(cfg["extras"]):
-            d.add_row(str(i + 1), e["path"], e["size"], slot_name(i),
+            d.add_row(str(i + 1), e["path"], e["size"], slot_name(i, e.get("bus", "auto")),
                       "YES" if e["boot"] else "-",
                       bootable_probe(e["path"]))
         console.print(d)
@@ -176,10 +193,11 @@ def show_config(cfg: dict) -> None:
         for k in ("kernel", "hypervisor", "firmware", "keyboard",
                   "bundle_apps", "data_disk_size", "vnc", "vnc_port", "web_ui", "web_ui_port"):
             out(f"  {k}: {cfg[k]}")
-        out(f"  extras ({len(cfg['extras'])}/{MAX_EXTRA_IDE}):")
+        out(f"  extras ({len(cfg['extras'])}/{MAX_EXTRAS}: "
+            f"{MAX_EXTRA_IDE} IDE + {MAX_EXTRA_VIRTIO} virtio):")
         for i, e in enumerate(cfg["extras"]):
             out(f"    {i+1}. {e['path']} size={e['size']} "
-                f"slot={slot_name(i)} boot={e['boot']} [{bootable_probe(e['path'])}]")
+                f"slot={slot_name(i, e.get('bus', 'auto'))} boot={e['boot']} [{bootable_probe(e['path'])}]")
         out("  runner: mfk-runner " + " ".join(to_runner_args(cfg)))
 
 
@@ -330,17 +348,20 @@ def choose_from_list(label: str, values: tuple[str, ...], current: str) -> str:
 def extra_menu(cfg: dict, index: int) -> None:
     """Edit one extra disk using the same arrow-key interaction."""
     e = cfg["extras"][index]
+    if "bus" not in e or e["bus"] not in VALID_BUS:
+        e["bus"] = "auto"
     selected = 0
 
     while True:
         clear_screen()
         out("[bold cyan]Extra disk editor[/bold cyan]")
-        out(f"Drive #{index + 1} — {slot_name(index)}")
+        out(f"Drive #{index + 1} — {slot_name(index, e.get('bus', 'auto'))}")
         out("")
 
         items = [
             ("Path", e["path"]),
             ("Size", e["size"]),
+            ("Bus", e.get("bus", "auto")),
             ("Boot", "YES" if e["boot"] else "NO"),
             ("Done", ""),
         ]
@@ -371,35 +392,41 @@ def extra_menu(cfg: dict, index: int) -> None:
                 e["size"] = edit_value("Drive size", e["size"])
                 save_config(cfg)
             elif selected == 2:
+                cur = VALID_BUS.index(e.get("bus", "auto"))
+                e["bus"] = VALID_BUS[(cur + 1) % len(VALID_BUS)]
+                save_config(cfg)
+            elif selected == 3:
                 e["boot"] = not e["boot"]
                 if e["boot"]:
                     for i, other in enumerate(cfg["extras"]):
                         if i != index:
                             other["boot"] = False
                 save_config(cfg)
-            elif selected == 3:
+            elif selected == 4:
                 return
 
 
 def add_extra_menu(cfg: dict) -> None:
-    if len(cfg["extras"]) >= MAX_EXTRA_IDE:
+    if len(cfg["extras"]) >= MAX_EXTRAS:
         clear_screen()
-        out(f"[red]IDE full: max {MAX_EXTRA_IDE} extras (indices 2-3).[/red]")
-        out("More drives need a virtio-blk guest driver.")
+        out(f"[red]Full: max {MAX_EXTRAS} extras "
+            f"({MAX_EXTRA_IDE} IDE + {MAX_EXTRA_VIRTIO} virtio).[/red]")
         out("")
         out("Press any key to continue...")
         read_key()
         return
 
-    default_path = (
-        "target/extra-disk.img"
-        if not cfg["extras"]
-        else "target/extra-disk2.img"
-    )
+    n = len(cfg["extras"])
+    default_path = f"target/extra-disk{n + 1}.img" if n else "target/extra-disk.img"
 
     path = edit_value("New drive path", default_path)
     size = edit_value("Creation size", "64M")
-    cfg["extras"].append({"path": path, "size": size, "boot": False})
+    bus = "auto"
+    if n >= MAX_EXTRA_IDE:
+        bus = "virtio"
+        out(f"[cyan]Slot #{n + 1} defaults to virtio-blk "
+            f"(guest drive {4 + n - MAX_EXTRA_IDE}).[/cyan]")
+    cfg["extras"].append({"path": path, "size": size, "boot": False, "bus": bus})
     save_config(cfg)
 
 
@@ -496,7 +523,8 @@ def menu_loop(cfg: dict) -> bool:
             f"[bold]Web UI port:[/bold] {cfg['web_ui_port']}"
         )
         out(f"[bold]Kernel:[/bold] {cfg['kernel']}")
-        out(f"[bold]Extra drives:[/bold] {len(cfg['extras'])}/{MAX_EXTRA_IDE}")
+        out(f"[bold]Extra drives:[/bold] {len(cfg['extras'])}/{MAX_EXTRAS} "
+            f"({MAX_EXTRA_IDE} IDE + {MAX_EXTRA_VIRTIO} virtio)")
         out("")
 
         for i, name in enumerate(menu_names):
@@ -665,7 +693,7 @@ def menu_loop(cfg: dict) -> bool:
             elif selected == 10:
                 add_extra_menu(cfg)
 
-            elif selected == 7:
+            elif selected == 11:
                 if not cfg["extras"]:
                     clear_screen()
                     out("[yellow]No extra drives yet.[/yellow]")
@@ -697,7 +725,7 @@ def menu_loop(cfg: dict) -> bool:
                         elif k == "escape":
                             break
 
-            elif selected == 11:
+            elif selected == 12:
                 remove_extra_menu(cfg)
 
             elif selected == 13:
@@ -741,7 +769,7 @@ def textual_app(cfg: dict):
             yield Header()
             yield Vertical(
                 Static(f"Config: {CONFIG_PATH.name} (auto-saves on Launch)"),
-                Static(f"Extras: {len(cfg['extras'])}/{MAX_EXTRA_IDE} | " +
+                Static(f"Extras: {len(cfg['extras'])}/{MAX_EXTRAS} | " +
                        ", ".join(e["path"] for e in cfg["extras"]) or "none"),
                 Static("Hypervisor: " + cfg["hypervisor"] + "  Firmware: " +
                        cfg["firmware"] + "  Kbd: " + cfg["keyboard"]),

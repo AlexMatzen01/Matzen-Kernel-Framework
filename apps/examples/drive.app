@@ -1,9 +1,9 @@
 # Drive: mkfs + mount built into an app
 echo === Drive App ===
 echo Formatting disk...
-mkfs
+mkfs 1 --yes
 echo Mounting filesystem...
-mount
+mount 1
 echo Disk ready:
 diskinfo
 ls

@@ -9,6 +9,7 @@
 pub mod acpi;
 pub mod ata;
 pub mod block;
+pub mod drives;
 pub mod e1000;
 pub mod fb;
 pub mod fb_gfx;
@@ -25,6 +26,9 @@ pub mod vga;
 
 #[cfg(feature = "usb")]
 pub mod usb;
+
+#[cfg(feature = "usb")]
+pub mod virtio_blk;
 
 #[cfg(feature = "usb")]
 pub mod xhci;

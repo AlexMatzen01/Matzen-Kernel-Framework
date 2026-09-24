@@ -381,7 +381,24 @@ fn load_path(scene: &mut Scene, app: &mut SettingsApp, path: &str, sw: usize, sh
             }
         }
         Err(e) => {
-            app.status = alloc::format!("Read '{}' failed: {}. Mount FS via Drive first?", path, e);
+            // Only suggest mounting when the FS really isn't mounted; otherwise
+            // report the actual cause (e.g. file too large for the heap) with
+            // the file size, so failures are actionable.
+            if !crate::shell::is_mounted() {
+                app.status = alloc::format!("Read '{}' failed: {}. Mount FS via Drive first?", path, e);
+            } else {
+                match crate::shell::gui_file_size(path) {
+                    Ok(size) => {
+                        app.status = alloc::format!(
+                            "Read '{}' failed: {} ({} bytes)",
+                            path, e, size
+                        )
+                    }
+                    Err(_) => {
+                        app.status = alloc::format!("Read '{}' failed: {}", path, e);
+                    }
+                }
+            }
         }
     }
     // Keep bg/accent live even when the image load failed.

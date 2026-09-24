@@ -44,7 +44,7 @@ pub fn process_packets() {
         let Some(packet) = crate::drivers::e1000::receive_packet() else {
             break;
         };
-        crate::serial_println!("RX: Received packet {} bytes", packet.len());
+        crate::net_log!("RX: Received packet {} bytes", packet.len());
         let mut queue = RX_QUEUE.lock();
         if queue.len() >= MAX_RX_QUEUE {
             queue.pop_front();
@@ -55,7 +55,7 @@ pub fn process_packets() {
     for _ in 0..MAX_RX_PER_PUMP {
         let packet = { RX_QUEUE.lock().pop_front() };
         let Some(packet) = packet else { break };
-        crate::serial_println!("Processing packet {} bytes", packet.len());
+        crate::net_log!("Processing packet {} bytes", packet.len());
         ethernet::process_packet(&packet);
     }
 }

@@ -57,14 +57,40 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     drivers::vga::init_with_offset(phys_mem_offset);
     serial_println!("VGA initialized");
 
-    // Initialize heap allocator (required before fb init: fb uses alloc)
-    allocator::init();
-    serial_println!("Heap allocator initialized");
+    // Initialize heap allocator (required before fb init: fb uses alloc).
+    // The heap is carved from the memory map, NOT .bss: a 32 MiB static
+    // array balloons the kernel ELF and collides with bootloader mappings
+    // on real hardware (GDT frame PageAlreadyMapped panic). Carving is
+    // stack-only, so it runs before the heap exists.
+    let (heap_phys, heap_size) =
+        allocator::carve_heap_run(&boot_info.memory_regions, allocator::HEAP_SIZE as u64)
+            .unwrap_or((0, 0));
+    // Minimum carved heap worth using; below this, boot on the 1 MiB
+    // static fallback instead (large wallpapers then fail cleanly via caps).
+    const MIN_CARVED_HEAP: u64 = 4 * 1024 * 1024;
+    if heap_size >= MIN_CARVED_HEAP {
+        let heap_virt = phys_mem_offset.wrapping_add(heap_phys) as *mut u8;
+        allocator::init(heap_virt, heap_size as usize);
+        serial_println!(
+            "Heap allocator initialized: {:#x} bytes at phys {:#x}",
+            heap_size,
+            heap_phys
+        );
+        if heap_size < allocator::HEAP_SIZE as u64 {
+            serial_println!("Warning: heap below 32 MiB budget; large images may fail");
+        }
+    } else {
+        allocator::init_fallback();
+        serial_println!("Warning: no large usable run; 1 MiB fallback heap in use");
+    }
 
     // Frame allocator from the bootloader memory map. Powers double
-    // buffering and any future page-table work. Heap (above) is a static
-    // array, so there is no conflict with these regions.
+    // buffering and any future page-table work. The carved heap range is
+    // reserved below so frames are never handed out twice.
     memory::frame_allocator::init_from_memory_map(&boot_info.memory_regions);
+    if heap_size >= MIN_CARVED_HEAP {
+        memory::frame_allocator::reserve_range(heap_phys, heap_phys + heap_size);
+    }
     serial_println!("Frame allocator initialized");
 
     // Attach UEFI GOP framebuffer when present so `println!` reaches the
@@ -146,6 +172,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Initialize ATA disk driver
     drivers::ata::init();
+
+    // Initialize virtio-blk disks (extras beyond the 4 IDE slots land on
+    // unified drive indices 4+; needs the `usb` feature for DMA helpers).
+    #[cfg(feature = "usb")]
+    drivers::virtio_blk::init();
+    #[cfg(not(feature = "usb"))]
+    serial_println!("virtio-blk not compiled in (ATA-only drives)");
 
     // Initialize networking (E1000 NIC)
     if let Err(e) = drivers::e1000::init(phys_mem_offset) {

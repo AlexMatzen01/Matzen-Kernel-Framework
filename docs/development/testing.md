@@ -171,8 +171,8 @@ chmod +x test_networking.sh
 # test_filesystem.sh
 
 OUTPUT=$("./run.sh target/x86_64-mfk/release/mfk-kernel" <<EOF
-mkfs
-mount
+mkfs 1 --yes
+mount 1
 write test.txt "Hello, World!"
 read test.txt
 ls
@@ -411,8 +411,8 @@ EOF
 # load_test.sh - Write many files
 
 ./run.sh target/x86_64-mfk/release/mfk-kernel <<EOF
-mkfs
-mount
+mkfs 1 --yes
+mount 1
 
 write file1.txt "content"
 write file2.txt "content"

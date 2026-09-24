@@ -24,14 +24,18 @@ use spin::Mutex;
 // Limits
 // ──────────────────────────────────────────────
 
-/// Max accepted image file size (8 MiB).
-pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Max accepted image file size (4 MiB; sized for the 32 MiB kernel heap —
+/// file bytes, inflate output and RGBA buffers are alive at once).
+pub const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 /// Max image dimension (either axis).
 pub const MAX_IMAGE_DIM: u32 = 4096;
-/// Max decoded pixels (16 MP; bounds transient + cache memory).
-pub const MAX_IMAGE_PIXELS: u64 = 16_777_216;
-/// Max zlib/deflate output while inflating IDAT.
-const MAX_INFLATE_BYTES: usize = 64 * 1024 * 1024;
+/// Max decoded pixels (1920x1080; bounds transient + cache memory so a
+/// too-big image is a clean error, never an out-of-memory panic).
+pub const MAX_IMAGE_PIXELS: u64 = 1920 * 1080;
+/// Max zlib/deflate output while inflating IDAT (covers 8-bit paths at the
+/// pixel cap with headroom; 16-bit RGB at full cap may exceed it and is
+/// rejected cleanly — re-save as 8-bit).
+const MAX_INFLATE_BYTES: usize = 12 * 1024 * 1024;
 /// Largest screen cache we build (4K). Bigger screens use direct rendering.
 const MAX_CACHE_PIXELS: u64 = 3840 * 2160;
 /// Settings file location on SimplFS.
@@ -183,7 +187,7 @@ pub fn has_supported_extension(path: &str) -> bool {
 
 pub fn decode_auto(bytes: &[u8]) -> Result<DecodedImage, &'static str> {
     if bytes.len() > MAX_IMAGE_BYTES {
-        return Err("image too large (max 8 MiB)");
+        return Err("image too large (max 4 MiB; resize below 1920x1080)");
     }
     if bytes.is_empty() {
         return Err("empty file");
@@ -765,7 +769,7 @@ pub fn decode_png(bytes: &[u8]) -> Result<DecodedImage, &'static str> {
         return Err("not a PNG file");
     }
     if bytes.len() > MAX_IMAGE_BYTES {
-        return Err("image too large (max 8 MiB)");
+        return Err("image too large (max 4 MiB; resize below 1920x1080)");
     }
     let mut off = 8usize;
     let mut w = 0u32;
@@ -1383,7 +1387,7 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<DecodedImage, &'static str> {
         return Err("not a JPEG file");
     }
     if bytes.len() > MAX_IMAGE_BYTES {
-        return Err("image too large (max 8 MiB)");
+        return Err("image too large (max 4 MiB; resize below 1920x1080)");
     }
 
     let mut pos = 2usize; // skip SOI
@@ -2217,4 +2221,87 @@ pub fn preview_rgba(max_w: u32, max_h: u32) -> Option<(Vec<u8>, u32, u32)> {
     let st = WALLPAPER.lock();
     let img = st.original.as_ref()?;
     make_preview(img, max_w, max_h, st.bg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_auto, decode_jpeg, decode_png, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS};
+
+    /// Minimal 1x1 grayscale PNG (stored deflate block; CRCs unchecked by
+    /// the decoder, any 4 bytes do). Validates the happy path under the caps.
+    fn tiny_png() -> alloc::vec::Vec<u8> {
+        let mut png = alloc::vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A,
+        ];
+        // IHDR: 1x1, 8-bit grayscale, no interlace.
+        png.extend_from_slice(&[0, 0, 0, 13]);
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0]);
+        png.extend_from_slice(&[0, 0, 0, 0]); // crc (unchecked)
+        // IDAT: zlib(stored block: filter 0 + pixel 0) + adler32(0x00020001).
+        let idat: [u8; 13] = [
+            0x78, 0x01, 0x01, 0x02, 0x00, 0xFD, 0xFF, 0x00, 0x00, 0x00, 0x02, 0x00,
+            0x01,
+        ];
+        png.extend_from_slice(&[0, 0, 0, 13]);
+        png.extend_from_slice(b"IDAT");
+        png.extend_from_slice(&idat);
+        png.extend_from_slice(&[0, 0, 0, 0]); // crc (unchecked)
+        png.extend_from_slice(&[0, 0, 0, 0]);
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0, 0, 0, 0]); // crc (unchecked)
+        png
+    }
+
+    #[test]
+    fn tiny_png_decodes() {
+        let img = decode_auto(&tiny_png()).unwrap();
+        assert_eq!((img.w, img.h), (1, 1));
+        assert_eq!(img.rgba.len(), 4);
+    }
+
+    #[test]
+    fn oversize_file_rejected_before_decode() {
+        // MAX_IMAGE_BYTES + 1 with valid magic: must fail on size, without
+        // attempting any decode allocation.
+        let mut big = alloc::vec![0u8; MAX_IMAGE_BYTES + 1];
+        big[0] = 0x89;
+        big[1] = b'P';
+        big[2] = b'N';
+        big[3] = b'G';
+        big[4] = 0x0D;
+        big[5] = 0x0A;
+        big[6] = 0x1A;
+        big[7] = 0x0A;
+        assert!(decode_auto(&big).is_err());
+        assert!(decode_png(&big).is_err());
+        let mut jpg = alloc::vec![0u8; MAX_IMAGE_BYTES + 1];
+        jpg[0] = 0xFF;
+        jpg[1] = 0xD8;
+        jpg[2] = 0xFF;
+        assert!(decode_jpeg(&jpg).is_err());
+        // The pixel cap fits a 1080p framebuffer budget.
+        assert!(MAX_IMAGE_PIXELS <= 1920 * 1080);
+    }
+
+    #[test]
+    fn oversize_dimensions_rejected() {
+        // 4096x4096 IHDR (> pixel cap): must fail on dimensions, before IDAT
+        // accumulation or inflate.
+        let mut png = alloc::vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A,
+        ];
+        png.extend_from_slice(&[0, 0, 0, 13]);
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[
+            0x00, 0x00, 0x10, 0x00, // w = 4096
+            0x00, 0x00, 0x10, 0x00, // h = 4096
+            8, 2, 0, 0, 0, // 8-bit RGB, no interlace
+        ]);
+        png.extend_from_slice(&[0, 0, 0, 0]); // crc (unchecked)
+        png.extend_from_slice(&[0, 0, 0, 0]);
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0, 0, 0, 0]); // crc (unchecked)
+        assert!(decode_png(&png).is_err_and(|e| e == "png: image has too many pixels"));
+    }
 }

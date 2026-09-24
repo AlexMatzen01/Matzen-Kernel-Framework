@@ -148,9 +148,13 @@ ifconfig                # Show/set IP address
 ping 10.0.2.2 4         # Test connectivity
 netstat                 # Network status
 
-# File system
-mkfs                    # Format disk
-mount                   # Mount filesystem
+# File system (drives: 0-3 ATA, 4+ virtio-blk; default drive 1)
+diskinfo                # List all drives
+mkfs 1 --yes            # Format drive 1 (asks for --yes to confirm)
+mount 1                 # Mount drive 1
+install --list          # Show install targets
+install 4               # Install MFK to drive 4 (asks for confirmation)
+wget http://10.0.2.2:8000/f.txt /f.txt  # Download to the mounted drive
 ls                      # List files
 write file.txt content  # Create/write file
 cat file.txt            # Read file
@@ -161,6 +165,12 @@ rm file.txt             # Delete file
 reboot                  # Reboot
 halt                    # Shutdown
 ```
+
+### Desktop wallpaper images
+
+Keep images small: PNG/JPG up to 4 MiB and 1920x1080 pixels. Larger
+files are rejected with a clear error (the kernel heap holds file
+bytes, decode buffers and the wallpaper cache at once).
 
 ## QEMU Configuration
 

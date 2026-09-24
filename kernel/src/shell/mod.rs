@@ -103,7 +103,7 @@ fn current_path_string() -> Option<alloc::string::String> {
     let fs_guard = FILESYSTEM.lock();
     if fs_guard.is_some() {
         drop(fs_guard);
-        let mut device = crate::drivers::block::AtaBlockDevice::new();
+        let mut device = mounted_device();
         let mut guard = FILESYSTEM.lock();
         if let Some(ref mut fs) = *guard {
             if let Ok(p) = fs.current_path(&mut device) {
@@ -124,6 +124,42 @@ static INTERRUPT_FLAG: AtomicBool = AtomicBool::new(false);
 
 /// Global filesystem state
 static FILESYSTEM: Mutex<Option<crate::fs::SimpleFilesystem>> = Mutex::new(None);
+
+/// Which unified drive index the filesystem is mounted from (None = default
+/// data drive). Set on every successful `mount`, cleared on `mkfs` of the
+/// mounted drive.
+static MOUNTED_DRIVE: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Currently mounted drive index (defaults to the data drive).
+pub fn mounted_drive() -> usize {
+    (*MOUNTED_DRIVE.lock()).unwrap_or(crate::drivers::drives::DATA_DRIVE)
+}
+
+/// Block device for the currently mounted drive (shared by shell, wget,
+/// editor, app runner and desktop so everything targets the same disk).
+pub fn mounted_device() -> crate::drivers::block::DriveBlockDevice {
+    crate::drivers::block::DriveBlockDevice::new(mounted_drive())
+}
+
+/// Parse an optional drive index argument (`""`, `"4"`, `"drive4"`).
+/// Returns `Ok(None)` for empty (caller substitutes the default),
+/// `Ok(Some(n))` for a valid index, `Err(msg)` otherwise.
+fn parse_drive_arg(args: &str) -> Result<Option<usize>, &'static str> {
+    let t = args.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    // First token only; flags (--list/--yes) are handled by callers.
+    let tok = t.split_whitespace().next().unwrap_or("");
+    let num = tok
+        .strip_prefix("drive")
+        .or_else(|| tok.strip_prefix("DRIVE"))
+        .unwrap_or(tok);
+    match num.parse::<usize>() {
+        Ok(n) if n < crate::drivers::drives::drive_count() => Ok(Some(n)),
+        _ => Err("Invalid drive index (see 'diskinfo')"),
+    }
+}
 
 /// Get the current tick count (rough millisecond approximation)
 pub fn get_tick_count() -> u64 {
@@ -253,9 +289,9 @@ pub fn execute_command(cmd: &str) -> bool {
         "calc" => cmd_calc(parts.1),
         "color" => cmd_color(parts.1),
         "test" => cmd_test(),
-        "diskinfo" => cmd_diskinfo(),
-        "mkfs" => cmd_mkfs(),
-        "mount" => cmd_mount(),
+        "diskinfo" => cmd_diskinfo(parts.1),
+        "mkfs" => cmd_mkfs(parts.1),
+        "mount" => cmd_mount(parts.1),
         "ls" | "dir" => cmd_ls(parts.1),
         "touch" => cmd_touch(parts.1),
         "cat" => cmd_cat(parts.1),
@@ -267,7 +303,7 @@ pub fn execute_command(cmd: &str) -> bool {
         "pwd" => cmd_pwd(),
         "ifconfig" => cmd_ifconfig(parts.1),
         "ping" => cmd_ping(parts.1),
-        "netstat" => cmd_netstat(),
+        "netstat" => cmd_netstat(parts.1),
         "dns" => cmd_dns(parts.1),
         "arp" => cmd_arp(parts.1),
         "udp-send" => cmd_udp_send(parts.1),
@@ -295,7 +331,7 @@ pub fn execute_command(cmd: &str) -> bool {
                 cmd_desktop();
             }
         }
-        "install" => cmd_install(),
+        "install" => cmd_install(parts.1),
         "usb" => cmd_usb(),
         "mouse" => cmd_mouse(),
         "" => {}
@@ -327,11 +363,12 @@ fn cmd_help() {
     println!("  halt      - Halt the system");
     println!("  date      - Display current date (simulated)");
     println!("  whoami    - Display current user");
+    println!("  install [<drive>|--list|--verify [drive]] - Install MFK to disk (interactive)");
     println!();
     println!("File System Commands:");
-    println!("  diskinfo  - Display disk information");
-    println!("  mkfs      - Format the disk with SimplFS");
-    println!("  mount     - Mount the filesystem");
+    println!("  diskinfo [--rescan] - Display all drives (0-3 ATA, 4+ virtio-blk)");
+    println!("  mkfs [drive] [--yes] - Format drive with SimplFS (default drive 1)");
+    println!("  mount [drive] - Mount drive filesystem (default drive 1)");
     println!("  ls/dir [path] - List files (e.g., 'ls', 'ls /docs')");
     println!("  touch     - Create a new file (e.g., 'touch test.txt', 'touch dir/file.txt')");
     println!("  cat       - Display file contents (e.g., 'cat test.txt')");
@@ -377,7 +414,7 @@ fn cmd_help() {
     println!("  speedtest-server - Show/set speedtest server");
     println!("  netdebug     - Toggle gated packet tracing (on/off/status)");
     println!("  tlsinfo      - Show whether the TLS 1.3 backend is compiled in");
-    println!("  Add -d/--debug to wget and speedtest for network traces.");
+    println!("  Add -d/--debug to any network command for packet traces.");
 }
 
 /// Clears the screen - true clear for both VGA and serial, no whitespace trick
@@ -806,25 +843,81 @@ fn cmd_test() {
     println!("All tests completed!");
 }
 
-/// Display disk information
-fn cmd_diskinfo() {
-    println!("Disk Information:");
-    println!("  Primary Master: ATA PIO Mode");
+/// Display disk information (all unified drives: 0-3 ATA, 4+ virtio-blk).
+fn cmd_diskinfo(args: &str) {
+    let t = args.trim();
+    if t == "--rescan" || t == "rescan" {
+        crate::drivers::drives::rescan_all_silent();
+        println!("Re-probed ATA + virtio-blk buses.");
+    }
+    let count = crate::drivers::drives::drive_count();
+    println!("Disk Information ({} drive(s): 0-3 ATA, 4+ virtio-blk):", count);
+    for i in 0..count {
+        let mut label = crate::drivers::drives::drive_label(i);
+        if is_mounted() && i == mounted_drive() {
+            label.push_str(" [MOUNTED]");
+        }
+        println!("  {}", label);
+    }
     println!("  Sector size: 512 bytes");
-    println!("  Block device layer: Active");
     println!();
-    println!("Use 'mkfs' to format disk, then 'mount' to access filesystem");
+    println!("Use 'mkfs <drive>' to format (default 1), then 'mount <drive>' to access.");
 }
 
-/// Format the disk with SimplFS
-fn cmd_mkfs() {
-    println!("Formatting disk with SimplFS...");
+/// Format a drive with SimplFS (`mkfs [drive] [--yes]`, `mkfs --list`).
+fn cmd_mkfs(args: &str) {
+    let t = args.trim();
+    if t == "--list" || t == "list" {
+        cmd_diskinfo("");
+        return;
+    }
+    let confirmed = t.split_whitespace().any(|w| w == "--yes" || w == "-y");
+    let stripped = t.replace("--yes", " ").replace("-y", " ");
+    let target = match parse_drive_arg(&stripped) {
+        Ok(None) => crate::drivers::drives::DATA_DRIVE,
+        Ok(Some(n)) => n,
+        Err(e) => {
+            println!("mkfs: {}. Usage: mkfs [drive] [--yes]", e);
+            return;
+        }
+    };
+    let Some(info) = crate::drivers::drives::drive_info(target) else {
+        println!("mkfs: drive {} out of range.", target);
+        return;
+    };
+    if !info.exists {
+        println!(
+            "mkfs: drive {} absent ({}). Attach it and run 'diskinfo --rescan'.",
+            target,
+            info.last_error.unwrap_or("not detected")
+        );
+        return;
+    }
+    if !confirmed {
+        println!(
+            "mkfs: will ERASE drive {} ({} sectors, {} MB) with SimplFS.",
+            target,
+            info.total_sectors,
+            info.total_sectors / 2048
+        );
+        println!("Re-run as 'mkfs {} --yes' to confirm.", target);
+        return;
+    }
+    println!(
+        "Formatting drive {} with SimplFS ({} sectors)...",
+        target, info.total_sectors
+    );
 
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = crate::drivers::block::DriveBlockDevice::new(target);
     match crate::fs::SimpleFilesystem::format(&mut device) {
         Ok(()) => {
-            println!("Filesystem formatted successfully!");
-            println!("Use 'mount' to mount the filesystem.");
+            // A stale in-memory FS of this drive must not linger after erase.
+            if mounted_drive() == target {
+                *FILESYSTEM.lock() = None;
+                *MOUNTED_DRIVE.lock() = None;
+            }
+            println!("Filesystem formatted successfully on drive {}!", target);
+            println!("Use 'mount {}' to mount the filesystem.", target);
         }
         Err(e) => {
             println!("Failed to format filesystem: {}", e);
@@ -832,20 +925,32 @@ fn cmd_mkfs() {
     }
 }
 
-/// Mount the filesystem
-fn cmd_mount() {
-    println!("Mounting filesystem...");
+/// Mount a drive's filesystem (`mount [drive]`, default = data drive).
+fn cmd_mount(args: &str) {
+    let target = match parse_drive_arg(args) {
+        Ok(None) => crate::drivers::drives::DATA_DRIVE,
+        Ok(Some(n)) => n,
+        Err(e) => {
+            println!("mount: {}. Usage: mount [drive]", e);
+            return;
+        }
+    };
+    println!("Mounting filesystem from drive {}...", target);
 
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = crate::drivers::block::DriveBlockDevice::new(target);
     match crate::fs::SimpleFilesystem::mount(&mut device) {
         Ok(fs) => {
             *FILESYSTEM.lock() = Some(fs);
-            println!("Filesystem mounted successfully!");
+            *MOUNTED_DRIVE.lock() = Some(target);
+            println!("Filesystem mounted successfully from drive {}!", target);
             println!("Root directory ready. Use 'ls' to list files.");
         }
         Err(e) => {
             println!("Failed to mount filesystem: {}", e);
-            println!("You may need to run 'mkfs' first to format the disk.");
+            println!(
+                "You may need to run 'mkfs {} --yes' first to format drive {}.",
+                target, target
+            );
         }
     }
 }
@@ -858,7 +963,7 @@ fn cmd_ls(path: &str) {
         return;
     }
     drop(fs_guard);
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     let mut fs_guard = FILESYSTEM.lock();
     if let Some(ref mut fs) = *fs_guard {
         // Determine target inode
@@ -917,7 +1022,7 @@ fn cmd_touch(path: &str) {
         return;
     }
 
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
 
     if let Some(ref mut fs) = *fs_guard {
         match fs.create_file(&mut device, path.trim()) {
@@ -944,7 +1049,7 @@ fn cmd_cat(path: &str) {
         return;
     }
 
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
 
     if let Some(ref mut fs) = *fs_guard {
         match fs.read_file(&mut device, path.trim()) {
@@ -1001,7 +1106,7 @@ fn cmd_write(args: &str) {
         return;
     }
 
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
 
     if let Some(ref mut fs) = *fs_guard {
         // Try to resolve existing file (path-aware)
@@ -1054,7 +1159,7 @@ fn cmd_rm(path: &str) {
         return;
     }
 
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
 
     if let Some(ref mut fs) = *fs_guard {
         match fs.delete_file(&mut device, path.trim()) {
@@ -1080,7 +1185,7 @@ fn cmd_mkdir(path: &str) {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     if let Some(ref mut fs) = *fs_guard {
         match fs.create_directory(&mut device, path.trim()) {
             Ok(ino) => println!("Created directory '{}' (inode {})", path.trim(), ino),
@@ -1100,7 +1205,7 @@ fn cmd_rmdir(path: &str) {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     if let Some(ref mut fs) = *fs_guard {
         match fs.remove_directory(&mut device, path.trim()) {
             Ok(()) => println!("Removed directory '{}'", path.trim()),
@@ -1116,7 +1221,7 @@ fn cmd_cd(path: &str) {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     if let Some(ref mut fs) = *fs_guard {
         let target = if path.trim().is_empty() {
             "/"
@@ -1137,7 +1242,7 @@ fn cmd_pwd() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     if let Some(ref mut fs) = *fs_guard {
         match fs.current_path(&mut device) {
             Ok(p) => println!("{}", p),
@@ -1146,8 +1251,10 @@ fn cmd_pwd() {
     }
 }
 
-/// Configure network interface
+/// Configure network interface (`-d`/`--debug` enables packet tracing).
 fn cmd_ifconfig(args: &str) {
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let args = args_owned.as_str();
     if args.is_empty() {
         // Display current configuration
         if let Some(mac) = crate::drivers::e1000::mac_address() {
@@ -1268,8 +1375,10 @@ fn take_word(input: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Send ping (ICMP echo request)
+/// Send ping (ICMP echo request). `-d`/`--debug` shows packet traces.
 fn cmd_ping(args: &str) {
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let args = args_owned.as_str();
     if args.is_empty() {
         println!("Usage: ping <ip-address|hostname> [count]");
         println!("Example: ping 10.0.2.2 4");
@@ -1402,7 +1511,8 @@ fn cmd_ping(args: &str) {
 }
 
 /// Display network statistics
-fn cmd_netstat() {
+fn cmd_netstat(args: &str) {
+    let (_net_dbg, _clean) = crate::net::debug::DebugGuard::acquire(args);
     println!("Network Status:");
     println!();
 
@@ -1455,6 +1565,8 @@ fn cmd_netstat() {
 }
 
 fn cmd_dns(args: &str) {
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let args = args_owned.as_str();
     if crate::net::ip::get_ip_address().is_none() {
         println!("Network not configured. Run 'ifconfig 10.0.2.15 255.255.255.0 10.0.2.2' first.");
         return;
@@ -1478,7 +1590,8 @@ fn cmd_dns(args: &str) {
 }
 
 fn cmd_arp(args: &str) {
-    let arg = args.trim();
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let arg = args_owned.as_str().trim();
     if arg.is_empty() || arg == "-a" || arg == "list" {
         let entries = crate::net::arp::entries();
         if entries.is_empty() {
@@ -1507,6 +1620,8 @@ fn cmd_arp(args: &str) {
 }
 
 fn cmd_udp_send(args: &str) {
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let args = args_owned.as_str();
     let Some((host, rest)) = take_word(args) else {
         println!("Usage: udp-send <IPv4|hostname> <local-port> <remote-port> <text>");
         return;
@@ -1577,6 +1692,8 @@ fn cmd_tlsinfo() {
 }
 
 fn cmd_udp_recv(args: &str) {
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let args = args_owned.as_str();
     let mut fields = args.split_whitespace();
     let Some(port_text) = fields.next() else {
         println!("Usage: udp-recv <local-port> [timeout-seconds]");
@@ -1628,8 +1745,10 @@ fn cmd_udp_recv(args: &str) {
 }
 
 fn cmd_tcpconnect(args: &str) {
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let args = args_owned.as_str();
     if args.is_empty() {
-        println!("Usage: tcpconnect <ip-address|hostname> <port>");
+        println!("Usage: tcpconnect [-d|--debug] <ip-address|hostname> <port>");
         println!("Example: tcpconnect 10.0.2.2 80");
         println!("         tcpconnect 93.184.216.34 80  (example.com)");
         return;
@@ -1717,6 +1836,8 @@ fn cmd_tcpconnect(args: &str) {
 }
 
 fn cmd_tcpsend(args: &str) {
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let args = args_owned.as_str();
     if args.is_empty() {
         println!("Usage: tcpsend <local-port> <data>");
         println!("Example: tcpsend 49152 GET / HTTP/1.0");
@@ -1786,6 +1907,8 @@ fn cmd_tcpsend(args: &str) {
 }
 
 fn cmd_tcpclose(args: &str) {
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let args = args_owned.as_str();
     if args.is_empty() {
         println!("Usage: tcpclose <local-port>");
         println!("Example: tcpclose 49152");
@@ -1807,7 +1930,8 @@ fn cmd_tcpclose(args: &str) {
 }
 
 fn cmd_tcpstatus(args: &str) {
-    let Ok(port) = args.trim().parse::<u16>() else {
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let Ok(port) = args_owned.as_str().trim().parse::<u16>() else {
         println!("Usage: tcpstatus <local-port>");
         return;
     };
@@ -1818,7 +1942,8 @@ fn cmd_tcpstatus(args: &str) {
 }
 
 fn cmd_tcprecv(args: &str) {
-    let mut fields = args.split_whitespace();
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let mut fields = args_owned.as_str().split_whitespace();
     let Some(port_text) = fields.next() else {
         println!("Usage: tcprecv <local-port> [timeout-seconds]");
         return;
@@ -1985,34 +2110,46 @@ pub fn promote_download_file(
 }
 
 // ── GUI bridge (shared by desktop File Explorer + Drive apps) ─────
-// These wrap the same FILESYSTEM + AtaBlockDevice logic as the CLI
+// These wrap the same FILESYSTEM + DriveBlockDevice logic as the CLI
 // commands so shell and desktop stay in sync. All helpers create
 // their own device, lock FS once, copy results out, and drop the
 // lock before returning (desktop must never hold the lock across
 // compositor.render()).
 
-/// Format disk (GUI version of `mkfs`). Returns human-readable summary.
-/// Drops any mounted FS so a stale in-memory image can't linger after erase.
-pub fn gui_format_disk() -> Result<alloc::string::String, &'static str> {
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+/// Format a drive (GUI version of `mkfs`). Returns human-readable summary.
+/// Drops the mounted FS when it came from this drive so a stale in-memory
+/// image can't linger after erase.
+pub fn gui_format_disk(drive: usize) -> Result<alloc::string::String, &'static str> {
+    if drive >= crate::drivers::drives::drive_count() {
+        return Err("Invalid drive index");
+    }
+    let mut device = crate::drivers::block::DriveBlockDevice::new(drive);
     match crate::fs::SimpleFilesystem::format(&mut device) {
         Ok(()) => {
-            *FILESYSTEM.lock() = None;
-            Ok(alloc::string::String::from(
-                "Formatted with SimplFS. Use Mount.",
+            if mounted_drive() == drive {
+                *FILESYSTEM.lock() = None;
+                *MOUNTED_DRIVE.lock() = None;
+            }
+            Ok(alloc::format!(
+                "Drive {} formatted with SimplFS. Use Mount.",
+                drive
             ))
         }
         Err(e) => Err(e),
     }
 }
 
-/// Mount filesystem (GUI version of `mount`). Returns human-readable summary.
-pub fn gui_mount_fs() -> Result<alloc::string::String, &'static str> {
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+/// Mount a drive's filesystem (GUI version of `mount`).
+pub fn gui_mount_fs(drive: usize) -> Result<alloc::string::String, &'static str> {
+    if drive >= crate::drivers::drives::drive_count() {
+        return Err("Invalid drive index");
+    }
+    let mut device = crate::drivers::block::DriveBlockDevice::new(drive);
     match crate::fs::SimpleFilesystem::mount(&mut device) {
         Ok(fs) => {
             *FILESYSTEM.lock() = Some(fs);
-            Ok(alloc::string::String::from("Mounted. Root ready."))
+            *MOUNTED_DRIVE.lock() = Some(drive);
+            Ok(alloc::format!("Drive {} mounted. Root ready.", drive))
         }
         Err(e) => Err(e),
     }
@@ -2022,42 +2159,46 @@ pub fn gui_mount_fs() -> Result<alloc::string::String, &'static str> {
 pub fn gui_fs_status() -> alloc::string::String {
     let guard = FILESYSTEM.lock();
     if guard.is_none() {
-        return alloc::string::String::from("Status: not mounted (open Drive: Format, then Mount)");
+        return alloc::string::String::from("Status: not mounted (open Drive: pick disk, Format, then Mount)");
     }
     drop(guard);
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     let mut guard = FILESYSTEM.lock();
     if let Some(ref mut fs) = *guard {
         match fs.current_path(&mut device) {
-            Ok(p) => alloc::format!("Status: mounted, cwd={}", p),
-            Err(_) => alloc::string::String::from("Status: mounted"),
+            Ok(p) => alloc::format!("Status: mounted (drive {}), cwd={}", mounted_drive(), p),
+            Err(_) => alloc::format!("Status: mounted (drive {})", mounted_drive()),
         }
     } else {
         alloc::string::String::from("Status: not mounted")
     }
 }
 
-/// Disk + FS summary for the Drive app status label.
+/// Disk + FS summary for the Drive app status label (all drives).
 pub fn gui_disk_summary() -> alloc::string::String {
     use alloc::string::ToString;
-    if !is_mounted() {
-        return alloc::string::String::from("Disk: ATA PIO 512B/block | FS: not mounted");
+    let mut out = alloc::string::String::from("Drives (0-3 ATA, 4+ virtio):");
+    for i in 0..crate::drivers::drives::drive_count() {
+        out.push('\n');
+        out.push_str(&crate::drivers::drives::drive_label(i));
+        if is_mounted() && i == mounted_drive() {
+            out.push_str(" [MOUNTED]");
+        }
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
-    let mut guard = FILESYSTEM.lock();
-    if let Some(ref mut fs) = *guard {
-        // list root to prove readability + count entries
-        let count = match fs.list_directory(&mut device, 0) {
-            Ok(v) => v.len(),
-            Err(_) => 0,
-        };
-        alloc::format!(
-            "Disk: ATA 512B/block | FS: SimplFS mounted | root entries: {}",
-            count
-        )
+    if is_mounted() {
+        let mut device = mounted_device();
+        let mut guard = FILESYSTEM.lock();
+        if let Some(ref mut fs) = *guard {
+            let count = match fs.list_directory(&mut device, 0) {
+                Ok(v) => v.len(),
+                Err(_) => 0,
+            };
+            out.push_str(&alloc::format!("\nFS: SimplFS mounted, root entries: {}", count));
+        }
     } else {
-        alloc::string::String::from("Disk: ATA | FS: not mounted")
+        out.push_str("\nFS: not mounted");
     }
+    out
 }
 
 /// List directory at `path` for GUI. Returns (display_path, entries).
@@ -2068,7 +2209,7 @@ pub fn gui_list_dir(
     if !is_mounted() {
         return Err("Filesystem not mounted. Use Drive: Mount first.");
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     let mut guard = FILESYSTEM.lock();
     if let Some(ref mut fs) = *guard {
         let target = if path.trim().is_empty() {
@@ -2103,10 +2244,26 @@ pub fn gui_read_file(path: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
     if !is_mounted() {
         return Err("Filesystem not mounted");
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     let mut guard = FILESYSTEM.lock();
     if let Some(ref mut fs) = *guard {
         fs.read_file(&mut device, path.trim())
+    } else {
+        Err("Filesystem not mounted")
+    }
+}
+
+/// File size in bytes for GUI (metadata only, no buffer allocation — safe
+/// to call before attempting a big read).
+pub fn gui_file_size(path: &str) -> Result<u64, &'static str> {
+    if !is_mounted() {
+        return Err("Filesystem not mounted");
+    }
+    let mut device = mounted_device();
+    let mut guard = FILESYSTEM.lock();
+    if let Some(ref mut fs) = *guard {
+        let ino = fs.resolve_file_or_dir(&mut device, path.trim())?;
+        fs.file_size(ino)
     } else {
         Err("Filesystem not mounted")
     }
@@ -2117,7 +2274,7 @@ pub fn gui_create_file(path: &str) -> Result<u32, &'static str> {
     if !is_mounted() {
         return Err("Filesystem not mounted");
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     let mut guard = FILESYSTEM.lock();
     if let Some(ref mut fs) = *guard {
         fs.create_file(&mut device, path.trim())
@@ -2131,7 +2288,7 @@ pub fn gui_create_dir(path: &str) -> Result<u32, &'static str> {
     if !is_mounted() {
         return Err("Filesystem not mounted");
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     let mut guard = FILESYSTEM.lock();
     if let Some(ref mut fs) = *guard {
         fs.create_directory(&mut device, path.trim())
@@ -2145,7 +2302,7 @@ pub fn gui_delete_path(path: &str) -> Result<(), &'static str> {
     if !is_mounted() {
         return Err("Filesystem not mounted");
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     let mut guard = FILESYSTEM.lock();
     if let Some(ref mut fs) = *guard {
         // Determine type first
@@ -2174,7 +2331,7 @@ pub fn gui_save_settings(text: &str) -> Result<alloc::string::String, &'static s
         return Err("Settings too large");
     }
     let path = crate::desktop::wallpaper::SETTINGS_PATH;
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     let mut guard = FILESYSTEM.lock();
     if let Some(ref mut fs) = *guard {
         if fs.resolve_file_or_dir(&mut device, "/config").is_err() {
@@ -2294,7 +2451,7 @@ fn cmd_appinfo(args: &str) {
         println!("Filesystem not mounted");
         return;
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     if let Some(data) = read_file_contents(path, &mut device) {
         println!("App '{}' ({} bytes)", path, data.len());
         if data.len() >= 4 && &data[0..4] == &[0x7F, b'E', b'L', b'F'] {
@@ -2350,9 +2507,11 @@ fn cmd_desktop() {
     crate::desktop::run();
 }
 
-/// Runs the disk installer (text mode, works on VGA or framebuffer)
-fn cmd_install() {
-    crate::install::run();
+/// Runs the disk installer (text mode, works on VGA or framebuffer).
+/// `install` opens the interactive menu; `install <drive>`,
+/// `install --list`, `install --verify [drive]` shortcut it.
+fn cmd_install(args: &str) {
+    crate::install::run_with_args(args);
 }
 
 /// Shows USB controller + HID keyboard status (also printed at boot)
@@ -2582,7 +2741,7 @@ fn common_prefix(mut candidates: Vec<&str>, prefix: &str) -> String {
 
 fn get_file_candidates(dir_part: &str, file_prefix: &str) -> Option<Vec<crate::fs::FileInfo>> {
     // Returns None if dir cannot be resolved (e.g., not a directory or not mounted)
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = mounted_device();
     let mut guard = FILESYSTEM.lock();
     let fs = match guard.as_mut() {
         Some(f) => f,

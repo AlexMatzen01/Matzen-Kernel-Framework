@@ -4,7 +4,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Max undo history entries (to bound heap 512KiB)
+/// Max undo history entries (to bound heap usage)
 const MAX_UNDO: usize = 256;
 
 /// Single undo action
@@ -79,7 +79,7 @@ impl TextBuffer {
         if !mounted {
             return None;
         }
-        let mut device = crate::drivers::block::AtaBlockDevice::new();
+        let mut device = crate::shell::mounted_device();
         // Need to get file data via FS
         // We need access to FILESYSTEM – we will expose a helper in shell
         crate::shell::read_file_contents(name, &mut device)
@@ -840,7 +840,7 @@ impl TextBuffer {
         }
         let data = self.to_bytes();
         // Use shell's helper to write – it creates if not exists
-        let mut device = crate::drivers::block::AtaBlockDevice::new();
+        let mut device = crate::shell::mounted_device();
         crate::shell::write_file_contents(name, &data, &mut device)?;
         self.filename = Some(String::from(name));
         self.dirty = false;

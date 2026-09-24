@@ -38,7 +38,7 @@ pub fn process_packet(packet: &[u8]) {
 
     let frame = unsafe { core::ptr::read_unaligned(packet.as_ptr() as *const EthernetFrame) };
 
-    crate::serial_println!(
+    crate::net_log!(
         "Ethernet: Received frame, ethertype={:#x}, len={}",
         frame.get_ethertype(),
         packet.len()

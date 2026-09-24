@@ -198,6 +198,15 @@ fn run_shell_command(scene: &mut crate::desktop::scene::Scene, app: &mut ShellAp
     refresh_shell_app(scene, app);
 }
 
+/// Runs a fullscreen text tool (installer/editor) with its VGA output
+/// mirrored into `rect_px` (usually the calling window's interior) so it
+/// stays visible on the pixel framebuffer. Restores normal rendering after.
+pub(crate) fn run_fullscreen_in(rect_px: (usize, usize, usize, usize), f: impl FnOnce()) {
+    *EDITOR_MIRROR_RECT.lock() = Some(rect_px);
+    f();
+    *EDITOR_MIRROR_RECT.lock() = None;
+}
+
 /// Repaints the legacy VGA text grid inside the active desktop terminal
 /// while a full-screen tool uses it as its screen backend.
 pub(crate) fn refresh_terminal_editor() {
@@ -340,7 +349,7 @@ pub fn run() {
         let label_id = crate::desktop::scene::WidgetId::new();
         let label_bounds = scene::Rect::new(20, 40, 360, 200);
         let mut label = crate::desktop::scene::Widget::label(label_bounds,
-            alloc::string::String::from("Matzen Kernel Framework v0.1.0\n\nTaskbar: Shell | Files | Drive\n| Settings\nFiles: browse, Enter opens, type name\nfor New File/Dir, click selects.\nDrives: Format (2-click) + Mount.\nSettings: wallpaper PNG/JPG + Fit/\nFill/Stretch/Center/Tile + colors.\n\nDrag windows by titlebar.\nPress Esc to exit."),
+            alloc::string::String::from("Matzen Kernel Framework v0.1.0\n\nTaskbar: Shell | Files | Drive\n| Settings\nFiles: browse, Enter opens, type name\nfor New File/Dir, click selects.\nDrives: pick disk (Up/Down, 1-8),\nFormat (2-click) + Mount + Install.\nSettings: wallpaper PNG/JPG + Fit/\nFill/Stretch/Center/Tile + colors.\n\nDrag windows by titlebar.\nPress Esc to exit."),
             theme);
         label.id = label_id;
         scene.widgets.insert(label_id, label);
@@ -842,7 +851,7 @@ pub fn run() {
                         }
                     }
                 }
-                // Arrows / PgUp / PgDn belong to Files; ignore elsewhere.
+                // Arrows: Files owns PgUp/PgDn; Up/Down also drive disk selection.
                 crate::drivers::keyboard::Key::ArrowUp
                 | crate::drivers::keyboard::Key::ArrowDown
                 | crate::drivers::keyboard::Key::PageUp
@@ -850,6 +859,11 @@ pub fn run() {
                     if is_explorer {
                         if let Some(app) = explorer_app.as_mut() {
                             files::explorer_key(&mut scene, app, ev.key);
+                        }
+                    } else if is_drive {
+                        if let Some(app) = drive_app.as_mut() {
+                            let tick = crate::shell::get_tick_count();
+                            drives::drive_key(&mut scene, app, ev.key, tick);
                         }
                     }
                 }

@@ -92,11 +92,11 @@ mfk> netstat
 Format and mount the virtual disk:
 
 ```bash
-# Format disk
-mfk> mkfs
+# Format disk (drive 1; --yes confirms the erase)
+mfk> mkfs 1 --yes
 
 # Mount filesystem
-mfk> mount
+mfk> mount 1
 
 # Create files
 mfk> write myfile.txt "Hello, World!"

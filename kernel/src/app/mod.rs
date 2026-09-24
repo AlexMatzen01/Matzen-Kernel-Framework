@@ -30,7 +30,7 @@ pub fn run(path: &str, args: &[&str]) -> Result<i32, &'static str> {
     if !crate::shell::is_mounted() {
         return Err("Filesystem not mounted. Use 'mount' first.");
     }
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = crate::shell::mounted_device();
     let data = crate::shell::read_file_contents(path, &mut device)
         .ok_or("Failed to read file (not found or not mounted)")?;
 
@@ -120,7 +120,7 @@ fn is_probably_text(data: &[u8]) -> bool {
 
 /// Helper for shell `mkapp` to create example files on FS
 pub fn create_example_app(name: &str, kind: &str) -> Result<(), &'static str> {
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = crate::shell::mounted_device();
     if !crate::shell::is_mounted() {
         return Err("Filesystem not mounted");
     }
@@ -349,7 +349,7 @@ pub fn write_hex_file(path: &str, hex: &str) -> Result<usize, &'static str> {
         bytes.push((hv << 4) | lv);
     }
     let len = bytes.len();
-    let mut device = crate::drivers::block::AtaBlockDevice::new();
+    let mut device = crate::shell::mounted_device();
     crate::shell::write_file_contents(path, &bytes, &mut device)?;
     Ok(len)
 }
