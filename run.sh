@@ -24,6 +24,9 @@ for arg in "$@"; do
         --vbox|--virtualbox)
             HYPERVISOR="--vbox"
             ;;
+        --hyperv|--hyper-v|--hv)
+            HYPERVISOR="--hyperv"
+            ;;
         --uefi)
             FIRMWARE="--uefi"
             ;;
@@ -33,12 +36,22 @@ for arg in "$@"; do
         --no-run)
             NO_RUN="--no-run"
             ;;
+        --force|--bundle-apps|--with-apps|--hyperv-*|--vhdx=*|--data-disk-size=*|--extra-disk=*|--extra-disk-size=*|--boot-extra-disk*|--wad=*|--wad-disk=*|--wad-disk-size=*|--wad-guest=*|--kbd=*|--xhci-kbd|--vnc|--vnc-port=*|--web-ui|--web-ui-port=*|--gpu-passthrough=*|--gpu-audio=*|--gpu-rom=*)
+            EXTRA_ARGS+=("$arg")
+            ;;
         --help|-h)
-            echo "Usage: $0 [kernel_path] [--vbox|--qemu] [--bios|--uefi] [--no-run]"
+            echo "Usage: $0 [kernel_path] [--vbox|--qemu|--hyperv] [--bios|--uefi] [--no-run] [extra runner flags]"
             echo ""
             echo "Defaults:"
             echo "  Hypervisor: --vbox"
             echo "  Firmware:   --bios"
+            echo ""
+            echo "Hyper-V is Windows-only, Generation 2 (UEFI). It always uses"
+            echo "the UEFI ISO the runner creates next to the UEFI image."
+            echo "Extra Hyper-V flags are passed through to mfk-runner:"
+            echo "  --hyperv-switch=<name> --hyperv-mem=<MB> --hyperv-cpus=<n>"
+            echo "  --hyperv-boot=<dvd|disk> --vhdx=<path> --hyperv-com=<pipe|off>"
+            echo "  --force --bundle-apps --data-disk-size=<s> --extra-disk=<p>"
             echo ""
             echo "Examples:"
             echo "  $0"
@@ -46,6 +59,8 @@ for arg in "$@"; do
             echo "  $0 --qemu --uefi"
             echo "  $0 --vbox --bios"
             echo "  $0 --vbox --uefi"
+            echo "  $0 --hyperv --uefi"
+            echo "  $0 --hyperv --uefi --hyperv-switch=\"Default Switch\" --hyperv-mem=512"
             exit 0
             ;;
         *)
@@ -57,6 +72,15 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# Hyper-V is Generation 2 / UEFI-only.
+if [[ "$HYPERVISOR" == "--hyperv" && "$FIRMWARE" == "--bios" ]]; then
+    echo "ERROR: --hyperv is UEFI-only (Generation 2); drop --bios or pass --uefi." >&2
+    exit 1
+fi
+if [[ "$HYPERVISOR" == "--hyperv" ]]; then
+    FIRMWARE="--uefi"
+fi
 
 # Select firmware image
 if [[ "$FIRMWARE" == "--uefi" ]]; then
@@ -96,6 +120,9 @@ if [[ -z "$NO_RUN" ]]; then
             echo "Install: sudo apt-get install qemu-system-x86 qemu-utils" >&2
             exit 1
         }
+    elif [[ "$HYPERVISOR" == "--hyperv" ]]; then
+        # Checked by the runner itself (Windows + Hyper-V role required).
+        true
     else
         command -v VBoxManage >/dev/null 2>&1 || {
             echo "ERROR: VBoxManage not found." >&2
@@ -125,7 +152,6 @@ RUN_ARGS=(
     "$KERNEL_PATH"
     "$HYPERVISOR"
     "$FIRMWARE"
-    "$FIRMWARE_IMAGE"
 )
 
 [[ -n "$NO_RUN" ]] && RUN_ARGS+=("$NO_RUN")

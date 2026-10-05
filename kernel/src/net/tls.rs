@@ -19,6 +19,14 @@ const TLS_HANDSHAKE_TIMEOUT_MS: u64 = 15_000;
 const TCP_WRITE_CHUNK: usize = 1400;
 const CERTIFICATE_SIZE: usize = 4096;
 
+/// Ceiling on bytes buffered between TCP and the record layer.
+///
+/// A TLS record plus its header is at most 16 KiB + 5 bytes by the spec, and the
+/// largest item the handshake buffers is a 4 KiB certificate, so this is
+/// generous. It exists so a peer that sends faster than records are consumed
+/// fails the transfer instead of growing the buffer without limit.
+const MAX_PENDING: usize = 64 * 1024;
+
 // ISRG Root X1, downloaded from letsencrypt.org/certs/isrgrootx1.pem.
 // Keep the source as base64 so the repository remains text-only; it is
 // decoded into caller-owned storage before constructing the verifier.
@@ -257,6 +265,13 @@ impl TcpSocket {
             super::http::pump();
             if let Some(data) = super::tcp::read_data(self.local_port) {
                 crate::net_log!("TLS: TCP supplied {} bytes", data.len());
+                // A peer that streams faster than the record layer drains must not
+                // grow this buffer without limit. TCP's own receive buffer is
+                // already bounded, so this only needs a ceiling comfortably above
+                // the largest record a handshake or record can produce.
+                if self.pending.len() + data.len() > MAX_PENDING {
+                    return Err(TcpSocketError::Network);
+                }
                 self.pending.extend_from_slice(&data);
                 return Ok(());
             }

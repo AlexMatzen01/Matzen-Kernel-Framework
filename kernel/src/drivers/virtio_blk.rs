@@ -469,10 +469,9 @@ fn dma_phys(virt: u64, len: usize) -> Option<u64> {
         return None;
     }
     let phys = crate::drivers::usb::virt_to_phys_for_dma(virt)?;
-    if phys >= 0x1_0000_0000 {
-        return None;
-    }
-    Some(phys)
+    // The legacy virtio-blk interface uses 32-bit physical addresses in the
+    // descriptor; the shared limit lives in `memmap::DMA_PHYS_LIMIT`.
+    crate::memory::addr::dma_phys(phys)
 }
 
 /// One zeroed DMA-capable page; leaked for driver lifetime.

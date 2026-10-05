@@ -8,11 +8,51 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod simplfs_host;
+mod uefi_iso;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Firmware {
     Bios,
     Uefi,
+}
+
+/// Which USB host controller the emulated keyboard and tablet attach to.
+/// The guest's matching driver (xhci/ehci/uhci/ohci) claims the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KbdMode {
+    Ps2,
+    Xhci,
+    Ehci,
+    Uhci,
+    Ohci,
+}
+
+impl KbdMode {
+    fn is_usb(self) -> bool {
+        self != KbdMode::Ps2
+    }
+
+    /// QEMU `-device` string for this controller, with an explicit id so the
+    /// bus name is predictable.
+    fn hcd_device(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            KbdMode::Xhci => Some(("qemu-xhci", "xhci")),
+            KbdMode::Ehci => Some(("usb-ehci", "ehci")),
+            KbdMode::Uhci => Some(("piix3-usb-uhci", "uhci")),
+            KbdMode::Ohci => Some(("pci-ohci", "ohci")),
+            KbdMode::Ps2 => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            KbdMode::Ps2 => "ps2",
+            KbdMode::Xhci => "xHCI",
+            KbdMode::Ehci => "EHCI",
+            KbdMode::Uhci => "UHCI",
+            KbdMode::Ohci => "OHCI",
+        }
+    }
 }
 
 impl Firmware {
@@ -78,13 +118,24 @@ fn main() {
 
     let hypervisor = if args.iter().any(|a| a == "--qemu") {
         "qemu"
+    } else if args
+        .iter()
+        .any(|a| a == "--hyperv" || a == "--hyper-v" || a == "--hv")
+    {
+        "hyperv"
     } else if args.iter().any(|a| a == "--vbox" || a == "--virtualbox") {
         "vbox"
     } else {
         "vbox"
     };
 
-    let firmware = if args.iter().any(|a| a == "--uefi") {
+    // Hyper-V Generation 2 VMs are UEFI-only; BIOS is irrelevant there.
+    if hypervisor == "hyperv" && args.iter().any(|a| a == "--bios") {
+        eprintln!("ERROR: --hyperv is UEFI-only (Generation 2). Drop --bios or use --uefi.");
+        std::process::exit(1);
+    }
+
+    let firmware = if hypervisor == "hyperv" || args.iter().any(|a| a == "--uefi") {
         Firmware::Uefi
     } else {
         Firmware::Bios
@@ -92,6 +143,42 @@ fn main() {
 
     let no_run = args.iter().any(|a| a == "--no-run");
     let force = args.iter().any(|a| a == "--force");
+    // Hyper-V options (Windows only, UEFI only).
+    let hyperv_switch: Option<String> = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--hyperv-switch="))
+        .map(|s| s.to_string());
+    let hyperv_mem: u32 = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--hyperv-mem="))
+        .and_then(|s| s.trim_end_matches(['M', 'm']).parse().ok())
+        .unwrap_or(512);
+    let hyperv_cpus: u32 = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--hyperv-cpus="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    // COM1 named pipe for kernel serial output (Gen2 has no file-backed
+    // serial like VirtualBox). `off` disables COM configuration.
+    let hyperv_com: String = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--hyperv-com="))
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    // DVD boots the generated UEFI ISO; disk boots a VHDX (see --vhdx).
+    let hyperv_boot: String = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--hyperv-boot="))
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "dvd".to_string());
+    if hypervisor == "hyperv" && hyperv_boot != "dvd" && hyperv_boot != "disk" {
+        eprintln!("ERROR: --hyperv-boot must be dvd or disk.");
+        std::process::exit(1);
+    }
+    let vhdx_arg: Option<String> = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--vhdx="))
+        .map(|s| s.to_string());
     let gpu_passthrough_arg = args
         .iter()
         .find_map(|a| a.strip_prefix("--gpu-passthrough="));
@@ -131,15 +218,71 @@ fn main() {
     let bundle = args
         .iter()
         .any(|a| a == "--bundle-apps" || a == "--with-apps");
+    // Doom WAD injection into an (extra) disk image:
+    //   --wad=<host-wad> [--wad-disk=target/doom.img] [--wad-disk-size=128M]
+    //   [--wad-guest=/wad/doom1.wad]
+    // The WAD disk stays separate from target/disk.img by design.
+    let wad_host: Option<String> = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--wad="))
+        .map(|s| s.to_string());
+    let wad_disk: String = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--wad-disk="))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "target/doom.img".to_string());
+    let wad_disk_size: String = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--wad-disk-size="))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "128M".to_string());
+    let wad_guest: String = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--wad-guest="))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "/wad/doom1.wad".to_string());
 
-    // Keyboard transport: --kbd=<ps2|xhci|ehci|uhci> (from mfk_launch.py)
-    // or legacy --xhci-kbd. xhci attaches qemu-xhci + usb-kbd; the emulated
-    // usb-kbd overrides PS/2 so guest input flows through the xHCI driver.
-    // Serial stdio stays available as a backdoor.
+    // Keyboard transport: --kbd=<ps2|xhci|ehci|uhci|ohci> (from mfk_launch.py)
+    // or legacy --xhci-kbd. Each USB mode attaches a matching QEMU host
+    // controller plus usb-kbd/usb-tablet; the emulated usb-kbd overrides
+    // PS/2 so guest input flows through that controller's driver. Serial
+    // stdio stays available as a backdoor.
+    let hw_profile = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--hw-profile="))
+        .map(|s| s.to_ascii_lowercase());
     let kbd_arg = args
         .iter()
         .find_map(|a| a.strip_prefix("--kbd=").map(|v| v.to_ascii_lowercase()));
-    let xhci_kbd = args.iter().any(|a| a == "--xhci-kbd") || kbd_arg.as_deref() == Some("xhci");
+    let kbd = match kbd_arg.as_deref() {
+        Some("xhci") => KbdMode::Xhci,
+        Some("ehci") => KbdMode::Ehci,
+        Some("uhci") => KbdMode::Uhci,
+        Some("ohci") => KbdMode::Ohci,
+        Some("ps2") => KbdMode::Ps2,
+        Some(other) => {
+            eprintln!("Warning: unknown --kbd={other} (expected ps2|xhci|ehci|uhci|ohci); using ps2.");
+            KbdMode::Ps2
+        }
+        None => {
+            // Real N95: notebook-class PC, UEFI, USB keyboard/mouse over
+            // xHCI, legacy PS/2 input path is effectively absent. If the
+            // operator asked for the N95 profile, default to xHCI so a
+            // QEMU boot mirrors the real IRQ/driver path instead of the
+            // emulated i8042 PS/2 one.
+            if hw_profile.as_deref() == Some("n95") {
+                KbdMode::Xhci
+            } else {
+                KbdMode::Ps2
+            }
+        }
+    };
+    // Legacy alias for the historical xHCI-only flag.
+    let kbd = if args.iter().any(|a| a == "--xhci-kbd") {
+        KbdMode::Xhci
+    } else {
+        kbd
+    };
 
     // Extra drives from mfk_launch.py: --data-disk-size=10M plus repeatable
     // --extra-disk=<path> --extra-disk-size=<size> pairs in order, with an
@@ -207,6 +350,25 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8084);
 
+    // Hyper-V (Gen2) ignores QEMU-only devices: warn instead of silently
+    // dropping them so `--hyperv --vnc` typos are visible.
+    if hypervisor == "hyperv" {
+        if vnc || web_ui {
+            eprintln!("Warning: --vnc/--web-ui are QEMU-only and are ignored with --hyperv.");
+        }
+        if kbd.is_usb() || kbd_arg.is_some() {
+            eprintln!("Warning: --kbd/--xhci-kbd are QEMU-only and are ignored with --hyperv.");
+        }
+        if gpu_passthrough.is_some() {
+            eprintln!("Warning: --gpu-passthrough is QEMU-only and is ignored with --hyperv.");
+            eprintln!("For a physical GPU in Hyper-V, use Discrete Device Assignment (DDA) manually.");
+        }
+        if boot_extra.is_some() {
+            eprintln!("Warning: --boot-extra-disk is QEMU/VBox-legacy only and is ignored with --hyperv.");
+            eprintln!("Use --hyperv-boot=dvd|disk to select the Hyper-V boot device.");
+        }
+    }
+
     // ------------------------------------------------------------
     // Create disk image paths
     // ------------------------------------------------------------
@@ -243,7 +405,36 @@ fn main() {
     }
 
     // ------------------------------------------------------------
-    // Bundle example apps into QEMU raw data disk if requested
+    // Create the UEFI ISO (El Torito, for Hyper-V Gen2 DVD boot).
+    //
+    // BIOS is legacy here and intentionally gets no ISO.
+    // ------------------------------------------------------------
+
+    let iso_path = format!("{}-uefi.iso", args[1]);
+
+    println!("Creating UEFI ISO image...");
+    match uefi_iso::create_uefi_iso(Path::new(&uefi_path), Path::new(&iso_path)) {
+        Ok(_) => println!("Created UEFI ISO image: {}", iso_path),
+        Err(e) => {
+            eprintln!("Failed to create UEFI ISO image: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // ------------------------------------------------------------
+    // Pre-create raw data disks so --bundle-apps works on the first run
+    // (QEMU helpers create them lazily inside run_qemu_*; Hyper-V needs
+    // the raws now so they can be bundled then converted to VHDX).
+    // ------------------------------------------------------------
+
+    if hypervisor == "hyperv" {
+        create_qemu_data_disk("target/disk.img", &data_disk_size);
+        ensure_extra_disks(&extra_disks);
+    }
+
+    // ------------------------------------------------------------
+    // Bundle example apps into the raw data disk if requested
+    // (Hyper-V converts target/disk.img -> target/disk.vhdx later).
     // ------------------------------------------------------------
 
     if bundle {
@@ -269,6 +460,53 @@ fn main() {
     }
 
     // ------------------------------------------------------------
+    // Bundle a Doom WAD into its own disk image (kept off target/disk.img).
+    // Creates the raw image on demand so `--wad` works on first run.
+    // ------------------------------------------------------------
+
+    if let Some(wad) = wad_host.as_deref() {
+        let wad_src = Path::new(wad);
+        if !wad_src.is_file() {
+            eprintln!("WAD bundle: host file not found: {}", wad);
+            std::process::exit(1);
+        }
+        if !Path::new(&wad_disk).exists() {
+            println!(
+                "WAD bundle: creating WAD disk {} ({})...",
+                wad_disk, wad_disk_size
+            );
+            create_qemu_data_disk(&wad_disk, &wad_disk_size);
+        }
+        if Path::new(&wad_disk).exists() {
+            if let Err(e) = simplfs_host::bundle_single_file(
+                Path::new(&wad_disk),
+                &wad_guest,
+                wad_src,
+            ) {
+                eprintln!("WAD bundle failed: {}", e);
+            }
+        } else {
+            eprintln!(
+                "WAD bundle: {} not found (install qemu-img to create it)",
+                wad_disk
+            );
+        }
+        // Fully automated setup: attach the WAD disk unless the user
+        // already listed it via --extra-disk (avoids double-attach).
+        if !extra_disks.iter().any(|(p, _)| p == &wad_disk) {
+            if extra_disks.len() >= MAX_EXTRAS {
+                eprintln!(
+                    "Warning: extra disk slots full ({}); WAD disk {} bundled but not attached.",
+                    MAX_EXTRAS, wad_disk
+                );
+            } else {
+                println!("WAD bundle: auto-attaching {} as extra disk.", wad_disk);
+                extra_disks.push((wad_disk.clone(), wad_disk_size.clone()));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------
     // Select the actual boot image
     // ------------------------------------------------------------
 
@@ -283,38 +521,75 @@ fn main() {
     println!("  Hypervisor: {}", hypervisor);
     println!("  Firmware:   {}", firmware.name());
     println!("  Boot image: {}", boot_image);
-    if xhci_kbd {
-        println!("  Input:      xHCI USB keyboard + absolute tablet");
-    }
-    println!("  Data disk:  target/disk.img ({})", data_disk_size);
-    for (i, (p, s)) in extra_disks.iter().enumerate() {
-        let bus = if i < MAX_EXTRA_IDE { "IDE" } else { "virtio" };
+    println!("  UEFI ISO:   {}", iso_path);
+    if hypervisor == "hyperv" {
+        println!("  HV boot:    {}", hyperv_boot);
         println!(
-            "  Extra #{}:   {} ({}) [{}]{}",
-            i + 1,
-            p,
-            s,
-            bus,
-            if boot_extra == Some(i) { " [boot]" } else { "" }
+            "  HV switch:  {}",
+            hyperv_switch.as_deref().unwrap_or("Default Switch (auto)")
+        );
+        println!("  HV memory:  {} MB", hyperv_mem);
+        println!("  HV CPUs:    {}", hyperv_cpus);
+        if let Some(v) = vhdx_arg.as_deref() {
+            println!("  HV VHDX:    {}", v);
+        }
+        if hyperv_com.is_empty() {
+            println!("  HV COM:     pipe MFK-<vm>-com1 (use tools/hyperv-serial.ps1)");
+        } else if hyperv_com == "off" {
+            println!("  HV COM:     disabled");
+        } else {
+            println!("  HV COM:     pipe {}", hyperv_com);
+        }
+    }
+    if kbd.is_usb() && hypervisor != "hyperv" {
+        println!(
+            "  Input:      {} USB keyboard + absolute tablet",
+            kbd.name()
         );
     }
-    if vnc || web_ui {
+    if hypervisor == "hyperv" {
+        println!(
+            "  Data disk:  target/disk.img ({}) -> target/disk.vhdx (SCSI)",
+            data_disk_size
+        );
+        for (i, (p, s)) in extra_disks.iter().enumerate() {
+            println!("  Extra #{}:   {} ({}) -> {}.vhdx (SCSI)", i + 1, p, s, p);
+        }
+    } else {
+        println!("  Data disk:  target/disk.img ({})", data_disk_size);
+        for (i, (p, s)) in extra_disks.iter().enumerate() {
+            let bus = if i < MAX_EXTRA_IDE { "IDE" } else { "virtio" };
+            println!(
+                "  Extra #{}:   {} ({}) [{}]{}",
+                i + 1,
+                p,
+                s,
+                bus,
+                if boot_extra == Some(i) { " [boot]" } else { "" }
+            );
+        }
+    }
+    if (vnc || web_ui) && hypervisor != "hyperv" {
         println!(
             "  VNC:        enabled (TCP port {}, WebSocket port {})",
             qemu_vnc_tcp_port(vnc_port),
             vnc_port
         );
     }
-    if web_ui {
+    if web_ui && hypervisor != "hyperv" {
         println!("  Web UI:     enabled (port {})", web_ui_port);
     }
     if let Some(gpu) = &gpu_passthrough {
-        println!("  GPU:        vfio-pci {}", gpu.device);
-        if let Some(audio) = &gpu.audio {
-            println!("  GPU audio:  vfio-pci {}", audio);
-        }
-        if let Some(rom) = &gpu.rom {
-            println!("  GPU ROM:    {}", rom);
+        if hypervisor == "hyperv" {
+            println!("  GPU:        ignored (QEMU-only; use Hyper-V DDA manually)");
+        } else {
+            println!("  GPU:        vfio-pci {}", gpu.device);
+            if let Some(audio) = &gpu.audio {
+                println!("  GPU audio:  vfio-pci {}", audio);
+            }
+            if let Some(rom) = &gpu.rom {
+                println!("  GPU ROM:    {}", rom);
+            }
         }
     }
     println!();
@@ -356,6 +631,12 @@ fn main() {
             eprintln!("Install: sudo apt-get install qemu-system-x86 qemu-utils");
             std::process::exit(1);
         }
+    } else if selected_hypervisor == "hyperv" {
+        if !cfg!(target_os = "windows") {
+            eprintln!("ERROR: --hyperv requires Windows with the Hyper-V role.");
+            eprintln!("On Linux/macOS use --vbox or --qemu (the UEFI ISO is still created).");
+            std::process::exit(1);
+        }
     } else if !command_exists("VBoxManage") {
         eprintln!("ERROR: VBoxManage not found.");
         std::process::exit(1);
@@ -370,7 +651,7 @@ fn main() {
             Firmware::Bios => run_qemu_bios(
                 &bios_path,
                 bundle,
-                xhci_kbd,
+                kbd,
                 &data_disk_size,
                 &extra_disks,
                 vnc,
@@ -382,7 +663,7 @@ fn main() {
             Firmware::Uefi => run_qemu_uefi(
                 &uefi_path,
                 bundle,
-                xhci_kbd,
+                kbd,
                 &data_disk_size,
                 &extra_disks,
                 vnc,
@@ -398,6 +679,21 @@ fn main() {
 
             Firmware::Uefi => run_virtualbox(&uefi_path, kernel_path, Firmware::Uefi, force),
         },
+
+        "hyperv" => run_hyperv(
+            &iso_path,
+            &uefi_path,
+            kernel_path,
+            force,
+            hyperv_boot.as_str(),
+            hyperv_switch.as_deref(),
+            hyperv_mem,
+            hyperv_cpus,
+            vhdx_arg.as_deref(),
+            hyperv_com.as_str(),
+            &data_disk_size,
+            &extra_disks,
+        ),
 
         _ => {
             eprintln!("Unknown hypervisor: {}", selected_hypervisor);
@@ -437,10 +733,10 @@ fn add_qemu_acceleration(qemu: &mut Command) {
     #[cfg(target_os = "windows")]
     {
         if qemu_supports_whpx() {
-            qemu.args(["-accel", "kvm", "-cpu", "max"]);
+            qemu.args(["-accel", "tcg", "-cpu", "max"]);
         } else {
             eprintln!("WHPX is not available; falling back to TCG.");
-            qemu.args(["-accel", "kvm", "-cpu", "max"]);
+            qemu.args(["-accel", "tcg", "-cpu", "max"]);
         }
     }
 
@@ -1179,6 +1475,485 @@ fn run_virtualbox(boot_image: &str, kernel_path: &Path, firmware: Firmware, forc
 }
 
 // ------------------------------------------------------------
+// Hyper-V (Windows, Generation 2 / UEFI only)
+// ------------------------------------------------------------
+
+/// Escape a string for embedding in a PowerShell single-quoted literal.
+fn ps_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Run a PowerShell script, returning trimmed stdout or an error.
+fn run_powershell(script: &str) -> Result<String, String> {
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|e| format!("Failed to launch powershell: {}", e))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Convert any raw image to VHDX, reusing the VHDX when it is newer than
+/// the raw (same policy as the VirtualBox VDI path).
+///
+/// Prefers `qemu-img` (cross-platform); falls back to Hyper-V's
+/// `Convert-VHD` via PowerShell on Windows. `label` is used in log lines.
+fn raw_to_vhdx(raw: &str, vhdx: &str, label: &str, force: bool) -> Result<String, String> {
+    let stale = if force {
+        true
+    } else if Path::new(&vhdx).exists() {
+        match (
+            std::fs::metadata(raw).and_then(|m| m.modified()).ok(),
+            std::fs::metadata(&vhdx).and_then(|m| m.modified()).ok(),
+        ) {
+            (Some(r), Some(v)) => r > v,
+            _ => true,
+        }
+    } else {
+        true
+    };
+
+    if !stale {
+        println!("Using existing {} VHDX disk: {}", label, vhdx);
+        return Ok(vhdx.to_string());
+    }
+
+    if Command::new("qemu-img")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(&vhdx);
+        println!("Converting {} image to VHDX format...", label);
+        let output = Command::new("qemu-img")
+            .args(["convert", "-f", "raw", "-O", "vhdx", raw, vhdx])
+            .output()
+            .map_err(|e| format!("Failed to run qemu-img: {}", e))?;
+        if !output.status.success() {
+            return Err(format!(
+                "qemu-img convert failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        println!("Created VHDX disk: {}", vhdx);
+        return Ok(vhdx.to_string());
+    }
+
+    // Fallback on Windows: Hyper-V's Convert-VHD (needs admin + Hyper-V).
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "Convert-VHD -Path {} -DestinationPath {} -VHDType Dynamic; '{}'",
+            ps_quote(raw),
+            ps_quote(vhdx),
+            "CONVERT_OK"
+        );
+        match run_powershell(&script) {
+            Ok(_) => {
+                println!("Created VHDX disk via Convert-VHD: {}", vhdx);
+                return Ok(vhdx.to_string());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "No VHDX at {} and conversion failed (qemu-img missing, Convert-VHD: {}).\n\
+                     Convert once with: qemu-img convert -f raw -O vhdx {} {}",
+                    vhdx, e, raw, vhdx
+                ));
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err(format!(
+            "No VHDX at {} and qemu-img is missing.\n\
+             Convert once with: qemu-img convert -f raw -O vhdx {} {}\n\
+             Or boot the ISO instead: --hyperv-boot=dvd (default).",
+            vhdx, raw, vhdx
+        ));
+    }
+}
+
+/// Convert the UEFI raw image to VHDX for `--hyperv-boot=disk`.
+fn ensure_hyperv_vhdx(uefi_img: &str, vhdx_arg: Option<&str>, force: bool) -> Result<String, String> {
+    let vhdx = vhdx_arg
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{}.vhdx", uefi_img));
+    raw_to_vhdx(uefi_img, &vhdx, "UEFI", force)
+}
+
+/// Ensure the Hyper-V data-disk VHDX (`target/disk.vhdx`) from the raw
+/// `target/disk.img`. The raw must already exist (created before bundling).
+fn ensure_hyperv_data_vhdx(force: bool) -> Result<String, String> {
+    let raw = "target/disk.img";
+    if !Path::new(raw).exists() {
+        return Err(format!(
+            "Data disk raw {} missing (qemu-img failed to create it?).",
+            raw
+        ));
+    }
+    raw_to_vhdx(raw, "target/disk.vhdx", "data disk", force)
+}
+
+/// Ensure one VHDX per `--extra-disk=<raw>` (output: `<raw>.vhdx`).
+fn ensure_hyperv_extra_vhdx(extra_disks: &[(String, String)], force: bool) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for (raw, _) in extra_disks {
+        if !Path::new(raw).exists() {
+            return Err(format!("Extra disk raw {} missing.", raw));
+        }
+        let vhdx = format!("{}.vhdx", raw);
+        out.push(raw_to_vhdx(raw, &vhdx, "extra disk", force)?);
+    }
+    Ok(out)
+}
+
+fn absolutize(p: &str) -> String {
+    std::env::current_dir()
+        .map(|c| c.join(p))
+        .unwrap_or_else(|_| Path::new(p).to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_hyperv(
+    iso_path: &str,
+    uefi_img: &str,
+    kernel_path: &Path,
+    force: bool,
+    boot: &str,
+    switch: Option<&str>,
+    mem_mb: u32,
+    cpus: u32,
+    vhdx_arg: Option<&str>,
+    com: &str,
+    _data_disk_size: &str,
+    extra_disks: &[(String, String)],
+) {
+    let vm_name = format!(
+        "MFK-{}-uefi",
+        kernel_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("kernel")
+    );
+
+    // Attach as absolute paths: Hyper-V resolves relative to
+    // C:\Windows\System32 otherwise.
+    let iso_abs = std::env::current_dir()
+        .map(|p| p.join(iso_path))
+        .unwrap_or_else(|_| Path::new(iso_path).to_path_buf());
+    let iso_abs = iso_abs.to_string_lossy().to_string();
+
+    // --------------------------------------------------------
+    // Preflight: admin + Hyper-V module
+    // --------------------------------------------------------
+    let preflight = concat!(
+        "$admin = ([Security.Principal.WindowsPrincipal]",
+        "[Security.Principal.WindowsIdentity]::GetCurrent())",
+        ".IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); ",
+        "if (-not $admin) { Write-Error 'NOT_ADMIN'; exit 1 } ",
+        "if (-not (Get-Module -ListAvailable -Name Hyper-V)) { Write-Error 'NO_MODULE'; exit 1 } ",
+        "if (-not (Get-Command New-VM -ErrorAction SilentlyContinue)) { Write-Error 'NO_CMDLETS'; exit 1 } ",
+        "'PREFLIGHT_OK'"
+    );
+    if let Err(e) = run_powershell(preflight) {
+        if e.contains("NOT_ADMIN") {
+            eprintln!("ERROR: Hyper-V needs an elevated shell.");
+            eprintln!("Right-click PowerShell -> Run as administrator, then retry.");
+        } else if e.contains("NO_MODULE") || e.contains("NO_CMDLETS") {
+            eprintln!("ERROR: Hyper-V PowerShell module not found.");
+            eprintln!("Enable Hyper-V: OptionalFeatures.exe -> Hyper-V, then reboot.");
+        } else {
+            eprintln!("ERROR: Hyper-V preflight failed: {}", e);
+        }
+        std::process::exit(1);
+    }
+
+    // --------------------------------------------------------
+    // VHDX disks: boot image + data disk + extra disks
+    //
+    // Gen2 VMs have no IDE controller, so every disk is a SCSI VHDX:
+    //   boot VHDX  = UEFI image converted (<uefi>.vhdx or --vhdx=)
+    //   data VHDX  = target/disk.img  -> target/disk.vhdx
+    //   extra VHDX = <raw>            -> <raw>.vhdx
+    // Raws are created (qemu-img) before bundling in main(), so the
+    // conversions below only need to copy raw -> VHDX.
+    // --------------------------------------------------------
+    let boot_vhdx_abs: Option<String> = if boot == "disk" {
+        match ensure_hyperv_vhdx(uefi_img, vhdx_arg, force) {
+            Ok(v) => Some(absolutize(&v)),
+            Err(e) => {
+                eprintln!("ERROR: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(v) = vhdx_arg {
+        // Explicit --vhdx with DVD boot: attach it as an extra data disk.
+        let abs = absolutize(v);
+        if !Path::new(&abs).is_file() {
+            eprintln!("ERROR: VHDX not found at: {}", abs);
+            std::process::exit(1);
+        }
+        Some(abs)
+    } else {
+        None
+    };
+
+    let data_vhdx_abs: String = match ensure_hyperv_data_vhdx(force) {
+        Ok(v) => absolutize(&v),
+        Err(e) => {
+            eprintln!("ERROR: {}", e);
+            eprintln!("Hint: install qemu-img (qemu-utils) or run with a pre-made target/disk.vhdx.");
+            std::process::exit(1);
+        }
+    };
+
+    let extra_vhdx_abs: Vec<String> = match ensure_hyperv_extra_vhdx(extra_disks, force) {
+        Ok(v) => v.into_iter().map(|p| absolutize(&p)).collect(),
+        Err(e) => {
+            eprintln!("ERROR: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Attach order on the SCSI controller: boot VHDX first (so
+    // FirstBootDevice=hard-disk is unambiguous), then data, then extras,
+    // then an explicit --vhdx in DVD-boot mode.
+    let mut scsi_vhdx: Vec<String> = Vec::new();
+    if let Some(v) = boot_vhdx_abs.as_deref() {
+        if boot == "disk" {
+            scsi_vhdx.push(v.to_string());
+        }
+    }
+    scsi_vhdx.push(data_vhdx_abs.clone());
+    scsi_vhdx.extend(extra_vhdx_abs.clone());
+    if boot != "disk" {
+        if let Some(v) = boot_vhdx_abs.as_deref() {
+            scsi_vhdx.push(v.to_string());
+        }
+    }
+
+    // --------------------------------------------------------
+    // Virtual switch
+    // --------------------------------------------------------
+    let switch_name = if let Some(s) = switch {
+        let check = format!(
+            "if (-not (Get-VMSwitch -Name {} -ErrorAction SilentlyContinue)) \
+             {{ Write-Error 'NO_SWITCH'; exit 1 }} '{}'",
+            ps_quote(s),
+            "SWITCH_OK"
+        );
+        if let Err(e) = run_powershell(&check) {
+            eprintln!("ERROR: virtual switch not found: {}", s);
+            eprintln!("List switches: Get-VMSwitch   ({})", e);
+            std::process::exit(1);
+        }
+        s.to_string()
+    } else {
+        // Prefer "Default Switch", else the first available switch.
+        let find = concat!(
+            "$sw = Get-VMSwitch -Name 'Default Switch' -ErrorAction SilentlyContinue; ",
+            "if (-not $sw) { $sw = Get-VMSwitch -ErrorAction SilentlyContinue | Select-Object -First 1 } ",
+            "if (-not $sw) { Write-Error 'NO_SWITCH'; exit 1 } ",
+            "$sw.Name"
+        );
+        match run_powershell(find) {
+            Ok(name) if !name.is_empty() => {
+                println!("Using virtual switch: {} (auto-detected)", name);
+                name
+            }
+            _ => {
+                eprintln!("ERROR: No virtual switch found.");
+                eprintln!("Create one: Hyper-V Manager -> Virtual Switch Manager,");
+                eprintln!("or pass one explicitly: --hyperv-switch=\"<name>\"");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // --------------------------------------------------------
+    // Existing VM?
+    // --------------------------------------------------------
+    let vm_exists = run_powershell(&format!(
+        "if (Get-VM -Name {} -ErrorAction SilentlyContinue) {{ 'YES' }} else {{ 'NO' }}",
+        ps_quote(&vm_name)
+    ))
+    .map(|s| s == "YES")
+    .unwrap_or(false);
+
+    if vm_exists && force {
+        println!("--force: removing existing VM {}", vm_name);
+        let _ = run_powershell(&format!(
+            "Stop-VM -Name {} -TurnOff -Force -ErrorAction SilentlyContinue; \
+             Remove-VM -Name {} -Force",
+            ps_quote(&vm_name),
+            ps_quote(&vm_name)
+        ));
+    }
+
+    let vm_exists = if vm_exists && force { false } else { vm_exists };
+
+    if !vm_exists {
+        println!("Creating Hyper-V VM: {} (Generation 2, UEFI)", vm_name);
+        // NoVHD here: the boot device (DVD and/or VHDX) is attached below
+        // so FirstBootDevice can point at the real device object.
+        let create = format!(
+            "New-VM -Name {} -Generation 2 -MemoryStartupBytes {}MB -NoVHD -SwitchName {} | Out-Null; \
+             Set-VMProcessor -VMName {} -Count {}; \
+             Set-VMFirmware -VMName {} -EnableSecureBoot Off; \
+             '{}'",
+            ps_quote(&vm_name),
+            mem_mb,
+            ps_quote(&switch_name),
+            ps_quote(&vm_name),
+            cpus,
+            ps_quote(&vm_name),
+            "VM_OK"
+        );
+        if let Err(e) = run_powershell(&create) {
+            eprintln!("ERROR: Failed to create VM {}: {}", vm_name, e);
+            std::process::exit(1);
+        }
+    } else {
+        println!("Using existing VM: {}", vm_name);
+        // Keep CPU/memory in sync on reuse.
+        let _ = run_powershell(&format!(
+            "Set-VMProcessor -VMName {} -Count {}; \
+             Set-VMMemory -VMName {} -StartupBytes {}MB -ErrorAction SilentlyContinue; \
+             Set-VMFirmware -VMName {} -EnableSecureBoot Off; \
+             '{}'",
+            ps_quote(&vm_name),
+            cpus,
+            ps_quote(&vm_name),
+            mem_mb,
+            ps_quote(&vm_name),
+            "VM_OK"
+        ));
+    }
+
+    // --------------------------------------------------------
+    // COM1 serial (named pipe; Gen2 has no file-backed serial)
+    // --------------------------------------------------------
+    let com_pipe: Option<String> = if com == "off" {
+        None
+    } else if com.is_empty() {
+        Some(format!("MFK-{}-com1", vm_name.trim_start_matches("MFK-")))
+    } else {
+        Some(com.trim_start_matches("\\\\.\\pipe\\").to_string())
+    };
+    if let Some(pipe) = com_pipe.as_deref() {
+        let pipe_path = format!("\\\\.\\pipe\\{}", pipe);
+        let com_script = format!(
+            "Set-VMComPort -VMName {} -Number 1 -Path {}; '{}'",
+            ps_quote(&vm_name),
+            ps_quote(&pipe_path),
+            "COM_OK"
+        );
+        if let Err(e) = run_powershell(&com_script) {
+            eprintln!("Warning: could not configure COM1 pipe {}: {}", pipe_path, e);
+        } else {
+            println!("COM1 pipe: {}", pipe_path);
+        }
+    }
+
+    // --------------------------------------------------------
+    // Attach DVD (UEFI ISO) + all SCSI VHDX disks, set boot order
+    // --------------------------------------------------------
+    let dvd = format!(
+        "$dvd = Get-VMDvdDrive -VMName {}; \
+         if (-not $dvd) {{ Add-VMDvdDrive -VMName {} -Path {} }} \
+         else {{ Set-VMDvdDrive -VMName {} -Path {} }}; \
+         '{}'",
+        ps_quote(&vm_name),
+        ps_quote(&vm_name),
+        ps_quote(&iso_abs),
+        ps_quote(&vm_name),
+        ps_quote(&iso_abs),
+        "DVD_OK"
+    );
+    if let Err(e) = run_powershell(&dvd) {
+        eprintln!("ERROR: Failed to attach UEFI ISO: {}", e);
+        std::process::exit(1);
+    }
+
+    for vhdx in &scsi_vhdx {
+        // Idempotent: only Add when this exact Path is not attached yet.
+        // (Reused VMs keep old disks; --force recreates the VM above.)
+        let disk = format!(
+            "$exists = Get-VMHardDiskDrive -VMName {} | Where-Object {{ $_.Path -eq {} }}; \
+             if (-not $exists) {{ Add-VMHardDiskDrive -VMName {} -Path {} }}; \
+             '{}'",
+            ps_quote(&vm_name),
+            ps_quote(vhdx),
+            ps_quote(&vm_name),
+            ps_quote(vhdx),
+            "DISK_OK"
+        );
+        if let Err(e) = run_powershell(&disk) {
+            eprintln!("ERROR: Failed to attach VHDX {}: {}", vhdx, e);
+            std::process::exit(1);
+        }
+    }
+    println!("Attached {} SCSI VHDX disk(s).", scsi_vhdx.len());
+
+    // Boot order: disk boots the first hard disk, dvd boots the ISO.
+    let first = if boot == "disk" {
+        format!("Get-VMHardDiskDrive -VMName {}", ps_quote(&vm_name))
+    } else {
+        format!("Get-VMDvdDrive -VMName {}", ps_quote(&vm_name))
+    };
+    if let Err(e) = run_powershell(&format!(
+        "Set-VMFirmware -VMName {} -FirstBootDevice ({}); '{}'",
+        ps_quote(&vm_name),
+        first,
+        "BOOT_OK"
+    )) {
+        eprintln!("Warning: could not set Hyper-V boot order: {}", e);
+    }
+
+    // --------------------------------------------------------
+    // Start
+    // --------------------------------------------------------
+    println!();
+    println!("Starting Hyper-V VM: {}", vm_name);
+    println!("Firmware: UEFI (Generation 2, Secure Boot off)");
+    println!("Boot:     {} ({})", boot.to_uppercase(), iso_abs);
+    println!("Switch:   {}", switch_name);
+    println!("Data:     {} + {} extra(s)", data_vhdx_abs, extra_vhdx_abs.len());
+    println!("Connect:  Hyper-V Manager or vmconnect.exe");
+
+    match run_powershell(&format!(
+        "$vm = Get-VM -Name {}; \
+         if ($vm.State -ne 'Running') {{ Start-VM -Name {} }}; \
+         '{}'",
+        ps_quote(&vm_name),
+        ps_quote(&vm_name),
+        "START_OK"
+    )) {
+        Ok(_) => {
+            println!("VM started successfully!");
+            println!("Stop it with: Stop-VM -Name {}", vm_name);
+            if let Some(pipe) = com_pipe.as_deref() {
+                println!(
+                    "Serial: tools/hyperv-serial.ps1 -VMName {} -PipeName {} (log: target/mfk-hyperv-serial.log)",
+                    vm_name, pipe
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("ERROR: Failed to start VM: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ------------------------------------------------------------
 // QEMU BIOS
 // ------------------------------------------------------------
 
@@ -1212,7 +1987,7 @@ fn add_gpu_passthrough(qemu: &mut Command, gpu: Option<&GpuPassthrough>) {
 fn run_qemu_bios(
     bios_path: &str,
     bundle: bool,
-    xhci_kbd: bool,
+    kbd: KbdMode,
     data_disk_size: &str,
     extra_disks: &[(String, String)],
     vnc: bool,
@@ -1235,8 +2010,11 @@ fn run_qemu_bios(
     println!("Firmware: BIOS");
     println!("Boot image: {}", bios_path);
     println!("Networking: E1000 + user-mode NAT");
-    if xhci_kbd {
-        println!("Input: xHCI USB keyboard + absolute tablet (PS/2 overridden)");
+    if kbd.is_usb() {
+        println!(
+            "Input: {} USB keyboard + absolute tablet (PS/2 overridden)",
+            kbd.name()
+        );
     }
 
     let mut qemu = Command::new("qemu-system-x86_64");
@@ -1304,18 +2082,7 @@ fn run_qemu_bios(
         }
     }
 
-    if xhci_kbd {
-        qemu.args([
-            "-device",
-            "qemu-xhci,id=xhci",
-            "-device",
-            "usb-kbd,bus=xhci.0",
-            // Absolute pointer: host cursor maps 1:1, no GTK grab needed.
-            // The guest claims it like a USB tablet (see xhci/usb drivers).
-            "-device",
-            "usb-tablet,bus=xhci.0",
-        ]);
-    }
+    attach_usb_input(&mut qemu, kbd);
 
     // Spawn web proxy before QEMU if web UI is enabled
     let mut web_proxy_child = None;
@@ -1349,8 +2116,30 @@ fn run_qemu_bios(
     // Clean up web proxy when QEMU exits
     if let Some(mut proxy) = web_proxy_child {
         let _ = proxy.kill();
-        let _ = proxy.wait();
+        let  _ = proxy.wait();
     }
+}
+
+/// Attaches the emulated USB keyboard and absolute pointer to the host
+/// controller selected by `--kbd`.
+///
+/// The controller gets an explicit id so its bus is predictably named
+/// (`<id>.0`), which is what the usb-kbd/usb-tablet devices attach to. The
+/// emulated usb-kbd overrides PS/2 in the guest, so input exercises the
+/// matching HCD driver.
+///
+/// `pci-ohci` is a compile-time option in QEMU, so OHCI mode is best-effort:
+/// if the device is unavailable QEMU exits with a clear error naming it.
+fn attach_usb_input(qemu: &mut Command, kbd: KbdMode) {
+    let Some((hcd, id)) = kbd.hcd_device() else {
+        return;
+    };
+    let bus = format!("{id}.0");
+    qemu.args(["-device", &format!("{hcd},id={id}")]);
+    qemu.args(["-device", &format!("usb-kbd,bus={bus}")]);
+    // Absolute pointer: the host cursor maps 1:1, so no GTK grab is needed.
+    // The guest claims it like a USB tablet (see the xhci/uhci drivers).
+    qemu.args(["-device", &format!("usb-tablet,bus={bus}")]);
 }
 
 // ------------------------------------------------------------
@@ -1360,7 +2149,7 @@ fn run_qemu_bios(
 fn run_qemu_uefi(
     uefi_path: &str,
     bundle: bool,
-    xhci_kbd: bool,
+    kbd: KbdMode,
     data_disk_size: &str,
     extra_disks: &[(String, String)],
     vnc: bool,
@@ -1386,8 +2175,11 @@ fn run_qemu_uefi(
     println!("OVMF: {}", ovmf.display());
     println!("Boot image: {}", uefi_path);
     println!("Networking: E1000 + user-mode NAT");
-    if xhci_kbd {
-        println!("Input: xHCI USB keyboard + absolute tablet ONLY");
+    if kbd.is_usb() {
+        println!(
+            "Input: {} USB keyboard + absolute tablet ONLY",
+            kbd.name()
+        );
     } else {
         println!("Input: PS/2 keyboard");
     }
@@ -1401,7 +2193,7 @@ fn run_qemu_uefi(
         "-machine",
         "pc",
         "-m",
-        "128M",
+        "4G",
         // IMPORTANT:
         //
         // The UEFI image itself is attached here.
@@ -1470,17 +2262,7 @@ fn run_qemu_uefi(
         }
     }
 
-    if xhci_kbd {
-        qemu.args([
-            "-device",
-            "qemu-xhci,id=xhci",
-            "-device",
-            "usb-kbd,bus=xhci.0",
-            // Absolute pointer: host cursor maps 1:1, no GTK grab needed.
-            "-device",
-            "usb-tablet,bus=xhci.0",
-        ]);
-    }
+    attach_usb_input(&mut qemu, kbd);
 
     // Spawn web proxy before QEMU if web UI is enabled
     let mut web_proxy_child = None;
@@ -1615,6 +2397,23 @@ fn print_usage(program: &str) {
 
     eprintln!("  --qemu                   Run in QEMU");
 
+    eprintln!("  --hyperv, --hyper-v, --hv");
+    eprintln!("                           Run in Hyper-V (Windows, Generation 2 / UEFI only)");
+
+    eprintln!("  --hyperv-boot=<dvd|disk>  Hyper-V boot device (default dvd: the UEFI ISO)");
+
+    eprintln!("  --vhdx=<path>            VHDX for --hyperv-boot=disk (auto-converted via");
+    eprintln!("                           qemu-img/Convert-VHD when missing) or extra data disk with dvd boot");
+
+    eprintln!("  --hyperv-switch=<name>    Virtual switch (default: Default Switch, auto-detected)");
+
+    eprintln!("  --hyperv-mem=<MB>         VM startup memory in MB (default 512)");
+
+    eprintln!("  --hyperv-cpus=<n>         Virtual CPUs (default 2)");
+
+    eprintln!("  --hyperv-com=<pipe|off>   COM1 named pipe (default MFK-<vm>-com1; off disables)");
+    eprintln!("                           Capture with: tools/hyperv-serial.ps1");
+
     eprintln!("  --bios                   Use BIOS firmware (default)");
 
     eprintln!("  --uefi                   Use UEFI firmware");
@@ -1626,16 +2425,28 @@ fn print_usage(program: &str) {
     eprintln!("  --bundle-apps, --with-apps");
 
     eprintln!("                           Bundle apps/examples into target/disk.img");
+    eprintln!("                           (Hyper-V: bundled before raw->VHDX conversion)");
 
-    eprintln!("  --kbd=<ps2|xhci>          QEMU keyboard transport (default ps2)");
+    eprintln!("  --wad=<host-wad>         Inject a Doom WAD into its own disk image");
+    eprintln!("  --wad-disk=<img>         WAD disk image (default target/doom.img)");
+    eprintln!("  --wad-disk-size=<size>   Size when creating WAD disk (default 128M)");
+    eprintln!("  --wad-guest=<path>       Guest path (default /wad/doom1.wad)");
+    eprintln!("                           Then attach with --extra-disk=target/doom.img");
+
+    eprintln!("  --kbd=<mode>             QEMU keyboard transport (default ps2)");
+    eprintln!("                            ps2 | xhci | ehci | uhci | ohci");
+    eprintln!("                            USB modes attach qemu-xhci / usb-ehci /");
+    eprintln!("                            piix3-usb-uhci / pci-ohci plus usb-kbd");
+    eprintln!("                            and usb-tablet, overriding PS/2.");
 
     eprintln!("  --xhci-kbd               Attach qemu-xhci + usb-kbd to QEMU");
 
     eprintln!("  --data-disk-size=<size>   Size for target/disk.img (default 10M)");
 
     eprintln!(
-        "  --extra-disk=<path>       Extra data disk (repeatable, max 8: first 2 IDE, rest virtio-blk)"
+        "  --extra-disk=<path>       Extra data disk (repeatable, max 8; QEMU: first 2 IDE rest virtio-blk;"
     );
+    eprintln!("                           Hyper-V: each raw converted to <raw>.vhdx on SCSI)");
 
     eprintln!("  --extra-disk-size=<size>  Size for preceding --extra-disk (default 64M)");
 
@@ -1676,6 +2487,16 @@ fn print_usage(program: &str) {
 
     eprintln!(
         "  {} target/x86_64-mfk/debug/mfk-kernel --vbox --uefi",
+        program
+    );
+
+    eprintln!(
+        "  {} target/x86_64-mfk/debug/mfk-kernel --hyperv --uefi",
+        program
+    );
+
+    eprintln!(
+        "  {} target/x86_64-mfk/debug/mfk-kernel --hyperv --hyperv-boot=disk",
         program
     );
 

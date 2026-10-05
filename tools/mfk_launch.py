@@ -34,25 +34,38 @@ VALID_BUS = ("auto", "ide", "virtio")
 
 DEFAULTS = {
     "kernel": "target/x86_64-mfk/debug/mfk-kernel",
-    "hypervisor": "qemu",       # qemu | vbox
-    "firmware": "bios",         # bios | uefi
+    "hypervisor": "qemu",       # qemu | vbox | hyperv (hyperv = Windows, Gen2/UEFI)
+    "firmware": "bios",         # bios | uefi (hyperv forces uefi)
     "ovmf_code": "OVMF/OVMF_CODE_4M.fd",
-    "keyboard": "ps2",          # ps2 | ehci | xhci | uhci
+    "keyboard": "ps2",          # ps2 | ehci | xhci | uhci | ohci (QEMU only)
     "bundle_apps": False,
     "data_disk_size": "10M",
-    "vnc": False,               # Enable QEMU VNC server
+    "doom": False,                # fully automated Doom setup (WAD disk + attach)
+    "doom_wad": "target/doom1.wad",      # shareware WAD cache (auto-downloaded)
+    "doom_commercial": "",        # optional user WAD (DOOM.WAD / DOOM64.WAD)
+    "doom_disk": "target/doom.img",
+    "doom_disk_size": "128M",
+    "doom_guest": "/wad/doom1.wad",
+    "vnc": False,               # Enable QEMU VNC server (QEMU only)
     "vnc_port": 5900,           # VNC WebSocket port
-    "web_ui": False,            # Launch noVNC web UI (implies vnc)
+    "web_ui": False,            # Launch noVNC web UI (implies vnc, QEMU only)
     "web_ui_port": 8084,        # Web UI HTTP port
     "gpu_passthrough": "",
     "gpu_audio": "",
     "gpu_rom": "",
+    # Hyper-V Gen2 options (Windows only; empty = runner default).
+    "hyperv_switch": "",        # "" = Default Switch (auto-detected)
+    "hyperv_mem": 512,
+    "hyperv_cpus": 2,
+    "hyperv_boot": "dvd",       # dvd | disk
+    "hyperv_vhdx": "",          # "" = auto (<uefi>.vhdx for disk boot)
+    "hyperv_com": "",           # "" = default pipe, "off" = disable COM1
     "extras": [
         # {"path": "target/extra-disk.img", "size": "64M", "boot": False}
     ],
 }
 
-VALID_KBD = ("ps2", "ehci", "xhci", "uhci")
+VALID_KBD = ("ps2", "ehci", "xhci", "uhci", "ohci")
 
 
 def is_valid_pci_bdf(value: str) -> bool:
@@ -119,6 +132,77 @@ def gpu_passthrough_status(cfg: dict) -> str:
     return "ON"
 
 
+# ---------------------------------------------------------------------------
+# Doom WAD automation: commercial WAD if set, else shareware doom1.wad.
+# ---------------------------------------------------------------------------
+
+SHAREWARE_WAD_URLS = (
+    # GitHub mirrors first (reliable hotlinking), id mirrors as fallback.
+    "https://raw.githubusercontent.com/samrude005/doom1.wad/main/doom1.wad",
+    "https://doomwiki.org/mediawiki/images/9/9d/Doom1.wad",
+)
+SHAREWARE_WAD_SHA256 = ""  # optional pin; empty = accept download as-is.
+
+
+def resolve_doom_wad(cfg: dict) -> str:
+    """Host WAD path for the Doom setup. Prefers commercial, else shareware.
+
+    Downloads the shareware doom1.wad into doom_wad when neither exists.
+    Returns "" when automation is off or nothing is available.
+    """
+    if not cfg.get("doom"):
+        return ""
+    commercial = str(cfg.get("doom_commercial", "") or "").strip()
+    if commercial:
+        p = Path(commercial).expanduser()
+        if not p.is_absolute():
+            p = REPO_ROOT / p
+        if p.is_file():
+            return str(p)
+        out(f"[yellow]Doom commercial WAD not found: {p}; falling back to shareware.[/yellow]")
+    wad = Path(str(cfg.get("doom_wad", "target/doom1.wad") or "target/doom1.wad"))
+    if not wad.is_absolute():
+        wad = REPO_ROOT / wad
+    if wad.is_file() and wad.stat().st_size > 1_000_000:
+        return str(wad)
+    for url in SHAREWARE_WAD_URLS:
+        try:
+            out(f"[cyan]Downloading shareware doom1.wad from {url}...[/cyan]")
+            import hashlib
+            import urllib.request
+            wad.parent.mkdir(parents=True, exist_ok=True)
+            tmp = wad.with_suffix(".wad.download")
+            with urllib.request.urlopen(url, timeout=60) as src, open(tmp, "wb") as dst:
+                digest = hashlib.sha256()
+                while True:
+                    chunk = src.read(1 << 20)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    dst.write(chunk)
+            if tmp.stat().st_size < 1_000_000:
+                tmp.unlink(missing_ok=True)
+                continue
+            if SHAREWARE_WAD_SHA256 and digest.hexdigest() != SHAREWARE_WAD_SHA256:
+                tmp.unlink(missing_ok=True)
+                continue
+            os.replace(tmp, wad)
+            out(f"[green]Shareware WAD cached: {wad} ({wad.stat().st_size} bytes)[/green]")
+            return str(wad)
+        except Exception as e:
+            out(f"[yellow]Shareware download failed ({url}): {e}[/yellow]")
+    return ""
+
+
+def doom_guest_path(cfg: dict, host_wad: str) -> str:
+    guest = str(cfg.get("doom_guest", "") or "/wad/doom1.wad").strip() or "/wad/doom1.wad"
+    commercial = str(cfg.get("doom_commercial", "") or "").strip()
+    if (commercial and host_wad and guest == "/wad/doom1.wad"
+            and os.path.basename(host_wad).lower() != "doom1.wad"):
+        guest = "/wad/" + os.path.basename(host_wad)
+    return guest
+
+
 def find_runner_binary() -> Path | None:
     name = "mfk-runner.exe" if os.name == "nt" else "mfk-runner"
     for profile in ("release", "debug"):
@@ -182,10 +266,21 @@ def load_config() -> dict:
                     cfg[k] = saved[k]
         except (json.JSONDecodeError, OSError) as e:
             out(f"[yellow]Warning: could not read {CONFIG_PATH}: {e}; using defaults.[/yellow]")
-    # normalize extras (back-compat: entries without "bus" get "auto";
-    # "auto" = first 2 on IDE, rest on virtio-blk, matching the runner)
+    # normalize extras (back-compat: entries without "bus" get "auto";    # "auto" = first 2 on IDE, rest on virtio-blk, matching the runner)
     normalize_gpu_config(cfg)
     normalize_ovmf_config(cfg)
+    if cfg.get("hypervisor") not in ("qemu", "vbox", "hyperv"):
+        cfg["hypervisor"] = "qemu"
+    # Normalize the keyboard transport the same way, so a stale or hand-edited
+    # value in .mfk-launch.json cannot raise later at VALID_KBD.index().
+    if str(cfg.get("keyboard", "")).lower() not in VALID_KBD:
+        out("[yellow]Warning: unknown keyboard "
+            f"{cfg.get('keyboard')!r}; falling back to ps2.[/yellow]")
+        cfg["keyboard"] = "ps2"
+    else:
+        cfg["keyboard"] = str(cfg["keyboard"]).lower()
+    if cfg.get("hypervisor") == "hyperv":
+        cfg["firmware"] = "uefi"  # Hyper-V Generation 2 is UEFI-only
     norm = []
     for e in cfg.get("extras", []):
         if isinstance(e, dict) and e.get("path"):
@@ -230,10 +325,65 @@ def bootable_probe(path: str) -> str:
         return "not-created-yet"
 
 
+def doom_runner_args(cfg: dict) -> list[str]:
+    """Runner flags for the automated Doom setup (uses resolved transient keys)."""
+    host = str(cfg.get("_doom_host", "") or "")
+    if not host:
+        return []
+    disk = str(cfg.get("doom_disk", "") or "target/doom.img")
+    size = str(cfg.get("doom_disk_size", "") or "128M")
+    guest = str(cfg.get("_doom_guest", "") or "/wad/doom1.wad")
+    args = [f"--wad={host}", f"--wad-disk={disk}",
+            f"--wad-disk-size={size}", f"--wad-guest={guest}"]
+    if all(e.get("path") != disk for e in cfg.get("extras", [])):
+        args += [f"--extra-disk={disk}", f"--extra-disk-size={size}"]
+    return args
+
+
 def to_runner_args(cfg: dict) -> list[str]:
     args = [cfg.get("kernel", DEFAULTS["kernel"])]
-    args.append("--qemu" if cfg.get("hypervisor", "qemu") == "qemu" else "--vbox")
-    args.append("--uefi" if cfg.get("firmware") == "uefi" else "--bios")
+    hv = cfg.get("hypervisor", "qemu")
+    if hv == "hyperv":
+        args.append("--hyperv")
+    else:
+        args.append("--qemu" if hv == "qemu" else "--vbox")
+    # Hyper-V Generation 2 is UEFI-only.
+    args.append("--uefi" if (cfg.get("firmware") == "uefi" or hv == "hyperv") else "--bios")
+    if hv == "hyperv":
+        # Hyper-V Gen2 options (host-side parity; QEMU devices don't apply).
+        boot = str(cfg.get("hyperv_boot", "dvd") or "dvd").lower()
+        if boot not in ("dvd", "disk"):
+            boot = "dvd"
+        args.append(f"--hyperv-boot={boot}")
+        if cfg.get("hyperv_switch"):
+            args.append(f"--hyperv-switch={cfg['hyperv_switch']}")
+        try:
+            args.append(f"--hyperv-mem={int(cfg.get('hyperv_mem', 512))}")
+        except (TypeError, ValueError):
+            pass
+        try:
+            args.append(f"--hyperv-cpus={int(cfg.get('hyperv_cpus', 2))}")
+        except (TypeError, ValueError):
+            pass
+        if cfg.get("hyperv_vhdx"):
+            args.append(f"--vhdx={cfg['hyperv_vhdx']}")
+        if cfg.get("hyperv_com"):
+            args.append(f"--hyperv-com={cfg['hyperv_com']}")
+        if cfg.get("bundle_apps"):
+            args.append("--bundle-apps")
+        if cfg.get("data_disk_size"):
+            args.append(f"--data-disk-size={cfg['data_disk_size']}")
+        for e in cfg.get("extras", []):
+            args.append(f"--extra-disk={e['path']}")
+            args.append(f"--extra-disk-size={e['size']}")
+        args += doom_runner_args(cfg)
+        for key in ("keyboard", "vnc", "web_ui", "gpu_passthrough"):
+            if key == "keyboard":
+                if str(cfg.get(key, "ps2")).lower() != "ps2":
+                    out("[yellow]Note: --kbd is QEMU-only; ignored for Hyper-V.[/yellow]")
+            elif cfg.get(key):
+                out(f"[yellow]Note: {key} is QEMU-only; ignored for Hyper-V.[/yellow]")
+        return args
     args.append(f"--kbd={cfg.get('keyboard', 'ps2')}")
     if cfg.get("bundle_apps"):
         args.append("--bundle-apps")
@@ -255,6 +405,7 @@ def to_runner_args(cfg: dict) -> list[str]:
     for e in cfg.get("extras", []):
         args.append(f"--extra-disk={e['path']}")
         args.append(f"--extra-disk-size={e['size']}")
+    args += doom_runner_args(cfg)
     boots = [i for i, e in enumerate(cfg.get("extras", [])) if e.get("boot")]
     if boots:
         if len(boots) > 1:
@@ -295,6 +446,16 @@ def show_config(cfg: dict) -> None:
         t.add_row("gpu_audio", cfg["gpu_audio"] or "-")
         t.add_row("gpu_rom", cfg["gpu_rom"] or "-")
         t.add_row("gpu_status", gpu_passthrough_status(cfg))
+        t.add_row("hyperv_switch", cfg.get("hyperv_switch") or "(auto: Default Switch)")
+        t.add_row("hyperv_mem", str(cfg.get("hyperv_mem", 512)))
+        t.add_row("hyperv_cpus", str(cfg.get("hyperv_cpus", 2)))
+        t.add_row("hyperv_boot", cfg.get("hyperv_boot", "dvd"))
+        t.add_row("hyperv_vhdx", cfg.get("hyperv_vhdx") or "(auto)")
+        t.add_row("hyperv_com", cfg.get("hyperv_com") or "(auto pipe)")
+        t.add_row("doom", "ON" if cfg.get("doom") else "OFF")
+        t.add_row("doom_wad", cfg.get("_doom_host") or cfg.get("doom_wad", ""))
+        t.add_row("doom_disk", str(cfg.get("doom_disk", "")) or "-")
+        t.add_row("doom_guest", cfg.get("_doom_guest") or cfg.get("doom_guest", ""))
         console.print(t)
         d = Table(title=f"Extra drives ({len(cfg['extras'])}/{MAX_EXTRAS}: "
                         f"{MAX_EXTRA_IDE} IDE + {MAX_EXTRA_VIRTIO} virtio)")
@@ -315,11 +476,17 @@ def show_config(cfg: dict) -> None:
         out("== MFK launch config ==")
         for k in ("kernel", "hypervisor", "firmware", "ovmf_code", "ovmf_status", "keyboard",
                   "bundle_apps", "data_disk_size", "vnc", "vnc_port", "web_ui", "web_ui_port",
-                  "gpu_passthrough", "gpu_audio", "gpu_rom", "gpu_status"):
+                  "gpu_passthrough", "gpu_audio", "gpu_rom", "gpu_status",
+                  "hyperv_switch", "hyperv_mem", "hyperv_cpus", "hyperv_boot",
+                  "hyperv_vhdx", "hyperv_com", "doom", "doom_wad", "doom_disk", "doom_guest"):
             if k == "ovmf_status":
                 value = ovmf_status(cfg)
             elif k == "gpu_status":
                 value = gpu_passthrough_status(cfg)
+            elif k == "doom_wad":
+                value = cfg.get("_doom_host") or cfg.get("doom_wad", "")
+            elif k == "doom_guest":
+                value = cfg.get("_doom_guest") or cfg.get("doom_guest", "")
             else:
                 value = cfg[k]
             out(f"  {k}: {value}")
@@ -628,6 +795,10 @@ def menu_loop(cfg: dict) -> bool:
         "GPU audio BDF",
         "GPU ROM path",
         "OVMF code path",
+        "Doom setup",
+        "Doom shareware WAD",
+        "Doom commercial WAD",
+        "Doom disk size",
         "Add extra drive",
         "Edit extra drive",
         "Remove extra drive",
@@ -676,6 +847,8 @@ def menu_loop(cfg: dict) -> bool:
         out(f"[bold]Kernel:[/bold] {cfg['kernel']}")
         out(f"[bold]Extra drives:[/bold] {len(cfg['extras'])}/{MAX_EXTRAS} "
             f"({MAX_EXTRA_IDE} IDE + {MAX_EXTRA_VIRTIO} virtio)")
+        out(f"[bold]Doom:[/bold] {'ON' if cfg.get('doom') else 'OFF'}"
+            + (f"  WAD: {cfg.get('_doom_host') or cfg.get('doom_wad', '')}" if cfg.get("doom") else ""))
         out("")
 
         for i, name in enumerate(menu_names):
@@ -708,14 +881,22 @@ def menu_loop(cfg: dict) -> bool:
                 value = f" : {cfg['gpu_rom'] or '-'}"
             elif i == 13:
                 value = f" : {cfg['ovmf_code'] or 'AUTO'}"
+            elif i == 14:
+                value = f" : {'ON' if cfg.get('doom') else 'OFF'}"
+            elif i == 15:
+                value = f" : {cfg.get('doom_wad', '')}"
+            elif i == 16:
+                value = f" : {cfg.get('doom_commercial', '') or '-'}"
+            elif i == 17:
+                value = f" : {cfg.get('doom_disk_size', '')}"
             else:
                 value = ""
 
-            if i == 17:
+            if i == 21:
                 prefix_text = "▶ "
-            elif i == 18:
+            elif i == 22:
                 prefix_text = "💾 "
-            elif i == 19:
+            elif i == 23:
                 prefix_text = "✕ "
             else:
                 prefix_text = "  "
@@ -747,9 +928,11 @@ def menu_loop(cfg: dict) -> bool:
 
         # Left/right can directly change the cycle-based options.
         if selected == 0 and key in ("a", "d"):
-            values = ("qemu", "vbox")
-            current = values.index(cfg["hypervisor"])
+            values = ("qemu", "vbox", "hyperv")
+            current = values.index(cfg["hypervisor"]) if cfg["hypervisor"] in values else 0
             cfg["hypervisor"] = values[(current + (1 if key == "d" else -1)) % len(values)]
+            if cfg["hypervisor"] == "hyperv":
+                cfg["firmware"] = "uefi"
             save_config(cfg)
             continue
 
@@ -757,10 +940,13 @@ def menu_loop(cfg: dict) -> bool:
             values = ("bios", "uefi")
             current = values.index(cfg["firmware"])
             cfg["firmware"] = values[(current + (1 if key == "d" else -1)) % len(values)]
+            if cfg["hypervisor"] == "hyperv":
+                cfg["firmware"] = "uefi"  # Hyper-V Generation 2 is UEFI-only
             save_config(cfg)
             continue
 
         if selected == 2 and key in ("a", "d"):
+            # load_config() normalizes this, so index() cannot raise here.
             current = VALID_KBD.index(cfg["keyboard"])
             step = 1 if key == "d" else -1
             cfg["keyboard"] = VALID_KBD[(current + step) % len(VALID_KBD)]
@@ -769,6 +955,18 @@ def menu_loop(cfg: dict) -> bool:
 
         if selected == 3 and key in ("space", "a", "d"):
             cfg["bundle_apps"] = not cfg["bundle_apps"]
+            save_config(cfg)
+            continue
+
+        if selected == 14 and key in ("space", "a", "d"):
+            cfg["doom"] = not cfg.get("doom")
+            if cfg["doom"]:
+                host = resolve_doom_wad(cfg)
+                cfg["_doom_host"] = host
+                cfg["_doom_guest"] = doom_guest_path(cfg, host) if host else ""
+            else:
+                cfg["_doom_host"] = ""
+                cfg["_doom_guest"] = ""
             save_config(cfg)
             continue
 
@@ -791,14 +989,18 @@ def menu_loop(cfg: dict) -> bool:
         if key == "enter" or (selected == 3 and key == "space"):
             if selected == 0:
                 cfg["hypervisor"] = choose_from_list(
-                    "Hypervisor", ("qemu", "vbox"), cfg["hypervisor"]
+                    "Hypervisor", ("qemu", "vbox", "hyperv"), cfg["hypervisor"]
                 )
+                if cfg["hypervisor"] == "hyperv":
+                    cfg["firmware"] = "uefi"
                 save_config(cfg)
 
             elif selected == 1:
                 cfg["firmware"] = choose_from_list(
                     "Firmware", ("bios", "uefi"), cfg["firmware"]
                 )
+                if cfg["hypervisor"] == "hyperv":
+                    cfg["firmware"] = "uefi"  # Hyper-V Generation 2 is UEFI-only
                 save_config(cfg)
 
             elif selected == 2:
@@ -879,9 +1081,44 @@ def menu_loop(cfg: dict) -> bool:
                 save_config(cfg)
 
             elif selected == 14:
-                add_extra_menu(cfg)
+                cfg["doom"] = not cfg.get("doom")
+                if cfg["doom"]:
+                    host = resolve_doom_wad(cfg)
+                    cfg["_doom_host"] = host
+                    cfg["_doom_guest"] = doom_guest_path(cfg, host) if host else ""
+                else:
+                    cfg["_doom_host"] = ""
+                    cfg["_doom_guest"] = ""
+                save_config(cfg)
 
             elif selected == 15:
+                cfg["doom_wad"] = edit_value("Shareware doom1.wad cache path",
+                                             str(cfg.get("doom_wad", "target/doom1.wad")))
+                if cfg.get("doom"):
+                    host = resolve_doom_wad(cfg)
+                    cfg["_doom_host"] = host
+                    cfg["_doom_guest"] = doom_guest_path(cfg, host) if host else ""
+                save_config(cfg)
+
+            elif selected == 16:
+                cfg["doom_commercial"] = edit_optional_value(
+                    "Commercial WAD path (DOOM.WAD/DOOM64.WAD, empty = shareware)",
+                    str(cfg.get("doom_commercial", "") or ""))
+                if cfg.get("doom"):
+                    host = resolve_doom_wad(cfg)
+                    cfg["_doom_host"] = host
+                    cfg["_doom_guest"] = doom_guest_path(cfg, host) if host else ""
+                save_config(cfg)
+
+            elif selected == 17:
+                cfg["doom_disk_size"] = edit_value("Doom disk size",
+                                                   str(cfg.get("doom_disk_size", "128M")))
+                save_config(cfg)
+
+            elif selected == 18:
+                add_extra_menu(cfg)
+
+            elif selected == 19:
                 if not cfg["extras"]:
                     clear_screen()
                     out("[yellow]No extra drives yet.[/yellow]")
@@ -913,14 +1150,18 @@ def menu_loop(cfg: dict) -> bool:
                         elif k == "escape":
                             break
 
-            elif selected == 16:
+            elif selected == 20:
                 remove_extra_menu(cfg)
 
-            elif selected == 17:
+            elif selected == 21:
+                if cfg.get("doom") and not cfg.get("_doom_host"):
+                    host = resolve_doom_wad(cfg)
+                    cfg["_doom_host"] = host
+                    cfg["_doom_guest"] = doom_guest_path(cfg, host) if host else ""
                 save_config(cfg)
                 return True
 
-            elif selected == 18:
+            elif selected == 22:
                 save_config(cfg)
                 clear_screen()
                 out(f"[green]Saved to {CONFIG_PATH}[/green]")
@@ -928,11 +1169,20 @@ def menu_loop(cfg: dict) -> bool:
                 out("Press any key to continue...")
                 read_key()
 
-            elif selected == 19:
+            elif selected == 23:
                 return False
 
 
 def launch(cfg: dict) -> int:
+    if cfg.get("doom"):
+        host = resolve_doom_wad(cfg)
+        cfg["_doom_host"] = host
+        cfg["_doom_guest"] = doom_guest_path(cfg, host) if host else ""
+        if not host:
+            out("[red]Doom setup is ON but no WAD is available; "
+                "set Doom commercial WAD or check network for shareware download.[/red]")
+            return 2
+        save_config(cfg)
     if cfg.get("gpu_passthrough") and is_wsl2():
         out("[red]GPU passthrough is blocked under WSL2: raw PCI passthrough is unavailable.[/red]")
         out("Use a native Linux host with VFIO, or a Hyper-V VM with Discrete Device Assignment.")
@@ -978,6 +1228,8 @@ def textual_app(cfg: dict):
                 Static("GPU passthrough: " + gpu_passthrough_status(cfg) +
                        "  BDF: " + (cfg["gpu_passthrough"] or "-") +
                        "  Audio: " + (cfg["gpu_audio"] or "-")),
+                Static("Doom: " + ("ON (" + (cfg.get("_doom_host") or cfg.get("doom_wad", "")) + ")"
+                        if cfg.get("doom") else "OFF")),
                 Static("Runner: mfk-runner " + " ".join(to_runner_args(cfg))),
                 Button("Launch", id="go", variant="success"),
                 Button("Quit (saved)", id="quit"),
@@ -1007,6 +1259,10 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = load_config()
+    if cfg.get("doom"):
+        host = resolve_doom_wad(cfg)
+        cfg["_doom_host"] = host
+        cfg["_doom_guest"] = doom_guest_path(cfg, host) if host else ""
 
     if args.show_args:
         print(" ".join(to_runner_args(cfg)))

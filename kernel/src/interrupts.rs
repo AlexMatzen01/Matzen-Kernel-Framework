@@ -9,6 +9,7 @@
 
 use crate::serial_println;
 use lazy_static::lazy_static;
+use spin::Mutex;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 lazy_static! {
@@ -31,8 +32,17 @@ lazy_static! {
             .set_handler_fn(keyboard_interrupt_handler);
         idt[InterruptIndex::Com1.as_u8()]
             .set_handler_fn(serial_interrupt_handler);
+        idt[InterruptIndex::Mouse.as_u8()]
+            .set_handler_fn(mouse_interrupt_handler);
 
-        // Default handlers for unused PIC IRQs (ack spurious interrupts)
+        // The E1000 takes whichever of IRQ10/IRQ11 the firmware gave it (see
+        // `NIC_IRQ_LINES`). Both vectors call into the driver; the one the card
+        // is not on stays masked, so it never fires.
+        idt[InterruptIndex::E1000A.as_u8()].set_handler_fn(e1000_interrupt_handler);
+        idt[InterruptIndex::E1000B.as_u8()].set_handler_fn(e1000_interrupt_handler);
+
+        // Remaining PIC IRQs: acknowledge only, so a masked or unused line
+        // cannot escalate into a fault.
         idt[34].set_handler_fn(irq2_handler);
         idt[35].set_handler_fn(irq3_handler);
         idt[37].set_handler_fn(irq5_handler);
@@ -40,9 +50,6 @@ lazy_static! {
         idt[39].set_handler_fn(irq7_handler);
         idt[40].set_handler_fn(irq8_handler);
         idt[41].set_handler_fn(irq9_handler);
-        idt[42].set_handler_fn(irq10_handler);
-        idt[43].set_handler_fn(irq11_handler);
-        idt[44].set_handler_fn(mouse_interrupt_handler);
         idt[45].set_handler_fn(irq13_handler);
         idt[46].set_handler_fn(irq14_handler);
         idt[47].set_handler_fn(irq15_handler);
@@ -56,13 +63,38 @@ pub fn init_idt() {
     IDT.load();
 }
 
+/// First PIC interrupt vector. Matches the remap in `pic::PICS`.
+pub const PIC_BASE: u8 = 32;
+
+// PIC IRQ lines owned by the core devices and the E1000.
+pub const IRQ_TIMER: u8 = 0;
+pub const IRQ_KEYBOARD: u8 = 1;
+pub const IRQ_COM1: u8 = 4;
+pub const IRQ_MOUSE: u8 = 12;
+
+/// PIC lines the E1000 may be assigned, with a handler installed on each.
+///
+/// QEMU's legacy `pc` machine places the e1000 at device 3, which lands on
+/// IRQ11 here; other machines and firmware configurations put it on IRQ10. Both
+/// vectors are wired to the driver, and the driver unmasks only the line it was
+/// actually given, so the unused one stays quiet.
+pub const NIC_IRQ_LINES: [u8; 2] = [10, 11];
+
+/// Whether `irq` has a handler installed for the E1000.
+pub fn is_nic_irq(irq: u8) -> bool {
+    NIC_IRQ_LINES.contains(&irq)
+}
+
 /// Hardware interrupt indices (mapped by PIC)
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum InterruptIndex {
-    Timer = 32,    // PIC1 base + 0 (IRQ0)
-    Keyboard = 33, // PIC1 base + 1 (IRQ1)
-    Com1 = 36,     // PIC1 base + 4 (IRQ4)
+    Timer = 32,     // PIC1 base + 0 (IRQ0)
+    Keyboard = 33,  // PIC1 base + 1 (IRQ1)
+    Com1 = 36,      // PIC1 base + 4 (IRQ4)
+    E1000A = 42,    // PIC1 base + 10 (IRQ10)
+    E1000B = 43,    // PIC1 base + 11 (IRQ11)
+    Mouse = 44,     // PIC1 base + 12 (IRQ12)
 }
 
 impl InterruptIndex {
@@ -135,6 +167,11 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     use x86_64::registers::control::Cr2;
 
+    crate::println!();
+    crate::println!("EXCEPTION: PAGE FAULT");
+    crate::println!("Accessed Address: {:?}", Cr2::read());
+    crate::println!("Error Code: {:?}", error_code);
+    crate::println!("{:#?}", stack_frame);
     serial_println!("EXCEPTION: PAGE FAULT");
     serial_println!("Accessed Address: {:?}", Cr2::read());
     serial_println!("Error Code: {:?}", error_code);
@@ -150,7 +187,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     unsafe {
         super::pic::PICS
             .lock()
-            .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
+            .notify_end_of_interrupt(PIC_BASE + IRQ_TIMER);
     }
 }
 
@@ -168,7 +205,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     unsafe {
         super::pic::PICS
             .lock()
-            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+            .notify_end_of_interrupt(PIC_BASE + IRQ_KEYBOARD);
     }
 }
 
@@ -194,7 +231,9 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
     }
 
     unsafe {
-        super::pic::PICS.lock().notify_end_of_interrupt(44);
+        super::pic::PICS
+            .lock()
+            .notify_end_of_interrupt(PIC_BASE + IRQ_MOUSE);
     }
 }
 
@@ -206,8 +245,12 @@ extern "x86-interrupt" fn serial_interrupt_handler(_stack_frame: InterruptStackF
     unsafe {
         super::pic::PICS
             .lock()
-            .notify_end_of_interrupt(InterruptIndex::Com1.as_u8());
+            .notify_end_of_interrupt(PIC_BASE + IRQ_COM1);
     }
+}
+
+extern "x86-interrupt" fn e1000_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::drivers::e1000::handle_interrupt();
 }
 
 // Unhandled or spurious IRQs (PIC remapped to 32-47). These simply acknowledge
@@ -229,9 +272,7 @@ unused_irq_handler!(irq6_handler, 38);
 unused_irq_handler!(irq7_handler, 39);
 unused_irq_handler!(irq8_handler, 40);
 unused_irq_handler!(irq9_handler, 41);
-unused_irq_handler!(irq10_handler, 42);
 unused_irq_handler!(irq11_handler, 43);
-
 unused_irq_handler!(irq13_handler, 45);
 unused_irq_handler!(irq14_handler, 46);
 unused_irq_handler!(irq15_handler, 47);

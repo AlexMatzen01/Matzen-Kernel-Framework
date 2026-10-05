@@ -1,376 +1,206 @@
 # Memory Management
 
-Deep dive into MFK's memory system.
+Reference for MFK's memory subsystem: how physical memory is discovered and
+classified, how frames and heap bytes are handed out, and what the `mem`
+command reports.
 
-## Memory Layout
+## Address space
 
-### Address Space Overview
+MFK runs in ring 0 only and does not implement its own virtual memory. The
+bootloader establishes the mappings and the kernel reaches RAM through a
+**physical direct map**: a physical address `p` is a valid pointer at
+`physical_memory_offset + p`. The offset is chosen by the bootloader and is
+printed at boot (`Physical memory offset: 0x...`) and reported by `mem`.
 
-```
-Virtual Address Space (x86_64)
-────────────────────────────────────────────
+| Region | How it is reached |
+|---|---|
+| Kernel code/data | Bootloader's own mapping |
+| Kernel stack | Bootloader's own mapping (80 KiB default) |
+| Heap | Direct map at `offset + heap_phys` |
+| VGA text buffer | Direct map (`0xB8000`) |
+| Physical frames | Direct map |
+| PCI MMIO | Direct map when below the mapped range, otherwise fresh page tables via `drivers::pci` |
 
-0xFFFFFFFF80000000  ┌─────────────────────┐
-                    │  Kernel Code/Data   │
-                    │  (Identity mapped)   │
-                    │  512MB              │
-                    │                     │
-0xFFFFFFFF80000000 + 512MB
-                    │  Heap (100KB-1MB)   │
-                    │                     │
-Lower Virtual       │  Stack              │
-Addresses           │  (grows down)       │
-                    │                     │
-0x00000000          │  User space/BIOS    │
-                    │  (not used yet)     │
-                    └─────────────────────┘
+`crate::memory::addr` owns that arithmetic. Drivers must not re-derive it:
+`addr::dma_phys` also confirms a 32-bit DMA controller can reach the address.
 
-Physical Address Space
-────────────────────────────────────────────
+### Direct-map range
 
-0x0000000000000000  ┌─────────────────────┐
-                    │  BIOS/Real mode     │
-                    │  (first 1MB)        │
-                    │                     │
-0x0000000000100000  │  Bootloader         │
-                    │                     │
-0x0000000000200000  │  Kernel ELF         │
-                    │  (loaded by boot)   │
-                    │                     │
-0x0000000010000000  │  Free RAM           │
-                    │  (available for     │
-                    │   heap/DMA)         │
-                    │                     │
-                    └─────────────────────┘
-```
+The bootloader maps `[0, max(highest region end, 4 GiB))` — at least 4 GiB, so
+MMIO regions stay reachable on a machine with less RAM than that. That 4 GiB
+floor matters: treating the mapped range as ending at the highest region end
+makes every sub-4 GiB PCI BAR look unmapped on a small guest, so each one takes
+the page-table path and leaks page-table frames for a mapping that already
+exists. `drivers::pci::PHYS_MAP_END` therefore holds the floored value.
 
-### Physical Memory Offset
+## Firmware memory map
 
-The bootloader provides a **physical memory offset** that allows kernel code to access any physical address:
+`crate::memory::memmap` interprets the firmware map once, in `kernel_main`:
 
-```rust
-// From bootloader
-let phys_mem_offset = VirtAddr::new(0xFFFFFFFF80000000);
+1. **Classify** every region. The raw tags are `Usable`, `Bootloader`, or an
+   `Unknown*` variant carrying the firmware type (UEFI `MemoryType` or BIOS
+   E820 type). Each maps to a `RegionClass`:
 
-// Access physical address:
-let physical = PhysAddr::new(0x1000);
-let virtual_addr = phys_mem_offset + physical.as_u64();
-let reference = &*(virtual_addr.as_ptr() as *const u32);
-```
+   | Class | Policy |
+   |---|---|
+   | `usable` | Allocatable |
+   | `acpi-reclaim` | Allocatable (the OS claims it) |
+   | `bootloader` | Mapped, never allocated |
+   | `acpi-nvs` | Must survive reboots — never allocated |
+   | `bad` | Never allocated |
+   | `mmio` | Never allocated |
+   | `reserved` | Never allocated |
 
-In practice, **MFK uses identity mapping**: Physical address 0x1000 → Virtual address 0x1000. This means no conversion is needed.
+   Any firmware type the kernel does not recognise maps to `reserved`. An
+   unidentified region must never become free RAM.
 
-## Allocator Design
+2. **Reserve** the spans the kernel itself occupies. The bootloader marks its
+   own structures, but not everything: the kernel ELF (from
+   `BootInfo::kernel_addr`/`kernel_len`), a ramdisk, the linear framebuffer,
+   and the heap are recorded explicitly.
 
-### BumpAllocator
+3. **Produce spans** — page-aligned, reservation-free, adjacent spans merged.
+   This is what the frame allocator is given, and it is computed over *every*
+   region, not the capped display list.
 
-MFK uses a simple bump allocator for initial memory allocation:
+`MAX_REGIONS` (64) caps only how many regions `mem` prints; the byte totals
+stay exact, and `allocatable_spans` is unaffected by the cap.
 
-```rust
-pub struct BumpAllocator {
-    heap_start: usize,
-    heap_end: usize,
-    next: usize,
-}
+### Why "total" is not "RAM"
 
-impl BumpAllocator {
-    pub fn allocate(&mut self, layout: Layout) -> *mut u8 {
-        // Align to requested alignment
-        let aligned = align_up(self.next, layout.align());
-        
-        // Check bounds
-        if aligned + layout.size() > self.heap_end {
-            return core::ptr::null_mut();
-        }
-        
-        // Allocate
-        self.next = aligned + layout.size();
-        aligned as *mut u8
-    }
-    
-    pub fn deallocate(&mut self, ptr: *mut u8, layout: Layout) {
-        // Bump allocator doesn't support deallocation
-        // (except via reset)
-    }
-}
-```
+A firmware map routinely contains a PCI MMIO hole covering most of the upper
+address space. Counting it as physical memory makes `mem` claim far more RAM
+than the machine has, so `mem` leads with the **allocatable** figure and prints
+the per-class breakdown beneath it, which reconciles the two.
 
-**Characteristics:**
-- ✅ Very fast (O(1) allocation)
-- ✅ No fragmentation
-- ✅ Low overhead
-- ❌ Can't free individual allocations
-- ❌ Wastes space if some allocations are freed
+## Frame allocator
 
-**When to use:** Best for systems that mostly allocate at startup and never free.
+`crate::memory::frame_allocator` is bitmap-backed, with counters and free.
 
-### Heap Setup
+| Property | Value |
+|---|---|
+| Granularity | 4 KiB, plus naturally aligned 2 MiB frames |
+| Allocation | First fit from a rotating per-region cursor, wrapping |
+| Free | Yes — `FrameDeallocator` for 4 KiB |
+| Persistence | None: frames are a kernel-lifetime resource, not on disk |
+| DMA pool | `allocate_dma_frame` returns only frames below 4 GiB |
+| Bookkeeping | `FrameStats`: totals, free, used, low/high, ops, failures |
+| Bitmap budget | 4 MiB, tracking 32 GiB of RAM; overflow is skipped and logged |
 
-The heap is initialized early in boot:
+4 GiB is the DMA ceiling because every bus master in this kernel (EHCI, UHCI,
+OHCI, xHCI, legacy virtio-blk, PIO-mode IDE) addresses memory with a 32-bit
+physical pointer. The limit lives in `memmap::DMA_PHYS_LIMIT` and every driver
+shares it.
 
-```rust
-// kernel/src/main.rs
+A 2 MiB frame must start on a 2 MiB boundary, so the unaligned head of a
+region is skipped rather than producing a misaligned "huge" frame.
 
-unsafe {
-    allocator::init_heap(&mut HEAP, HEAP_START, HEAP_SIZE)
-        .expect("Heap initialization failed");
-}
+The previous implementation was a bump cursor: it could never return a frame,
+kept no counters, and — because it walked regions in ascending order with no
+upper bound — would eventually hand out frames above 4 GiB that the DMA
+controllers cannot address, turning into silent driver failure.
+
+## Kernel heap
+
+The heap is a `TrackingAllocator` wrapping `linked_list_allocator::LockedHeap`.
+
+```text
+  base                                                  base + size
+  |------ main heap (HEAP_SIZE, 32 MiB) ------|-- reserve (1 MiB) --|
+     first-fit hole list, freed normally           bump cursor, one-shot
 ```
 
-**Default heap:**
-- **Size:** 100 KB (configurable in allocator.rs)
-- **Start:** `0xABCD0000` (defined in allocator.rs)
-- **Growth:** Static, no dynamic expansion
+It must not live in `.bss`: a 32 MiB static array balloons the kernel ELF and
+collides with bootloader mappings on real hardware. It is carved from the
+firmware map instead, from the **tail of the largest usable run**, preferring
+memory below 4 GiB.
 
-### Allocation Strategy
+The default carve *refuses* a run above 4 GiB rather than falling back to one.
+Every DMA buffer comes from this heap, so a heap above 4 GiB would leave USB
+and virtio-blk unable to address any of it — they would fail silently.
 
-**Typical allocation workflow:**
+If no sub-4 GiB run exists, the kernel boots on a 1 MiB static fallback with a
+serial warning.
+
+### Instrumentation
+
+| Field | Meaning |
+|---|---|
+| `size` / `used` / `free` | From the hole list |
+| `peak_bytes` | High-water mark of live allocated bytes |
+| `peak_single` | Largest single allocation ever served |
+| `live_allocations` | Outstanding allocations |
+| `alloc_requests` | Total `alloc`/`realloc` calls |
+| `total_allocated` / `total_freed` | Lifetime byte totals |
+| `oom_events` | Heap-exhaustion events |
+| `reserve_used` | Emergency-reserve bytes handed out |
+
+### Out-of-memory behaviour
+
+An exhausted heap routes to an explicit `#[alloc_error_handler]` that formats
+only integers, reports over serial, and halts. It deliberately does **not**
+panic: the panic handler formats a `PanicInfo`, which allocates, so a
+heap-exhaustion panic could recurse into the allocator it had already failed.
+
+`allocator::try_alloc_emergency` allocates from the reserve for paths that must
+survive low memory. Reserve allocations are never reused.
+
+## Physical addressing width
+
+`sysinfo::cpu_max_phys_addr_bits()` reads `CPUID.0x80000008:EAX[7:0]`
+(`MAXPHYADDR`), adding 32 when the extension bit is set. Without it nothing in
+the kernel knew how wide physical memory is, so a 64-bit PCI BAR above that
+width could not be detected as unreachable. `cpu_phys_addr_limit()` is the
+value to use for range checks, defaulting to the x86-64 baseline of 40 bits.
+
+## SMBIOS
+
+`crate::drivers::smbios` reports what the RAM physically *is* — module sizes,
+form factor, ECC, manufacturer part numbers — which the memory map cannot say.
+
+Types 16 (Physical Memory Array) and 17 (Physical Memory Device) are decoded
+from a bounds-checked parser over a byte slice. Two details the format forces:
+
+- **String handles are single bytes.** A type 17 record's string fields are
+  8-bit indices into the record's string pool, not 16-bit.
+- **Type 16 has two layouts.** SMBIOS 2.x (length `0x0F`) and 3.x (length
+  `>= 0x17`) place the handle, slot count, capacity and ECC bytes at different
+  offsets. The record's own length byte selects the layout; a length matching
+  neither is not decoded, because a plausible-looking wrong handle is worse
+  than no array at all.
+
+Entry-point discovery scans the RSDP page, the BIOS data area, and the BIOS ROM
+area for `SMBIOS3` / `_SM_` rather than trusting a fixed RSDP offset.
+
+Firmware is not obliged to expose a guest-reachable entry point — **OVMF is
+not** — so `mem` reports "not exposed by firmware" on a plain UEFI guest. The
+memory map and CPUID remain authoritative in that case.
+
+## `mem`
+
 ```
-1. Request Vec::new()
-2. GlobalAlloc::alloc() called
-3. BumpAllocator.allocate() bumps pointer
-4. Memory initialized with zeros
-5. Pointer returned to Vec
-```
-
-**Deallocations:**
-```
-1. Variable dropped (implicit or explicit)
-2. Drop trait called
-3. Memory no longer accessible
-4. BumpAllocator: memory wasted until reset
-```
-
-## Memory Safety
-
-### Alignment
-
-Hardware requires certain alignments:
-- `u32`: 4-byte aligned
-- `u64`: 8-byte aligned  
-- Structures: Aligned to largest field
-
-```rust
-// Good: Fields naturally aligned
-#[repr(C)]
-struct Good {
-    a: u8,
-    b: u32,     // Padded to 4-byte boundary
-    c: u64,     // At 8-byte boundary
-}
-
-// Bad: Manual packing wastes space
-#[repr(C, packed)]
-struct Bad {
-    a: u8,
-    b: u32,     // Unaligned! CPU penalty
-    c: u64,
-}
-```
-
-### DMA Buffer Alignment
-
-DMA buffers must be aligned for hardware:
-
-```rust
-#[repr(C, align(4096))]  // 4KB page alignment
-pub struct DmaBuffer {
-    rx_descriptors: [RxDescriptor; 32],
-    tx_descriptors: [TxDescriptor; 32],
-    rx_buffers: [[u8; 2048]; 32],
-    tx_buffers: [[u8; 2048]; 32],
-}
-```
-
-This ensures DMA controller can access buffers correctly.
-
-### Virtual vs Physical Addresses
-
-**Key insight:** Most kernel code uses virtual addresses. But hardware (like NIC) needs physical addresses.
-
-```rust
-// Virtual address: kernel code uses this
-let virt = &some_data as *const _ as VirtAddr;
-
-// Physical address: hardware uses this
-let phys = match virt_to_phys(virt) {
-    Ok(p) => p,
-    Err(e) => { /* handle */ }
-};
-
-// For DMA:
-device.set_buffer_address(phys);  // Hardware understands this
+Memory Information:
+  Allocatable:  455 MiB after kernel-owned reservations
+  Firmware map: 12.5 GiB described across 64 region(s) (list truncated)
+    usable            486 MiB  3.8%
+    reserved         12.0 GiB  96.0%
+    bootloader       22.9 MiB  0.2%
+    acpi-reclaim     2.04 MiB  0.0%
+    bad              72.0 KiB  0.0%
+  DMA reach:    488 MiB below 4 GiB, 0 B above (32-bit controllers)
+...
 ```
 
-## Memory Regions
+Every number is read from live state. The command previously printed a fixed
+1994-era 640 KB/384 KB/ROM map that matched no real machine.
 
-### Code Section
+## Source map
 
-- **Virtual:** 0xFFFFFFFF80000000 onwards
-- **Physical:** 0x200000 onwards  
-- **Permissions:** Read + Execute (initially)
-- **Visibility:** All modules
-
-### Data Section
-
-- **Virtual:** After code (varies)
-- **Physical:** After code
-- **Permissions:** Read + Write
-- **Visibility:** All modules
-
-### Heap
-
-- **Virtual:** 0xABCD0000 onwards
-- **Physical:** Depends on allocations
-- **Permissions:** Read + Write
-- **Visibility:** Through Allocator trait
-
-### Stack
-
-- **Virtual:** Below kernel code (grows down)
-- **Physical:** Various
-- **Permissions:** Read + Write
-- **Visibility:** Local to functions
-
-### Static Data
-
-Global variables live in the data section:
-
-```rust
-pub static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
-pub static COMMAND_BUFFER: Mutex<VecDeque<char>> = 
-    Mutex::new(VecDeque::new());
-```
-
-## Memory Pressure
-
-### Heap Exhaustion
-
-If heap fills up:
-
-```rust
-pub fn allocate(&mut self, layout: Layout) -> *mut u8 {
-    if aligned + layout.size() > self.heap_end {
-        // Heap full!
-        return core::ptr::null_mut();  // Null indicates failure
-    }
-    // ...
-}
-```
-
-**Allocation failure handling:**
-```rust
-let vec: Result<Vec<u8>, _> = vec.try_reserve(1000);
-match vec {
-    Ok(v) => { /* use vector */ }
-    Err(_) => { /* handle out of memory */ }
-}
-```
-
-### Monitoring Memory
-
-Check current heap usage:
-
-```rust
-// In shell: memory command
-pub fn handle_memory() {
-    let used = current_heap_used();
-    let total = HEAP_SIZE;
-    serial_println!("Heap: {}/{} bytes", used, total);
-}
-```
-
-## Unsafe Memory Access
-
-Unsafe is needed for:
-- Hardware register access
-- Buffer descriptors (physical addresses)
-- Raw pointers to hardware memory
-
-**Safe pattern:**
-```rust
-pub fn safe_hardware_access() {
-    // SAFETY: This register is memory-mapped by bootloader
-    // and valid for entire kernel lifetime.
-    unsafe {
-        let reg = &*(0xDEADBEEF as *const u32);
-        serial_println!("Value: {}", reg);
-    }
-}
-```
-
-**Dangerous pattern:**
-```rust
-// WRONG: Unvalidated pointer from untrusted source
-unsafe {
-    let ptr = user_input_as_ptr();  // Where does it point?
-    *ptr = 42;  // Could write anywhere!
-}
-```
-
-## Memory Debugging
-
-### Checking Alignment
-
-```rust
-fn check_alignment<T>() {
-    let align = core::mem::align_of::<T>();
-    serial_println!("Alignment of {}: {}", 
-        core::any::type_name::<T>(), 
-        align);
-}
-```
-
-### Validating Pointers
-
-```rust
-fn is_valid_pointer(ptr: *const u8) -> bool {
-    // Check if pointer is in kernel space
-    let addr = ptr as usize;
-    addr >= KERNEL_START && addr < KERNEL_END
-}
-```
-
-### Memory Dumps
-
-```rust
-fn dump_memory(addr: *const u8, len: usize) {
-    for i in 0..len {
-        unsafe {
-            serial_print!("{:02X} ", *addr.add(i));
-            if (i + 1) % 16 == 0 {
-                serial_println!();
-            }
-        }
-    }
-}
-```
-
-## Future Enhancements
-
-### Better Allocator
-
-Consider implementing:
-- **Buddy Allocator** — Balance between speed and fragmentation
-- **Slab Allocator** — Fast allocation of fixed-size objects
-- **Paging** — Virtual memory for more address space
-
-### Memory Protection
-
-Add later:
-- **Write protection** — Mark code sections read-only
-- **Bounds checking** — Runtime verification
-- **Canaries** — Detect buffer overflows
-
-### Automatic Cleanup
-
-Future work:
-- **Reference counting** — Automatic deallocation
-- **Garbage collection** — Managed memory
-- **RAII** — Resource acquisition as initialization
-
-## Next Steps
-
-- **[Interrupts Reference](interrupts.md)** — How exceptions handled
-- **[Drivers Reference](drivers.md)** — Hardware access patterns
-- **[Architecture Overview](architecture.md)** — System organization
+| File | Contents |
+|---|---|
+| `memory/memmap.rs` | Region classification, reservations, spans, per-class totals |
+| `memory/frame_allocator.rs` | Bitmap frame allocator, DMA pool, 2 MiB frames, stats |
+| `memory/addr.rs` | Direct-map translation and DMA-reachability checks |
+| `allocator.rs` | Heap, tracking allocator, OOM handler, emergency reserve |
+| `sysinfo.rs` | Layout snapshot, CPUID, address width, region naming |
+| `drivers/smbios.rs` | SMBIOS types 16/17 parsing and entry-point discovery |

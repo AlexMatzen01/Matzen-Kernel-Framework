@@ -3,9 +3,15 @@
   "hypervisor": "qemu",
   "firmware": "uefi",
   "ovmf_code": "OVMF/OVMF_CODE_4M.fd",
-  "keyboard": "ehci",
+  "keyboard": "xhci",
   "bundle_apps": false,
   "data_disk_size": "10M",
+  "doom": false,
+  "doom_wad": "target/doom1.wad",
+  "doom_commercial": "",
+  "doom_disk": "target/doom.img",
+  "doom_disk_size": "128M",
+  "doom_guest": "/wad/doom1.wad",
   "vnc": true,
   "vnc_port": "5900",
   "web_ui": true,
@@ -13,6 +19,12 @@
   "gpu_passthrough": "",
   "gpu_audio": "",
   "gpu_rom": "",
+  "hyperv_switch": "",
+  "hyperv_mem": 512,
+  "hyperv_cpus": 2,
+  "hyperv_boot": "dvd",
+  "hyperv_vhdx": "",
+  "hyperv_com": "",
   "extras": [
     {
       "path": "target/extra-disk.img",
@@ -20,5 +32,7 @@
       "boot": false,
       "bus": "auto"
     }
-  ]
+  ],
+  "_doom_host": "",
+  "_doom_guest": ""
 }

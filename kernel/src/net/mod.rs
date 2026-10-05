@@ -6,6 +6,7 @@
 
 pub mod arp;
 pub mod debug;
+pub mod dhcp;
 pub mod dns;
 #[cfg(feature = "net_tls")]
 pub mod entropy;
@@ -14,6 +15,7 @@ pub(crate) mod http;
 pub mod icmp;
 pub mod ip;
 pub mod speedtest;
+pub mod socket;
 pub mod tcp;
 #[cfg(feature = "net_tls")]
 pub mod tls;
@@ -40,6 +42,11 @@ pub fn init() {
 }
 
 pub fn process_packets() {
+    // When the NIC has an interrupt line, drain only what an interrupt
+    // signalled. Without one the driver has no way to announce work, so the ring
+    // is polled every pass, as before.
+    let _ = crate::drivers::e1000::take_rx_pending();
+
     for _ in 0..MAX_RX_PER_PUMP {
         let Some(packet) = crate::drivers::e1000::receive_packet() else {
             break;
@@ -58,8 +65,33 @@ pub fn process_packets() {
         crate::net_log!("Processing packet {} bytes", packet.len());
         ethernet::process_packet(&packet);
     }
+
+    // Retransmission and reclaimation, driven from the same pump as delivery
+    // so a lost segment is noticed while the connection is still live.
+    tcp::tick();
+    tcp::expire();
 }
 
 pub fn send_packet(data: &[u8]) -> Result<(), &'static str> {
     crate::drivers::e1000::send_packet(data)
+}
+
+/// Pump received packets and advance the cooperative clock.
+///
+/// Both halves are required. `process_packets` moves received frames into the
+/// protocol handlers, and `increment_tick` keeps the millisecond clock advancing
+/// even on a machine whose IRQ0 never fires — which is every QEMU configuration
+/// this kernel is tested under. The spin loop keeps the cooperative scheduler
+/// from monopolising the core between poll intervals.
+///
+/// This lives here rather than in `http` so that the stack's scheduler has no
+/// dependency on a protocol module: TCP needs to call it while its send buffer
+/// is full, and when it lived in `http` the dependency ran `tcp -> http -> tcp`.
+pub fn pump() {
+    process_packets();
+    // Keep deadlines progressing even on machines without a working IRQ0.
+    crate::shell::increment_tick();
+    for _ in 0..2000 {
+        core::hint::spin_loop();
+    }
 }

@@ -1,37 +1,37 @@
 # Matzen Kernel Framework Documentation
 
-Welcome to the comprehensive documentation for the **Matzen Kernel Framework (MFK)** — a small educational terminal OS written in Rust for x86_64.
+Welcome to the comprehensive documentation for the **Matzen Kernel Framework (MFK)** â€” a small educational terminal OS written in Rust for x86_64.
 
 ## Quick Navigation
 
-### 🚀 Getting Started
-- **[Quick Start Guide](guide/quick-start.md)** — Set up and run the kernel in 5 minutes
-- **[Installation Guide](guide/installation.md)** — Detailed setup instructions
-- **[Running the Kernel](guide/running.md)** — Boot and interact with MFK
+### ðŸš€ Getting Started
+- **[Quick Start Guide](guide/quick-start.md)** â€” Set up and run the kernel in 5 minutes
+- **[Installation Guide](guide/installation.md)** â€” Detailed setup instructions
+- **[Running the Kernel](guide/running.md)** â€” Boot and interact with MFK
 
-### 📚 Core Documentation
-- **[Architecture Overview](reference/architecture.md)** — System design and components
-- **[Kernel API Reference](reference/api.md)** — Core kernel functions and structures
-- **[Memory Management](reference/memory.md)** — Heap allocation and memory layout
-- **[Interrupt Handling](reference/interrupts.md)** — IDT, PIC, and exception handling
+### ðŸ“š Core Documentation
+- **[Architecture Overview](reference/architecture.md)** â€” System design and components
+- **[Kernel API Reference](reference/api.md)** â€” Core kernel functions and structures
+- **[Memory Management](reference/memory.md)** â€” Heap allocation and memory layout
+- **[Interrupt Handling](reference/interrupts.md)** â€” IDT, PIC, and exception handling
 
-### 🌐 Features & Subsystems
-- **[Network Stack](reference/networking.md)** — Ethernet, IP, ARP, ICMP, and networking
-- **[File System](reference/filesystem.md)** — SimpleFS implementation and usage
-- **[Shell Commands](reference/shell-commands.md)** — Built-in terminal commands
-- **[Hardware Drivers](reference/drivers.md)** — VGA, Keyboard, ATA, E1000, Serial, RTC, PIC
+### ðŸŒ Features & Subsystems
+- **[Network Stack](reference/networking.md)** â€” Ethernet, IP, ARP, ICMP, and networking
+- **[File System](reference/filesystem.md)** â€” SimpleFS implementation and usage
+- **[Shell Commands](reference/shell-commands.md)** â€” Built-in terminal commands
+- **[Hardware Drivers](reference/drivers.md)** â€” VGA, Keyboard, USB (EHCI/xHCI/UHCI/OHCI), ATA, E1000, Serial, RTC, PIC
 
-### 🔧 Development
-- **[Development Setup](development/setup.md)** — Build environment configuration
-- **[Building the Kernel](development/building.md)** — Compilation flags and process
-- **[Testing Guide](development/testing.md)** — Running tests and debugging
-- **[Extending MFK](development/extending.md)** — Adding new features and modules
-- **[Troubleshooting](development/troubleshooting.md)** — Common issues and fixes
+### ðŸ”§ Development
+- **[Development Setup](development/setup.md)** â€” Build environment configuration
+- **[Building the Kernel](development/building.md)** â€” Compilation flags and process
+- **[Testing Guide](development/testing.md)** â€” Running tests and debugging
+- **[Extending MFK](development/extending.md)** â€” Adding new features and modules
+- **[Troubleshooting](development/troubleshooting.md)** â€” Common issues and fixes
 
-### 💡 Advanced Topics
-- **[Network Implementation Details](reference/networking-deep-dive.md)** — Protocol stack internals
-- **[Shell Implementation](reference/shell-internals.md)** — Command parsing and execution
-- **[Contributing Guide](development/contributing.md)** — How to contribute to the project
+### ðŸ’¡ Advanced Topics
+- **[Network Implementation Details](reference/networking-deep-dive.md)** â€” Protocol stack internals
+- **[Shell Implementation](reference/shell-internals.md)** â€” Command parsing and execution
+- **[Contributing Guide](development/contributing.md)** â€” How to contribute to the project
 
 ---
 
@@ -39,23 +39,23 @@ Welcome to the comprehensive documentation for the **Matzen Kernel Framework (MF
 
 The **Matzen Kernel Framework** is an educational operating system kernel written entirely in Rust. It provides:
 
-- **VGA Text Mode Output** — 80×25 character terminal
-- **PS/2 Keyboard Input** — Real-time keyboard support
-- **TCP/IP Network Stack** — Partial networking with Ethernet, IPv4, ARP, ICMP
-- **SimpleFS File System** — Basic disk I/O and file management
-- **Built-in Shell** — Interactive command-line interface
-- **BIOS/UEFI Boot** — Bootable via multiple firmware types
-- **Hardware Drivers** — VGA, ATA, E1000 NIC, Serial, RTC
-- **Interrupt Handling** — IDT, PIC, keyboard, serial interrupts
+- **VGA Text Mode Output** â€” 80Ã—25 character terminal
+- **PS/2 + USB HID Keyboard Input** - Real-time keyboard support over PS/2 or any USB host controller
+- **TCP/IP Network Stack** â€” Partial networking with Ethernet, IPv4, ARP, ICMP
+- **SimpleFS File System** â€” Basic disk I/O and file management
+- **Built-in Shell** â€” Interactive command-line interface
+- **BIOS/UEFI Boot** â€” Bootable via multiple firmware types
+- **Hardware Drivers** â€” VGA, ATA, E1000 NIC, Serial, RTC
+- **Interrupt Handling** â€” IDT, PIC, keyboard, serial interrupts
 
 ---
 
 ## Key Features
 
-### 🎯 Pure Rust
+### ðŸŽ¯ Pure Rust
 MFK is written entirely in Rust with no C dependencies, leveraging Rust's memory safety to prevent common kernel bugs.
 
-### 📖 Educational Focus
+### ðŸ“– Educational Focus
 Clean, well-documented code designed to teach OS concepts:
 - Memory management and heap allocation
 - Interrupt handling and exception processing
@@ -63,15 +63,15 @@ Clean, well-documented code designed to teach OS concepts:
 - File system design
 - Shell command parsing
 
-### 🔌 Hardware Support
+### ðŸ”Œ Hardware Support
 - Intel E1000 NIC (network)
 - ATA disk drives (storage)
-- PS/2 keyboard (input)
+- PS/2 keyboard and USB HID keyboards via EHCI/xHCI/UHCI/OHCI (input)
 - VGA text mode (output)
 - Serial port (debugging)
 - Real-time clock (timing)
 
-### 🚀 Real Hardware Capable
+### ðŸš€ Real Hardware Capable
 Boots on real x86_64 systems and virtual machines (QEMU, Hyper-V, VirtualBox).
 
 ---
@@ -125,25 +125,25 @@ mfk> halt              # Shutdown
 
 ```
 Matzen-Kernel-Framework/
-├── kernel/              # Main kernel crate
-│   ├── src/
-│   │   ├── main.rs      # Kernel entry point
-│   │   ├── allocator.rs # Heap allocator
-│   │   ├── interrupts.rs# IDT and exceptions
-│   │   ├── drivers/     # Hardware drivers
-│   │   ├── net/         # Network stack
-│   │   ├── fs/          # File system
-│   │   └── shell/       # Terminal shell
-│   └── Cargo.toml
-├── tools/               # Build tools
-│   ├── src/main.rs      # mfk-runner (disk image creator)
-│   └── Cargo.toml
-├── targets/             # Custom target specs
-│   └── x86_64-mfk.json
-├── docs/                # This documentation
-├── build.sh             # Build script
-├── run.sh               # Run script
-└── README.md            # Main project README
+â”œâ”€â”€ kernel/              # Main kernel crate
+â”‚   â”œâ”€â”€ src/
+â”‚   â”‚   â”œâ”€â”€ main.rs      # Kernel entry point
+â”‚   â”‚   â”œâ”€â”€ allocator.rs # Heap allocator
+â”‚   â”‚   â”œâ”€â”€ interrupts.rs# IDT and exceptions
+â”‚   â”‚   â”œâ”€â”€ drivers/     # Hardware drivers
+â”‚   â”‚   â”œâ”€â”€ net/         # Network stack
+â”‚   â”‚   â”œâ”€â”€ fs/          # File system
+â”‚   â”‚   â””â”€â”€ shell/       # Terminal shell
+â”‚   â””â”€â”€ Cargo.toml
+â”œâ”€â”€ tools/               # Build tools
+â”‚   â”œâ”€â”€ src/main.rs      # mfk-runner (disk image creator)
+â”‚   â””â”€â”€ Cargo.toml
+â”œâ”€â”€ targets/             # Custom target specs
+â”‚   â””â”€â”€ x86_64-mfk.json
+â”œâ”€â”€ docs/                # This documentation
+â”œâ”€â”€ build.sh             # Build script
+â”œâ”€â”€ run.sh               # Run script
+â””â”€â”€ README.md            # Main project README
 ```
 
 ---
@@ -159,16 +159,16 @@ Matzen-Kernel-Framework/
 
 ## For Different Audiences
 
-### 👨‍💻 Users
+### ðŸ‘¨â€ðŸ’» Users
 Start with [Quick Start Guide](guide/quick-start.md) and [Shell Commands Reference](reference/shell-commands.md).
 
-### 📚 Students & Learners
+### ðŸ“š Students & Learners
 Read [Architecture Overview](reference/architecture.md) then [Development Setup](development/setup.md).
 
-### 🔧 Developers & Contributors
+### ðŸ”§ Developers & Contributors
 Check [Building the Kernel](development/building.md) and [Extending MFK](development/extending.md).
 
-### 🐛 Debuggers & Troubleshooters
+### ðŸ› Debuggers & Troubleshooters
 See [Troubleshooting Guide](development/troubleshooting.md) and [Testing Guide](development/testing.md).
 
 ---

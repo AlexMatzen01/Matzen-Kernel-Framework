@@ -1,6 +1,6 @@
 # MFK Runner — Command Reference
 
-The `mfk-runner` tool creates bootable disk images and launches them in VirtualBox or QEMU.
+The `mfk-runner` tool creates bootable disk images and launches them in VirtualBox, QEMU, or Hyper-V.
 
 ## Basic Usage
 
@@ -13,6 +13,9 @@ The `mfk-runner` tool creates bootable disk images and launches them in VirtualB
 
 # Run in QEMU
 ./run.sh --qemu
+
+# Run in Hyper-V (Windows, Generation 2 / UEFI, boots the UEFI ISO via DVD)
+./run.sh --hyperv --uefi
 
 # With custom kernel path
 ./run.sh target/x86_64-mfk/release/mfk-kernel
@@ -29,8 +32,50 @@ cargo run -p mfk-runner --release -- <kernel-binary-path> [OPTIONS]
 OPTIONS:
   --vbox, --virtualbox  Run in VirtualBox (default)
   --qemu                Run in QEMU
+  --hyperv, --hyper-v, --hv
+                        Run in Hyper-V (Windows, Generation 2 / UEFI only)
+  --hyperv-boot=<dvd|disk>
+                        Hyper-V boot device (default dvd: the UEFI ISO)
+  --vhdx=<path>         VHDX for --hyperv-boot=disk (auto-converted via
+                        qemu-img/Convert-VHD when missing) or extra data disk with dvd boot
+  --hyperv-switch=<name>
+                        Virtual switch (default: Default Switch, auto-detected)
+  --hyperv-mem=<MB>     VM startup memory in MB (default 512)
+  --hyperv-cpus=<n>     Virtual CPUs (default 2)
+  --hyperv-com=<pipe|off>
+                        COM1 named pipe (default MFK-<vm>-com1; capture with tools/hyperv-serial.ps1)
+  --uefi                Use UEFI firmware (implied by --hyperv)
+  --kbd=<mode>          QEMU keyboard transport (default ps2; QEMU only)
+                        ps2  = PS/2 keyboard, no USB controller attached
+                        xhci = qemu-xhci, exercised by the xHCI driver
+                        ehci = usb-ehci, exercised by the EHCI driver
+                        uhci = piix3-usb-uhci, exercised by the UHCI driver
+                        ohci = pci-ohci, exercised by the OHCI driver
+                        USB modes attach usb-kbd + usb-tablet, which override
+                        PS/2 in the guest. `pci-ohci` is a QEMU build option:
+                        check `qemu-system-x86_64 -device help` before using
+                        `--kbd=ohci`.
+  --xhci-kbd            Legacy alias for --kbd=xhci
   --no-run              Only create disk images, don't launch
 ```
+
+### USB controller selection
+
+The kernel claims a host controller by PCI class code and programming
+interface, so the QEMU device must match the driver you want to test:
+
+| `--kbd=` | QEMU `-device` | USB controller | Kernel driver |
+| --- | --- | --- | --- |
+| `xhci` | `qemu-xhci` | USB 3.x | `kernel/src/drivers/xhci.rs` |
+| `ehci` | `usb-ehci` | USB 2.0 high-speed | `kernel/src/drivers/usb.rs` (EHCI) |
+| `uhci` | `piix3-usb-uhci` | USB 1.1 | `kernel/src/drivers/uhci.rs` |
+| `ohci` | `pci-ohci` | USB 1.0 | `kernel/src/drivers/ohci.rs` |
+
+On `-machine pc` (both the BIOS and UEFI QEMU paths) QEMU already provides
+two PIIX3 UHCI controllers on bus `usb-bus.0`. `--kbd=uhci` adds a third with
+an explicit id, so the bus under test is predictably named `uhci.0`; run the
+`usb` shell command in the guest to see every controller the kernel found and
+which were claimed.
 
 ## What Gets Created
 
@@ -39,6 +84,12 @@ OPTIONS:
 For kernel at `target/x86_64-mfk/debug/mfk-kernel`:
 
 - `target/x86_64-mfk/debug/mfk-kernel-uefi.img` — UEFI bootable image
+- `target/x86_64-mfk/debug/mfk-kernel-uefi.iso` — UEFI bootable ISO (El Torito,
+  for Hyper-V Gen2 DVD boot; created on every run, no external tools needed)
+- `target/x86_64-mfk/debug/mfk-kernel-uefi.img.vhdx` — Hyper-V boot disk, only with
+  `--hyperv --hyperv-boot=disk` (converted via `qemu-img`/`Convert-VHD` when missing)
+- `target/disk.vhdx` — Hyper-V data disk (SCSI, converted from `target/disk.img`)
+- `<extra>.vhdx` — one per `--extra-disk=<raw>` (SCSI)
 - `target/x86_64-mfk/debug/mfk-kernel-bios.img` — BIOS bootable image
 - `target/x86_64-mfk/debug/mfk-kernel-bios.img.vdi` — VirtualBox disk (auto-converted from BIOS image)
 - `target/disk.vdi` — Data disk (10 MB, created once)
@@ -50,6 +101,40 @@ For kernel at `target/x86_64-mfk/debug/mfk-kernel`:
 - **CPUs:** 2
 - **Networking:** Bridged (auto-detects host interface)
 - **Serial Console:** Logged to `target/mfk-serial.log`
+
+## Hyper-V Setup (Windows)
+
+Requirements: Windows with the Hyper-V role, an elevated shell, and a
+virtual switch (the `Default Switch` is used when present).
+Full guide: `HYPERV_SETUP.md`. Preflight: `.\setup-hyperv-windows.ps1`.
+
+```powershell
+# Run as Administrator
+.\run.ps1 --hyperv --uefi
+
+# With explicit switch / resources / disk boot
+cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel --hyperv `
+  --hyperv-switch="Default Switch" --hyperv-mem=512 --hyperv-cpus=2
+
+# Boot from VHDX instead of the ISO (converted via qemu-img/Convert-VHD)
+cargo run -p mfk-runner --release -- target/x86_64-mfk/debug/mfk-kernel --hyperv `
+  --hyperv-boot=disk
+```
+
+Details:
+
+- VM name: `MFK-<kernel>-uefi`, Generation 2, Secure Boot off (the MFK
+  loader is unsigned), DVD drive with the UEFI ISO attached.
+- `--hyperv-boot=dvd` (default) boots the ISO; `--hyperv-boot=disk` boots
+  the auto-converted `.vhdx` (or the file given via `--vhdx=`).
+- Data disk `target/disk.img` → `target/disk.vhdx` (SCSI) + each
+  `--extra-disk=<raw>` → `<raw>.vhdx` (SCSI); `--bundle-apps` is applied
+  before conversion. `--force` rebuilds VHDX + VM.
+- Serial: COM1 → named pipe (default `MFK-<vm>-com1`, `--hyperv-com=<pipe|off>`).
+  Capture with `.\tools\hyperv-serial.ps1` (log: `target/mfk-hyperv-serial.log`);
+  GUI via Hyper-V Manager (`vmconnect.exe`).
+- Manage with: `Get-VM MFK-*-uefi`, `Stop-VM -Name <vm>`,
+  `Remove-VM -Name <vm> -Force` (with `--force` the runner recreates it).
 
 ## VirtualBox Setup (Windows)
 
@@ -281,6 +366,7 @@ VBoxManage snapshot MFK-mfk-kernel delete my-snapshot
 | Use Case | Hypervisor |
 |----------|-----------|
 | Interactive development | VirtualBox |
+| Native Windows virtualization (UEFI) | Hyper-V |
 | Network protocol testing | VirtualBox |
 | ICMP/ping testing | VirtualBox |
 | CI/CD pipelines | QEMU |

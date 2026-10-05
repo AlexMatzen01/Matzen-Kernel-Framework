@@ -27,7 +27,21 @@ embedded-io = { version = "0.7", default-features = false }
 embedded-tls = { version = "0.19", default-features = false, features = ["rustpki"], optional = true }
 rand_chacha = { version = "0.3", default-features = false, optional = true }
 rand_core = { version = "0.6", default-features = false, optional = true }
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+lzma-rust2 = { version = "0.21", default-features = false, features = ["xz", "encoder", "lzip"] }
+libbz2-rs-sys = { version = "0.2", default-features = false, features = ["rust-allocator"] }
+lz4_flex = { version = "0.11", default-features = false }
+ruzstd = { version = "0.9", default-features = false }
 
 [dependencies.lazy_static]
 version = "1.5"
 features = ["spin_no_std"]
+
+[dev-dependencies]
+sevenz-rust2 = "0.20"
+bzip2 = "0.6"
+lz4_flex = { version = "0.11", features = ["frame"] }
+ruzstd = "0.9"
+flate2 = "1"
+tar = "0.4"
+lzma-rust2 = { version = "0.21", features = ["std"] }

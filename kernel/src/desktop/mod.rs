@@ -13,6 +13,7 @@
 
 mod compositor;
 mod cursor_data;
+pub(crate) mod doom;
 pub(crate) mod drives;
 pub(crate) mod files;
 mod scene;
@@ -337,6 +338,7 @@ pub fn run() {
     let mut explorer_app: Option<files::ExplorerApp> = None;
     let mut drive_app: Option<drives::DriveApp> = None;
     let mut settings_app: Option<settings::SettingsApp> = None;
+    let mut doom_app: Option<doom::DoomApp> = None;
     let about_win_id = scene.create_window(
         alloc::string::String::from("About MFK"),
         scene::Rect::new(220, 130, 400, 300),
@@ -349,7 +351,7 @@ pub fn run() {
         let label_id = crate::desktop::scene::WidgetId::new();
         let label_bounds = scene::Rect::new(20, 40, 360, 200);
         let mut label = crate::desktop::scene::Widget::label(label_bounds,
-            alloc::string::String::from("Matzen Kernel Framework v0.1.0\n\nTaskbar: Shell | Files | Drive\n| Settings\nFiles: browse, Enter opens, type name\nfor New File/Dir, click selects.\nDrives: pick disk (Up/Down, 1-8),\nFormat (2-click) + Mount + Install.\nSettings: wallpaper PNG/JPG + Fit/\nFill/Stretch/Center/Tile + colors.\n\nDrag windows by titlebar.\nPress Esc to exit."),
+            alloc::string::String::from("Matzen Kernel Framework v0.1.0\n\nTaskbar: Shell | Files | Drive\n| Settings | Doom\nFiles: browse, Enter opens, type name\nfor New File/Dir, click selects.\nDrives: pick disk (Up/Down, 1-8),\nFormat (2-click) + Mount + Install.\nSettings: wallpaper PNG/JPG + Fit/\nFill/Stretch/Center/Tile + colors.\nDoom: needs WAD disk mounted\n(mount drive, Doom launcher).\n\nDrag windows by titlebar.\nPress Esc to exit."),
             theme);
         label.id = label_id;
         scene.widgets.insert(label_id, label);
@@ -384,6 +386,27 @@ pub fn run() {
     // Restore persisted personalization (solid fallback when the FS is
     // not mounted or no settings were saved yet).
     settings::load_persisted(&mut scene, sw, sh);
+
+    // `doom run` queues a WAD and enters here: open the game immediately
+    // so the shell command works without a mouse click.
+    if let Some(wad) = doom::pending_wad() {
+        match doom::create_doom_app(&mut scene, sw, sh, &wad) {
+            Ok(app) => {
+                scene.focus_window(app.window);
+                crate::serial_println!("[desktop] Doom auto-opened ({})", wad);
+                doom_app = Some(app);
+            }
+            Err(e) => {
+                crate::serial_println!("[desktop] Doom: {}", e);
+                if let Some(shell) = shell_app.as_mut() {
+                    shell.output.push_str("Doom: ");
+                    shell.output.push_str(&e);
+                    shell.output.push('\n');
+                    refresh_shell_app(&mut scene, shell);
+                }
+            }
+        }
+    }
 
     // Mark full screen dirty for initial render
     scene.mark_dirty_full();
@@ -481,6 +504,28 @@ pub fn run() {
                     crate::serial_println!("[desktop] Settings opened");
                     settings_app = Some(app);
                 }
+            } else if scene.doom_launcher_rect().contains_point(mx, my) {
+                if let Some(app) = &doom_app {
+                    scene.restore_window(app.window);
+                } else {
+                    let wad = doom::take_launch_wad();
+                    match doom::create_doom_app(&mut scene, sw, sh, &wad) {
+                        Ok(app) => {
+                            scene.focus_window(app.window);
+                            crate::serial_println!("[desktop] Doom opened");
+                            doom_app = Some(app);
+                        }
+                        Err(e) => {
+                            crate::serial_println!("[desktop] Doom: {}", e);
+                            if let Some(shell) = shell_app.as_mut() {
+                                shell.output.push_str("Doom: ");
+                                shell.output.push_str(&e);
+                                shell.output.push_str("\n(mount the WAD disk, or run 'doom <path>')\n");
+                                refresh_shell_app(&mut scene, shell);
+                            }
+                        }
+                    }
+                }
             } else if let Some((win_id, btn_id)) = button_at(&scene, mx, my) {
                 // Clicked a button: focus, press, then dispatch app actions.
                 // Explorer/Drive buttons are dispatched here (their
@@ -556,7 +601,18 @@ pub fn run() {
                                     settings::resize_settings_content(&mut scene, app);
                                 }
                             }
+                            if let Some(app) = &doom_app {
+                                if app.window == win_id {
+                                    doom::resize_doom_content(&mut scene, app);
+                                }
+                            }
                         } else if close_btn.contains_point(mx, my) {
+                            if doom_app.as_ref().map(|app| app.window) == Some(win_id) {
+                                if let Some(app) = doom_app.as_mut() {
+                                    doom::doom_release_all(app);
+                                    doom::close_doom(app);
+                                }
+                            }
                             scene.destroy_window(win_id);
                             if shell_app.as_ref().map(|app| app.window) == Some(win_id) {
                                 shell_app = None;
@@ -566,6 +622,9 @@ pub fn run() {
                             }
                             if drive_app.as_ref().map(|app| app.window) == Some(win_id) {
                                 drive_app = None;
+                            }
+                            if doom_app.as_ref().map(|app| app.window) == Some(win_id) {
+                                doom_app = None;
                             }
                             if settings_app.as_ref().map(|app| app.window) == Some(win_id) {
                                 settings_app = None;
@@ -674,6 +733,11 @@ pub fn run() {
                                 settings::resize_settings_content(&mut scene, app);
                             }
                         }
+                        if let Some(app) = &doom_app {
+                            if app.window == win_id {
+                                doom::resize_doom_content(&mut scene, app);
+                            }
+                        }
                     }
                 }
             }
@@ -724,6 +788,11 @@ pub fn run() {
                             settings::resize_settings_content(&mut scene, app);
                         }
                     }
+                    if let Some(app) = &doom_app {
+                        if app.window == win_id {
+                            doom::resize_doom_content(&mut scene, app);
+                        }
+                    }
                 }
             }
         }
@@ -731,7 +800,9 @@ pub fn run() {
             PREV_LEFT = left;
         }
 
-        // Keyboard: route by focused window (Shell | Files | Drive).
+        // Keyboard: route by focused window (Shell | Files | Drive | Doom).
+        // While Doom is focused, every key goes to the game (Esc opens
+        // the in-game menu); desktop exit is via the taskbar/close box.
         for _ in 0..8 {
             let Some(ev) = crate::drivers::keyboard::read_key() else {
                 break;
@@ -753,6 +824,23 @@ pub fn run() {
                 .as_ref()
                 .map(|a| Some(a.window) == focused)
                 .unwrap_or(false);
+            let is_doom = doom_app
+                .as_ref()
+                .map(|a| Some(a.window) == focused)
+                .unwrap_or(false);
+            // Doom consumes everything while focused (including Esc).
+            if is_doom {
+                if let Some(app) = doom_app.as_mut() {
+                    // Ctrl+C in Doom: release stuck keys instead of firing.
+                    if ev.key == crate::drivers::keyboard::Key::Ctrl('C') {
+                        doom::doom_release_all(app);
+                        crate::shell::clear_interrupt();
+                    } else {
+                        doom::doom_key(app, ev.key);
+                    }
+                }
+                continue;
+            }
             match ev.key {
                 crate::drivers::keyboard::Key::Esc => {
                     break 'outer; // Exit desktop loop
@@ -868,6 +956,28 @@ pub fn run() {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Pump the Doom engine (35Hz paced inside; skips minimized).
+        if doom_app.is_some() {
+            let visible = doom_app
+                .as_ref()
+                .and_then(|app| scene.windows.get(&app.window))
+                .map(|win| win.visible && !win.minimized)
+                .unwrap_or(false);
+            if visible {
+                if let Some(app) = doom_app.as_mut() {
+                    match doom::pump_doom(&mut scene, app) {
+                        doom::DoomPump::Quit => {
+                            let win = app.window;
+                            doom::close_doom(app);
+                            scene.destroy_window(win);
+                            doom_app = None;
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
 

@@ -1,27 +1,32 @@
 # MFK Run Script for PowerShell
-# Runs the kernel in VirtualBox or QEMU
+# Runs the kernel in VirtualBox, QEMU, or Hyper-V (UEFI-only, Generation 2)
 
 param(
     [string]$KernelPath = "target/x86_64-mfk/debug/mfk-kernel",
-    [ValidateSet("--vbox", "--virtualbox", "--qemu", "")]
+    [ValidateSet("--vbox", "--virtualbox", "--qemu", "--hyperv", "--hyper-v", "--hv", "")]
     [string]$Hypervisor = "--vbox"
 )
 
-# Handle positional arguments
-if ($args.Count -gt 0) {
-    if ($args[0] -match "^(--qemu|--vbox|--virtualbox)$") {
-        $Hypervisor = $args[0]
+# Collect passthrough flags for the runner (--uefi, --hyperv-boot=..., ...)
+$RunnerExtra = @()
+foreach ($a in $args) {
+    if ($a -match "^(--qemu|--vbox|--virtualbox|--hyperv|--hyper-v|--hv)$") {
+        if ($Hypervisor -eq "--vbox" -or $Hypervisor -eq "") { $Hypervisor = $a }
+    }
+    elseif ($a -match "^(--uefi|--bios|--no-run|--force|--hyperv-.*|--vhdx=.*|--vnc.*|--web-ui.*|--kbd=.*|--xhci-kbd|--bundle-apps|--with-apps|--data-disk-size=.*|--extra-disk.*|--boot-extra-disk.*|--gpu-.*)$") {
+        $RunnerExtra += $a
     }
     else {
-        $KernelPath = $args[0]
+        $KernelPath = $a
     }
 }
 
-# Handle second positional argument
-if ($args.Count -gt 1) {
-    if ($args[1] -match "^(--qemu|--vbox|--virtualbox)$") {
-        $Hypervisor = $args[1]
-    }
+if ($Hypervisor -eq "--hyper-v" -or $Hypervisor -eq "--hv") { $Hypervisor = "--hyperv" }
+
+# Hyper-V Generation 2 is UEFI-only.
+if ($Hypervisor -eq "--hyperv" -and $RunnerExtra -contains "--bios") {
+    Write-Host "ERROR: --hyperv is UEFI-only (Generation 2); drop --bios or pass --uefi." -ForegroundColor Red
+    exit 1
 }
 
 Write-Host "Running MFK Kernel..." -ForegroundColor Cyan
@@ -38,7 +43,7 @@ $runnerCmd = @(
     "--",
     $KernelPath,
     $Hypervisor
-)
+) + $RunnerExtra
 
 & cargo $runnerCmd
 if ($LASTEXITCODE -ne 0) {

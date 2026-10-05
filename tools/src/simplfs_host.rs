@@ -1,4 +1,4 @@
-//! Host-side SimplFS helper for bundling apps into raw disk.img
+﻿//! Host-side SimplFS helper for bundling apps into raw disk.img
 //! Minimal reimplementation of kernel/src/fs layout to run on std.
 //! Only supports fresh format + file/dir creation for bundling.
 
@@ -12,6 +12,12 @@ const MAX_INODES: usize = 256;
 const INODE_DIRECT_BLOCKS: usize = 12;
 const INDIRECT_DATA_BLOCKS: usize = FS_BLOCK_SIZE / std::mem::size_of::<u64>() - 1;
 
+/// Mirrors `kernel/src/fs/mod.rs::Superblock` byte for byte.
+///
+/// This is a hand-maintained duplicate with no compile-time link to the
+/// kernel's definition, so the two layouts are kept in step by the assertions
+/// below: if either struct changes size or field order, these fail to compile
+/// rather than producing an image the kernel refuses to mount.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct Superblock {
@@ -25,8 +31,14 @@ struct Superblock {
     free_blocks: u64,
     free_inodes: u32,
     root_inode: u32,
-    reserved: [u8; 456],
+    bitmap_start: u64,
+    bitmap_blocks: u32,
+    reserved: [u8; 448],
 }
+
+const _: () = assert!(std::mem::size_of::<Superblock>() == FS_BLOCK_SIZE);
+const _: () = assert!(std::mem::size_of::<Inode>() == 144);
+const _: () = assert!(std::mem::size_of::<DirectoryEntry>() == 64);
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct Inode {
@@ -49,6 +61,14 @@ struct DirectoryEntry {
 }
 
 const SUPER_MAGIC: u32 = 0x53464D4B; // "SFMK"
+/// Must match `Superblock::VERSION` in kernel/src/fs/mod.rs.
+const SUPER_VERSION: u32 = 2;
+
+/// Blocks the allocation bitmap needs for `data_blocks` bits.
+const fn bitmap_blocks_for(data_blocks: u64) -> u32 {
+    let bytes = (data_blocks as usize).div_ceil(8);
+    bytes.div_ceil(FS_BLOCK_SIZE) as u32
+}
 const FT_EMPTY: u8 = 0;
 const FT_FILE: u8 = 1;
 const FT_DIR: u8 = 2;
@@ -89,6 +109,55 @@ impl RawDisk {
     }
 }
 
+/// Inject a single host file into a SimplFS disk image at `guest_path`
+/// (e.g. `/wad/doom1.wad`). Formats the disk first when it has no SimplFS
+/// magic, so `--extra-disk` images work on first boot. Large files ride the
+/// same chained-indirect layout as `host_create_file`, so multi-MB WADs fit.
+pub fn bundle_single_file(
+    disk_path: &Path,
+    guest_path: &str,
+    host_path: &Path,
+) -> Result<(), String> {
+    let data = std::fs::read(host_path).map_err(|e| {
+        format!(
+            "read {}: {}",
+            host_path.display(),
+            e
+        )
+    })?;
+    let metadata = std::fs::metadata(disk_path).map_err(|e| e.to_string())?;
+    let len = metadata.len();
+    if len % FS_BLOCK_SIZE as u64 != 0 {
+        return Err("disk size not multiple of block size".into());
+    }
+    let total_blocks = len / FS_BLOCK_SIZE as u64;
+    let mut disk = RawDisk::open(disk_path, total_blocks).map_err(|e| e.to_string())?;
+    let mut sb_buf = [0u8; FS_BLOCK_SIZE];
+    disk.read_blocks(0, 1, &mut sb_buf)
+        .map_err(|e| e.to_string())?;
+    let magic = u32::from_le_bytes([sb_buf[0], sb_buf[1], sb_buf[2], sb_buf[3]]);
+    let version = u32::from_le_bytes([sb_buf[4], sb_buf[5], sb_buf[6], sb_buf[7]]);
+    if magic != SUPER_MAGIC || version != SUPER_VERSION {
+        println!(
+            "WAD bundle: formatting {} as SimplFS v{} ({} blocks)...",
+            disk_path.display(),
+            SUPER_VERSION,
+            total_blocks
+        );
+        format_disk(&mut disk, total_blocks).map_err(|e| e.to_string())?;
+    }
+    println!(
+        "WAD bundle: {} ({} bytes) -> {}:{}",
+        host_path.display(),
+        data.len(),
+        disk_path.display(),
+        guest_path
+    );
+    host_create_file(&mut disk, guest_path, &data)?;
+    println!("WAD bundle: done. In kernel: mount <drive>; ls {}; doominfo {}", guest_path, guest_path);
+    Ok(())
+}
+
 pub fn bundle_examples(disk_path: &Path, examples_root: &Path) -> Result<(), String> {
     // if examples_root doesn't exist, skip
     if !examples_root.exists() {
@@ -116,7 +185,16 @@ pub fn bundle_examples(disk_path: &Path, examples_root: &Path) -> Result<(), Str
     disk.read_blocks(0, 1, &mut sb_buf)
         .map_err(|e| e.to_string())?;
     let magic = u32::from_le_bytes([sb_buf[0], sb_buf[1], sb_buf[2], sb_buf[3]]);
-    let is_formatted = magic == SUPER_MAGIC;
+    let version = u32::from_le_bytes([sb_buf[4], sb_buf[5], sb_buf[6], sb_buf[7]]);
+    // A version-1 image has no allocation bitmap and the kernel refuses to
+    // mount it, so it must be reformatted rather than appended to.
+    let is_formatted = magic == SUPER_MAGIC && version == SUPER_VERSION;
+    if magic == SUPER_MAGIC && version != SUPER_VERSION {
+        println!(
+            "Host bundle: existing image is SimplFS v{} (kernel wants v{}); reformatting",
+            version, SUPER_VERSION
+        );
+    }
 
     if !is_formatted {
         println!(
@@ -173,19 +251,35 @@ fn collect_files(root: &Path, cur: &Path, out: &mut Vec<(String, String)>) {
 
 fn format_disk(disk: &mut RawDisk, total_blocks: u64) -> std::io::Result<()> {
     let inode_blocks = (MAX_INODES * inode_size() + FS_BLOCK_SIZE - 1) / FS_BLOCK_SIZE;
-    let data_start = 1 + inode_blocks as u64;
+    let bitmap_start = 1 + inode_blocks as u64;
+    // Version 2 stores an allocation bitmap between the inode table and the
+    // data region. The kernel refuses a version 1 image, and it must refuse:
+    // version 1 kept free-space state only in RAM, so a host-bundled image
+    // would come back with a data region that starts at the wrong block.
+    let bitmap_input = total_blocks.saturating_sub(bitmap_start);
+    let bitmap_blocks = bitmap_blocks_for(bitmap_input);
+    let data_start = bitmap_start + bitmap_blocks as u64;
+    let data_blocks = total_blocks.saturating_sub(data_start);
+    if total_blocks <= data_start {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "disk too small for SimplFS",
+        ));
+    }
     let superblock = Superblock {
         magic: SUPER_MAGIC,
-        version: 1,
+        version: SUPER_VERSION,
         block_size: FS_BLOCK_SIZE as u32,
         total_blocks,
         inode_count: MAX_INODES as u32,
         inode_blocks: inode_blocks as u32,
         data_block_start: data_start,
-        free_blocks: total_blocks - data_start - 1, // minus root dir block
+        free_blocks: data_blocks - 1, // minus root dir block
         free_inodes: (MAX_INODES as u32) - 1,
         root_inode: 0,
-        reserved: [0; 456],
+        bitmap_start,
+        bitmap_blocks,
+        reserved: [0; 448],
     };
     // write superblock
     let mut buf = [0u8; FS_BLOCK_SIZE];
@@ -195,6 +289,28 @@ fn format_disk(disk: &mut RawDisk, total_blocks: u64) -> std::io::Result<()> {
     }
     // Ensure LE (host is little endian, same as kernel)
     disk.write_blocks(0, 1, &buf)?;
+
+    // Write the allocation bitmap: everything free except the root directory,
+    // which occupies the first *data* block (bit 0).
+    let bitmap_len = (data_blocks as usize).div_ceil(8);
+    let mut bitmap = vec![0u8; bitmap_len];
+    bitmap[0] |= 1;
+    let zero = [0u8; FS_BLOCK_SIZE];
+    let mut remaining = bitmap_len;
+    let mut block = bitmap_start;
+    for _ in 0..bitmap_blocks {
+        if remaining == 0 {
+            break;
+        }
+        let n = std::cmp::min(FS_BLOCK_SIZE, remaining);
+        let offset = bitmap_len - remaining;
+        let mut b = [0u8; FS_BLOCK_SIZE];
+        b[..n].copy_from_slice(&bitmap[offset..offset + n]);
+        disk.write_blocks(block, 1, &b)?;
+        remaining -= n;
+        block += 1;
+    }
+    let _ = zero;
 
     // inode table
     let mut inodes = vec![
@@ -232,28 +348,117 @@ fn format_disk(disk: &mut RawDisk, total_blocks: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-fn allocate_host_block(next_block: &mut u64, superblock: &mut Superblock) -> Result<u64, String> {
-    let total = unsafe { std::ptr::addr_of!(superblock.total_blocks).read_unaligned() };
-    if *next_block >= total {
-        return Err("no free blocks".into());
+/// Bitmap-backed block allocator for the host tool.
+///
+/// The previous allocator inferred the next free block *arithmetically* from
+/// `free_blocks`, which assumes used blocks form one contiguous run from the
+/// start of the data region. The kernel instead uses a bitmap with a rotating
+/// cursor, so the two diverged the moment a block in the middle of the region
+/// was freed -- the host would hand out a block the kernel considered live.
+/// Reading the same on-disk bitmap removes the divergence entirely.
+struct HostAlloc {
+    bitmap: Vec<u8>,
+    dirty: Vec<bool>,
+    cursor: usize,
+    bitmap_start: u64,
+    bitmap_blocks: u32,
+    data_start: u64,
+    data_blocks: usize,
+}
+
+impl HostAlloc {
+    fn load(disk: &mut RawDisk, sb: &Superblock) -> Result<Self, String> {
+        let total = unsafe { std::ptr::addr_of!(sb.total_blocks).read_unaligned() };
+        let data_start = unsafe { std::ptr::addr_of!(sb.data_block_start).read_unaligned() };
+        let bitmap_start = unsafe { std::ptr::addr_of!(sb.bitmap_start).read_unaligned() };
+        let bitmap_blocks = unsafe { std::ptr::addr_of!(sb.bitmap_blocks).read_unaligned() };
+        let data_blocks = total.saturating_sub(data_start) as usize;
+        let mut bitmap = vec![0u8; data_blocks.div_ceil(8)];
+        let mut remaining = bitmap.len();
+        let mut block = bitmap_start;
+        for _ in 0..bitmap_blocks {
+            if remaining == 0 {
+                break;
+            }
+            let n = std::cmp::min(FS_BLOCK_SIZE, remaining);
+            let offset = bitmap.len() - remaining;
+            let mut b = [0u8; FS_BLOCK_SIZE];
+            disk.read_blocks(block, 1, &mut b).map_err(|e| e.to_string())?;
+            bitmap[offset..offset + n].copy_from_slice(&b[..n]);
+            remaining -= n;
+            block += 1;
+        }
+        let mut dirty = vec![false; bitmap_blocks as usize];
+        Ok(Self {
+            bitmap,
+            dirty,
+            cursor: 0,
+            bitmap_start,
+            bitmap_blocks,
+            data_start,
+            data_blocks,
+        })
     }
-    let block = *next_block;
-    *next_block += 1;
-    unsafe {
-        let free = std::ptr::addr_of!(superblock.free_blocks)
-            .read_unaligned()
-            .checked_sub(1)
-            .ok_or_else(|| "no free blocks".to_string())?;
-        std::ptr::addr_of_mut!(superblock.free_blocks).write_unaligned(free);
+
+    #[inline]
+    fn is_used(&self, index: usize) -> bool {
+        self.bitmap[index / 8] & (1 << (index % 8)) != 0
     }
-    Ok(block)
+
+    fn alloc(&mut self, sb: &mut Superblock) -> Result<u64, String> {
+        if self.data_blocks == 0 {
+            return Err("no free blocks".into());
+        }
+        for step in 0..self.data_blocks {
+            let index = (self.cursor + step) % self.data_blocks;
+            if !self.is_used(index) {
+                self.bitmap[index / 8] |= 1 << (index % 8);
+                let per_block = FS_BLOCK_SIZE * 8;
+                if let Some(f) = self.dirty.get_mut(index / per_block) {
+                    *f = true;
+                }
+                self.cursor = (index + 1) % self.data_blocks;
+                unsafe {
+                    let free = std::ptr::addr_of!(sb.free_blocks)
+                        .read_unaligned()
+                        .checked_sub(1)
+                        .ok_or_else(|| "no free blocks".to_string())?;
+                    std::ptr::addr_of_mut!(sb.free_blocks).write_unaligned(free);
+                }
+                return Ok(self.data_start + index as u64);
+            }
+        }
+        Err("no free blocks".into())
+    }
+
+    /// Write back the bitmap blocks that changed.
+    fn flush(&mut self, disk: &mut RawDisk) -> Result<(), String> {
+        let per_block = FS_BLOCK_SIZE * 8;
+        for (i, dirty) in self.dirty.iter_mut().enumerate() {
+            if !*dirty || (i as u32) >= self.bitmap_blocks {
+                continue;
+            }
+            let first = (i * per_block) / 8;
+            if first >= self.bitmap.len() {
+                *dirty = false;
+                continue;
+            }
+            let n = std::cmp::min(FS_BLOCK_SIZE, self.bitmap.len() - first);
+            let mut b = [0u8; FS_BLOCK_SIZE];
+            b[..n].copy_from_slice(&self.bitmap[first..first + n]);
+            disk.write_blocks(self.bitmap_start + i as u64, 1, &b)
+                .map_err(|e| e.to_string())?;
+            *dirty = false;
+        }
+        Ok(())
+    }
 }
 
 fn host_file_block(
     disk: &mut RawDisk,
     inode: &mut Inode,
     logical_block: usize,
-    next_block: &mut u64,
+    alloc: &mut HostAlloc,
     superblock: &mut Superblock,
 ) -> Result<u64, String> {
     if logical_block < INODE_DIRECT_BLOCKS {
@@ -262,7 +467,7 @@ fn host_file_block(
         if block != 0 {
             return Ok(block);
         }
-        let block = allocate_host_block(next_block, superblock)?;
+        let block = alloc.alloc(superblock)?;
         inode.direct_blocks[logical_block] = block;
         return Ok(block);
     }
@@ -272,7 +477,7 @@ fn host_file_block(
     let slot = indirect_index % INDIRECT_DATA_BLOCKS;
     let mut root = u64::from_le_bytes(inode.reserved2[..8].try_into().unwrap());
     if root == 0 {
-        root = allocate_host_block(next_block, superblock)?;
+        root = alloc.alloc(superblock)?;
         let zero = [0u8; FS_BLOCK_SIZE];
         disk.write_blocks(root, 1, &zero)
             .map_err(|error| error.to_string())?;
@@ -286,7 +491,7 @@ fn host_file_block(
             .map_err(|error| error.to_string())?;
         let mut next = u64::from_le_bytes(buffer[..8].try_into().unwrap());
         if next == 0 {
-            next = allocate_host_block(next_block, superblock)?;
+            next = alloc.alloc(superblock)?;
             let zero = [0u8; FS_BLOCK_SIZE];
             disk.write_blocks(next, 1, &zero)
                 .map_err(|error| error.to_string())?;
@@ -305,7 +510,7 @@ fn host_file_block(
     if block != 0 {
         return Ok(block);
     }
-    let block = allocate_host_block(next_block, superblock)?;
+    let block = alloc.alloc(superblock)?;
     buffer[offset..offset + 8].copy_from_slice(&block.to_le_bytes());
     disk.write_blocks(node, 1, &buffer)
         .map_err(|error| error.to_string())?;
@@ -321,8 +526,6 @@ fn host_create_file(disk: &mut RawDisk, guest_path: &str, data: &[u8]) -> Result
         unsafe { std::ptr::read_unaligned(sb_buf.as_ptr() as *const Superblock) };
     let inode_blocks =
         unsafe { std::ptr::addr_of!(superblock.inode_blocks).read_unaligned() } as usize;
-    let data_start = unsafe { std::ptr::addr_of!(superblock.data_block_start).read_unaligned() };
-
     // read inodes
     let mut inode_buf = vec![0u8; inode_blocks * FS_BLOCK_SIZE];
     for i in 0..inode_blocks {
@@ -353,7 +556,10 @@ fn host_create_file(disk: &mut RawDisk, guest_path: &str, data: &[u8]) -> Result
     // helper: find free block (simple sequential)
     let total_blocks = unsafe { std::ptr::addr_of!(superblock.total_blocks).read_unaligned() };
     let free_blocks = unsafe { std::ptr::addr_of!(superblock.free_blocks).read_unaligned() };
-    let mut next_block = data_start + (total_blocks - data_start - free_blocks);
+        // Free space comes from the on-disk allocation bitmap, not from
+    // arithmetic on a free-block count.
+    let _ = (total_blocks, free_blocks);
+    let mut alloc = HostAlloc::load(disk, &superblock)?;
 
     // handle parent dirs creation for guest_path like /apps/hello.app
     let guest = guest_path.trim();
@@ -383,8 +589,7 @@ fn host_create_file(disk: &mut RawDisk, guest_path: &str, data: &[u8]) -> Result
         } else {
             // create dir
             let free = find_free_inode(&inodes).ok_or("no free inodes")?;
-            let block = next_block;
-            next_block += 1;
+            let block = alloc.alloc(&mut superblock)?;
             // create inode
             inodes[free] = Inode {
                 file_type: FT_DIR,
@@ -406,7 +611,7 @@ fn host_create_file(disk: &mut RawDisk, guest_path: &str, data: &[u8]) -> Result
             disk.write_blocks(block, 1, &zero)
                 .map_err(|e| e.to_string())?;
             // add entry to parent
-            add_entry(disk, &inodes, current_inode, dir, free as u32).map_err(|e| e.to_string())?;
+            add_entry(disk, &mut inodes, current_inode, dir, free as u32, &mut alloc, &mut superblock).map_err(|e| e.to_string())?;
             // update superblock counts later
             unsafe {
                 let p = std::ptr::addr_of_mut!(superblock.free_inodes);
@@ -453,7 +658,7 @@ fn host_create_file(disk: &mut RawDisk, guest_path: &str, data: &[u8]) -> Result
                 disk,
                 &mut inodes[inode_idx],
                 i,
-                &mut next_block,
+                &mut alloc,
                 &mut superblock,
             )?;
             let mut buf = [0u8; FS_BLOCK_SIZE];
@@ -467,7 +672,7 @@ fn host_create_file(disk: &mut RawDisk, guest_path: &str, data: &[u8]) -> Result
             .div_ceil(INDIRECT_DATA_BLOCKS);
         inodes[inode_idx].blocks_used = (blocks_needed + indirect_nodes) as u32;
         // write back superblock + inodes
-        write_back(disk, &superblock, &inodes, inode_blocks).map_err(|e| e.to_string())?;
+        write_back(disk, &mut superblock, &inodes, inode_blocks, &mut alloc).map_err(|e| e.to_string())?;
         return Ok(());
     }
 
@@ -486,19 +691,19 @@ fn host_create_file(disk: &mut RawDisk, guest_path: &str, data: &[u8]) -> Result
         .div_ceil(INDIRECT_DATA_BLOCKS);
     inodes[free].blocks_used = (blocks_needed + indirect_nodes) as u32;
     for (i, chunk) in data.chunks(FS_BLOCK_SIZE).enumerate() {
-        let bnum = host_file_block(disk, &mut inodes[free], i, &mut next_block, &mut superblock)?;
+        let bnum = host_file_block(disk, &mut inodes[free], i, &mut alloc, &mut superblock)?;
         let mut buf = [0u8; FS_BLOCK_SIZE];
         buf[..chunk.len()].copy_from_slice(chunk);
         disk.write_blocks(bnum, 1, &buf)
             .map_err(|e| e.to_string())?;
     }
-    add_entry(disk, &inodes, current_inode, basename, free as u32).map_err(|e| e.to_string())?;
+    add_entry(disk, &mut inodes, current_inode, basename, free as u32, &mut alloc, &mut superblock).map_err(|e| e.to_string())?;
     unsafe {
         let p = std::ptr::addr_of_mut!(superblock.free_inodes);
         let cur = std::ptr::read_unaligned(p);
         std::ptr::write_unaligned(p, cur - 1);
     }
-    write_back(disk, &superblock, &inodes, inode_blocks).map_err(|e| e.to_string())?;
+    write_back(disk, &mut superblock, &inodes, inode_blocks, &mut alloc).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -549,60 +754,83 @@ fn find_entry(
     Ok(None)
 }
 
+/// Add a directory entry, growing the directory across as many blocks as it
+/// needs (up to the inode's direct-block limit).
+///
+/// This used to inspect only block 0 and fail with "directory full" on the
+/// ninth entry, which meant `bundle_examples` could not package more than
+/// eight files into one directory. The kernel already grew directories; the
+/// host copy had not caught up.
 fn add_entry(
     disk: &mut RawDisk,
-    inodes: &Vec<Inode>,
+    inodes: &mut Vec<Inode>,
     dir_inode: u32,
     name: &str,
     child: u32,
+    alloc: &mut HostAlloc,
+    sb: &mut Superblock,
 ) -> std::io::Result<()> {
-    let ino = &inodes[dir_inode as usize];
-    let block = unsafe { std::ptr::addr_of!(ino.direct_blocks[0]).read_unaligned() };
-    if block == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "dir no blocks",
-        ));
-    }
-    let mut buf = [0u8; FS_BLOCK_SIZE];
-    disk.read_blocks(block, 1, &mut buf)?;
     let per_block = FS_BLOCK_SIZE / std::mem::size_of::<DirectoryEntry>();
-    for i in 0..per_block {
-        let offset = i * std::mem::size_of::<DirectoryEntry>();
-        let entry: DirectoryEntry =
-            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const DirectoryEntry) };
-        let ino_num = unsafe { std::ptr::addr_of!(entry.inode_number).read_unaligned() };
-        if ino_num == 0 {
-            let mut new_entry = DirectoryEntry {
-                inode_number: child,
-                name: [0; MAX_FILENAME_LEN],
-                reserved: [0; 4],
-            };
-            let bytes = name.as_bytes();
-            let len = std::cmp::min(bytes.len(), MAX_FILENAME_LEN - 1);
-            new_entry.name[..len].copy_from_slice(&bytes[..len]);
+    for slot in 0..INODE_DIRECT_BLOCKS {
+        let mut block = unsafe {
+            std::ptr::addr_of!(inodes[dir_inode as usize].direct_blocks[slot]).read_unaligned()
+        };
+        if block == 0 {
+            block = alloc
+                .alloc(sb)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            disk.write_blocks(block, 1, &[0u8; FS_BLOCK_SIZE])?;
             unsafe {
-                std::ptr::write_unaligned(
-                    buf.as_mut_ptr().add(offset) as *mut DirectoryEntry,
-                    new_entry,
-                );
+                let p = std::ptr::addr_of_mut!(inodes[dir_inode as usize].direct_blocks[slot]);
+                p.write_unaligned(block);
             }
-            disk.write_blocks(block, 1, &buf)?;
-            return Ok(());
+        }
+        let mut buf = [0u8; FS_BLOCK_SIZE];
+        disk.read_blocks(block, 1, &mut buf)?;
+        for i in 0..per_block {
+            let offset = i * std::mem::size_of::<DirectoryEntry>();
+            let entry: DirectoryEntry = unsafe {
+                std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const DirectoryEntry)
+            };
+            let ino_num = unsafe { std::ptr::addr_of!(entry.inode_number).read_unaligned() };
+            if ino_num == 0 {
+                let mut new_entry = DirectoryEntry {
+                    inode_number: child,
+                    name: [0; MAX_FILENAME_LEN],
+                    reserved: [0; 4],
+                };
+                let bytes = name.as_bytes();
+                let len = std::cmp::min(bytes.len(), MAX_FILENAME_LEN - 1);
+                new_entry.name[..len].copy_from_slice(&bytes[..len]);
+                unsafe {
+                    std::ptr::write_unaligned(
+                        buf.as_mut_ptr().add(offset) as *mut DirectoryEntry,
+                        new_entry,
+                    );
+                }
+                disk.write_blocks(block, 1, &buf)?;
+                return Ok(());
+            }
         }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::Other,
-        "directory full",
+        "directory full (12 blocks max)",
     ))
 }
 
+/// Persist superblock, bitmap and inode table.
+///
+/// The bitmap is written first so allocation state reaches the platter before
+/// the metadata that references it, matching the kernel's own ordering.
 fn write_back(
     disk: &mut RawDisk,
-    sb: &Superblock,
+    sb: &mut Superblock,
     inodes: &Vec<Inode>,
     inode_blocks: usize,
+    alloc: &mut HostAlloc,
 ) -> std::io::Result<()> {
+    alloc.flush(disk).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let mut buf = [0u8; FS_BLOCK_SIZE];
     unsafe {
         std::ptr::copy_nonoverlapping(

@@ -85,7 +85,10 @@ pub enum Color {
 
 ### Purpose
 
-Reads PS/2 keyboard input from I/O port 0x60.
+Reads keyboard input. The PS/2 controller on I/O port 0x60 is always
+available; USB HID keyboards are claimed by the host-controller drivers
+below and pushed in via `keyboard::push_usb_report()`. PS/2 is never
+disabled, so it remains a fallback when a USB device fails to enumerate.
 
 ### Port 0x60 (Keyboard Data)
 
@@ -144,6 +147,175 @@ Scan  Key
 0x0E  Backspace
 0x0F  Tab
 ```
+
+### Key event tracing
+
+`keyboard::KEY_TRACE` (`drivers/keyboard.rs`) turns on a serial trace of
+every key event, tagged with the source that produced it. It exists to tell
+apart the three places a key can be lost:
+
+| Tag | Emitted by | Meaning |
+| --- | --- | --- |
+| `[key] xhci claimed slot=.. ep=.. maxpacket=.. binterval=.. xfer_len=..` | `xhci::claim_hid_keyboards` | The HID keyboard endpoint was claimed at all |
+| `[key] xhci kb slot=.. len=.. <hex>` | `xhci::handle_hid_completion` | Bytes as they came off the bus, before the 8-byte boot slice |
+| `[key] usb raw = <hex>` | `keyboard::push_usb_report` | Boot-protocol report on entry, before any filtering |
+| `[key] usb suppress = <hex>` | `keyboard::push_usb_report` | Usage dropped by the `LAST_HID_REPORT` press-edge filter (held key) |
+| `[key] usb unmapped = <hex>` | `keyboard::push_usb_report` | Usage matched neither `hid_to_ascii` nor `hid_to_key` |
+| `[key] usb -> <Key>` | `keyboard::push_usb_report` | Event decoded and queued |
+| `[key] ps2 sc = <hex>` | `keyboard::handle_interrupt` | Raw scancode from IRQ1 |
+| `[key] ps2 -> <Key>` | `keyboard::handle_interrupt` | Event decoded and queued |
+
+An HID usage that never reaches a `-> <Key>` line is dropped somewhere in the
+transport; a usage that reaches `-> <Key>` but does nothing is a dispatch bug
+in the consumer.
+
+Enable it by flipping `KEY_TRACE` in `drivers/keyboard.rs`, then build and
+boot as usual (the guest console is already on `-serial stdio`):
+
+```console
+$ cargo build -p mfk-kernel --target targets/x86_64-mfk.json \
+    -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
+```
+
+Reproduce the key slowly and paste the serial log.
+
+> **Leave it off while typing quickly.** Each line is a blocking write at
+> 115200 baud, while USB reports are drained only once per
+> shell/desktop/editor loop iteration. Tracing fast input can overflow the xHCI
+> event ring and swallow the very reports under investigation, producing a
+> misleading log. Turn it back off once you have what you need.
+
+## USB Host Controller Drivers
+
+### Purpose
+
+Claim USB host controllers, enumerate the devices on their root ports, and
+feed HID boot reports into the keyboard and mouse subsystems.
+
+Four controllers are supported, each in its own module. All are
+**polling-only**: no IRQ, no MSI, and no interrupt-driven completion.
+`usb::poll()` is called from the shell loop and checks descriptor status.
+
+| Driver | Module | PCI class/subclass/prog-if | Bus |
+| --- | --- | --- | --- |
+| EHCI | `drivers/usb.rs` | `0c/03/20` | MMIO, high-speed |
+| xHCI | `drivers/xhci.rs` | `0c/03/30` | MMIO, USB 2.0 + 3.x |
+| UHCI | `drivers/uhci.rs` | `0c/03/00` | I/O, full/low-speed |
+| OHCI | `drivers/ohci.rs` | `0c/03/10` | I/O, full/low-speed |
+
+### Shared descriptor parsing
+
+The config-descriptor walkers are pure `&[u8]` functions in `drivers/usb.rs`
+and are re-exported to the other drivers, so all four agree on what a device
+is:
+
+```rust
+pub(crate) fn find_hid_keyboard(cfg: &[u8]) -> Option<(u8, u8, u16)>;   // iface, ep, maxpacket
+pub(crate) fn find_hid_mouse(cfg: &[u8]) -> Option<(u8, u8, u16)>;
+pub(crate) fn find_hid_pointer(cfg: &[u8]) -> Option<(u8, u8, u16, HidPointerKind)>;
+pub(crate) fn hid_binterval(cfg: &[u8], ep_addr: u8) -> u8;
+pub(crate) fn parse_tablet_layout(desc: &[u8]) -> Option<TabletLayout>;
+pub(crate) fn setup_packet(bm, req, value, index, len) -> [u8; 8];
+```
+
+Reports are handed to the subsystems by one shared function, so a keyboard
+behaves identically regardless of which controller claimed it:
+
+```rust
+pub(crate) fn dispatch_report(kind: StreamKind, layout: Option<TabletLayout>, data: &[u8]);
+```
+
+### UHCI: frame list
+
+UHCI schedules from a 1024-entry frame list of TD pointers (exactly one 4 KiB
+page). The async schedule lives in entry 1023 and is selected by SOFMOD bit
+2, so control transfers publish their TD chain there and switch SOFMOD.
+
+Interrupt endpoints spread several identical TDs across frame-list slots:
+
+```
+stride = clamp(2^(bInterval-1), 2, 16)   // frames
+slots  = min(1024 / stride, 16)
+```
+
+The clamp matters. A bInterval of 10 means 2^9 = 512 ms if taken literally,
+and the frame list wraps every 1024 ms, so a single TD per endpoint would
+give roughly one poll per second. bInterval is a maximum latency, not a floor,
+and devices must tolerate faster polling, so the stride is capped at 16 ms.
+
+TD layout is 32 bytes: link pointer, control/status, token, and four buffer
+pointers. A SETUP stage uses MaxLen 11, matching Linux `uhci-hcd`.
+
+### OHCI: ED lists and the HCCA
+
+OHCI has no frame list. The controller walks endpoint-descriptor lists, and
+**periodic (interrupt) EDs are reachable only through the 32-entry schedule
+table inside the HCCA**, which is 256 bytes and must be programmed after
+`HcCommandStatus.HCR` because a reset clears `HcHCCA`.
+
+```text
+ED (32B):  hwINFO | hwTailP | hwHeadP | hwNextED
+TD (16B):  hwINFO | hwCBP    | hwNextTD| hwBE
+```
+
+Two details are easy to get wrong:
+
+* **The tail is the terminator, not the last real TD.** The controller runs
+  `while (head != tail)`, so a chain is published by filling the TDs and then
+  writing `hwTailP` once, pointing at an inert dummy TD. Descriptor contents
+  must be visible before that single write.
+* **A TD's length comes from `hwCBP`/`hwBE`, not a length field**, and a
+  zero-length transfer is encoded as `hwCBP == 0 && hwBE == 0`.
+
+Completion is detected by the condition-code field: TDs are armed with
+`TD_NOTACCESSED` (0xF) and the controller overwrites it, so `CC != 0xF` means
+the transfer retired. `HcDoneHead` is written back by the controller and must
+be cleared by the driver, or the retired-TD chain grows without bound.
+
+For a control transfer the TDs are SETUP (`TD_T_DATA0`), DATA (`TD_T_DATA1`
+plus `TD_R` so a short IN does not halt the ED), and STATUS (zero length,
+opposite direction). Control direction lives in the TDs, not the ED.
+
+### I/O vs MMIO BARs
+
+UHCI and OHCI decode **I/O** BARs, unlike EHCI and xHCI which are MMIO.
+`pci::bar_base()` deliberately returns `None` when bit 0 of the BAR is set, so
+those drivers use `pci::bar_io_base()` and the `io_r*`/`io_w*` helpers in
+`drivers/usb.rs`.
+
+Only firmware-assigned bases are accepted. If a BAR is zero — a hot-added or
+firmware-less controller — the driver logs the address it would have needed
+and skips the controller rather than guessing a port window that could
+collide with other ranges.
+
+### Companion handshake with EHCI
+
+On real chipsets an EHCI root port is shared with a UHCI/OHCI companion, and
+EHCI's `PORTSC` owner bit selects which half may drive it. When a companion
+driver is present, `EhciController::reset_port` reads that bit instead of
+clearing it, so the two halves do not both reset and enable the same physical
+port. With no companion loaded the historical steal-the-port behavior is kept,
+so machines with only EHCI are unaffected.
+
+This is what makes low-speed devices work on real hardware: EHCI cannot carry
+full/low-speed traffic at all, so a keyboard behind a companion that nothing
+drives has no path to the host.
+
+### Verifying in QEMU
+
+Pick the controller with the runner flag and check the result in the guest
+with the `usb` shell command, which prints every controller found on the bus
+and the live driver status:
+
+```
+usb                                          # PS/2: exercise the machine-default UHCIs
+cargo run -p mfk-runner -- --qemu --kbd=uhci
+cargo run -p mfk-runner -- --qemu --kbd=ehci
+cargo run -p mfk-runner -- --qemu --kbd=ohci # needs pci-ohci in your QEMU
+```
+
+`pci-ohci` is a QEMU build option. Confirm it is available with
+`qemu-system-x86_64 -device help` before relying on `--kbd=ohci`.
 
 ## E1000 Driver
 
@@ -204,10 +376,28 @@ pub fn init(phys_mem_offset: VirtAddr) -> Result<(), &'static str> {
     // 7. Enable receive/transmit
     enable_rx()?;
     enable_tx()?;
-    
+
+    // 8. Leave the interrupt mask clear: the card may have latched causes
+    //    during setup, and unmasking with a stale bit set fires once for work
+    //    already handled. The mask is enabled after the driver is published.
     Ok(())
 }
 ```
+
+### Interrupts
+
+`init` reads the assigned INTx pin and line from PCI config offset 0x3C, which
+is where firmware records them. If the line is one the IDT has a handler for
+(IRQ10 or IRQ11 under the legacy `pc` machine), the cause register is unmasked
+and the PIC line is opened; otherwise the driver stays in polling mode and
+reports so, rather than unmasking a cause with no vector behind it.
+
+The handler acknowledges only. It reads ICR — which clears the latched cause and
+lets the line deassert — records the cause, sets a pending flag, and sends the
+PIC EOI. It takes no lock and allocates nothing, because on a uniprocessor it
+can interrupt `receive_packet` mid-update: taking the driver spin lock there
+would deadlock against the code that raised the interrupt. The ring is drained
+by the pump instead.
 
 ### Receive (RX) Descriptors
 

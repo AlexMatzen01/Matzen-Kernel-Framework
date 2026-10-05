@@ -9,7 +9,7 @@
 //! selected source. Provides a `time` shell command for verification.
 
 use alloc::string::String;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::drivers::{pit, pm_timer, tsc};
 use crate::{print, println, serial_println};
@@ -24,6 +24,7 @@ pub enum TimeSource {
 }
 
 static SELECTED: AtomicU8 = AtomicU8::new(TimeSource::Unselected as u8);
+static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 static SELECTION_SUMMARY: spin::Mutex<Option<String>> = spin::Mutex::new(None);
 
 /// Returns the currently selected time source.
@@ -54,6 +55,7 @@ pub fn select_at_boot(phys_offset: u64) {
     if SELECTED.load(Ordering::Relaxed) != TimeSource::Unselected as u8 {
         return; // already selected
     }
+    PHYS_OFFSET.store(phys_offset, Ordering::Relaxed);
 
     crate::serial_println!("[time] Starting time source calibration...");
 
@@ -239,8 +241,16 @@ pub fn delay_ms(ms: u32) {
         TimeSource::PmTimer => pm_timer::sleep_ms(ms),
         TimeSource::Tsc => tsc::sleep_ms(ms),
         TimeSource::Unselected => {
-            select_at_boot(0);
-            delay_ms(ms);
+            // Never probe ACPI with a bogus offset: phys_offset must have been
+            // recorded by a real select_at_boot() call. If it wasn't, spin on
+            // the TSC instead of dereferencing low/null addresses.
+            let off = PHYS_OFFSET.load(Ordering::Relaxed);
+            if off != 0 {
+                select_at_boot(off);
+                delay_ms(ms);
+            } else {
+                tsc::sleep_ms(ms);
+            }
         }
     }
 }

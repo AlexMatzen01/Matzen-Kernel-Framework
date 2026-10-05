@@ -109,6 +109,18 @@ fn is_updating() -> bool {
     read_cmos(RTC_STATUS_A) & 0x80 != 0
 }
 
+/// Waits for the RTC update-in-progress bit, bounded so a wedged CMOS
+/// (or absent RTC returning 0xFF) cannot hang boot.
+fn wait_update_done() {
+    for _ in 0..1_000_000 {
+        let status = read_cmos(RTC_STATUS_A);
+        if status == 0xFF || status & 0x80 == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Converts BCD to binary
 fn bcd_to_binary(bcd: u8) -> u8 {
     ((bcd >> 4) * 10) + (bcd & 0x0F)
@@ -117,7 +129,7 @@ fn bcd_to_binary(bcd: u8) -> u8 {
 /// Reads the current date and time from the RTC
 pub fn read_rtc() -> DateTime {
     // Wait for any update to complete
-    while is_updating() {}
+    wait_update_done();
 
     // Read initial values
     let mut second = read_cmos(RTC_SECONDS);
@@ -137,7 +149,7 @@ pub fn read_rtc() -> DateTime {
         let last_month = month;
         let last_year = year;
 
-        while is_updating() {}
+        wait_update_done();
 
         second = read_cmos(RTC_SECONDS);
         minute = read_cmos(RTC_MINUTES);

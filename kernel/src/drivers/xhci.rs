@@ -16,8 +16,9 @@
 //! All waits are bounded so missing/broken hardware cannot hang boot.
 
 use crate::drivers::usb::{
-    delay_ms, dma_page, find_hid_keyboard, find_hid_pointer, mmio_r16, mmio_r32, mmio_r64, mmio_r8,
-    mmio_w32, mmio_w64, parse_tablet_layout, setup_packet, HidPointerKind, TabletLayout,
+    delay_ms, dma_page, find_hid_keyboard, find_hid_pointer, hid_binterval, mmio_r16, mmio_r32,
+    mmio_r64, mmio_r8, mmio_w32, mmio_w64, parse_tablet_layout, setup_packet, HidPointerKind,
+    TabletLayout,
 };
 use alloc::vec::Vec;
 // ---------------------------------------------------------------------------
@@ -313,6 +314,19 @@ impl XhciController {
         )
         .ok_or("xHCI MMIO map failed")?;
 
+        // The BAR can land far outside the bootloader's direct map (QEMU/OVMF
+        // puts it at 56 TiB), so prove the window really has a page-table
+        // entry before the first register access. Failure here returns Err and
+        // the caller prints its normal "init failed" line; without this the
+        // very first read faults and panics the kernel.
+        if !crate::drivers::pci::is_mapped(base, phys_offset) {
+            crate::println!(
+                "[usb] xHCI {:02x}:{:02x}.{} BAR phys {:#x} window {:#x} UNMAPPED",
+                pci.bus, pci.device, pci.function, mmio_phys, base
+            );
+            return Err("xHCI MMIO window unmapped");
+        }
+
         // Ensure PCI COMMAND memory-space enable (bit 1) so MMIO reads work.
         // Firmware normally sets it; harmless if already set.
         let cmd = pci.read_config(0x04);
@@ -564,7 +578,13 @@ impl XhciController {
         // CRCR write with retry + warn-continue
         let expected_crcr = cmd_phys | 0x1;
         let mut crcr_ok = false;
+        crate::println!("[usb] xHCI pre-CRCR-write: op={:#x} base={:#x} caplen={:#x} expected_crcr={:#x} cmd_phys&F={:#x} dcbaa={:#x}", op, base, caplen, expected_crcr, cmd_phys & 0xF, dcbaa_phys);
+        for (lo_off, name) in [(0usize, "USBCMD/STS"), (0x08, "PAGESIZE"), (0x14, "DNCTRL"), (0x18, "CRCR"), (0x30, "DCBAAP"), (0x38, "CONFIG")] {
+            let v = unsafe { mmio_r32(op, lo_off) };
+            crate::println!("[usb] xHCI op+{:#04x} ({}) = {:#x}", lo_off, name, v);
+        }
         for attempt in 0..4 {
+            crate::println!("[usb] xHCI CRCR attempt {}", attempt);
             unsafe {
                 if attempt == 2 {
                     // Single 64-bit qword write (8-byte aligned: page base +
@@ -581,6 +601,7 @@ impl XhciController {
                 }
             }
             let crcr_check = unsafe { mmio_r64(op, OP_CRCR) };
+            crate::println!("[usb] xHCI CRCR attempt {} readback={:#x}", attempt, crcr_check);
             // Compare ignoring RO/status low nibble: pass iff pointer equal and RCS set
             if (crcr_check & !0xF) == (expected_crcr & !0xF) && (crcr_check & 1) == 1 {
                 crcr_ok = true;
@@ -614,14 +635,16 @@ impl XhciController {
         let crcr_ok_final = (crcr_check & !0xF) == (expected_crcr & !0xF) && (crcr_check & 1) == 1;
         // Also read back DCBAAP for diagnostic
         let dcbaap_check = unsafe { mmio_r64(op, OP_DCBAAP) };
-        crate::serial_println!(
-            "[usb] xHCI CRCR: cmd_phys={:#x} expected={:#x} read={:#x} ok={} | DCBAAP wrote={:#x} read={:#x} match={}",
-            cmd_phys, expected_crcr, crcr_check, crcr_ok_final,
-            dcbaa_phys, dcbaap_check, dcbaap_check == dcbaa_phys
-        );
-        crate::println!("[usb] xHCI CRCR: cmd={:#x} expected={:#x} read={:#x} ok={} | DCBAAP wrote={:#x} read={:#x} match={}", 
+        crate::serial_println!("[usb] xHCI CRCR: cmd={:#x} expected={:#x} read={:#x} ok={} | DCBAAP wrote={:#x} read={:#x} match={}", 
             cmd_phys, expected_crcr, crcr_check, crcr_ok_final,
             dcbaa_phys, dcbaap_check, dcbaap_check == dcbaa_phys);
+        // CRCR read-back mismatch on this silicon is a red herring: DCBAAP and
+        // CONFIG writes land fine on the same window, the NOOP completion is
+        // matched on command-ring pointer, and ports enumerate — the ring
+        // pointer is accepted. Don't scare the operator with it on screen.
+        crate::println!("[usb] xHCI CRCR: cmd={:#x} ok={} | DCBAAP match={}",
+            cmd_phys, crcr_ok_final,
+            dcbaap_check == dcbaa_phys);
 
         if !crcr_ok_final {
             let dcbaap_check = unsafe { mmio_r64(op, OP_DCBAAP) };
@@ -630,12 +653,10 @@ impl XhciController {
                 cmd_phys, expected_crcr, crcr_check, crcr_check ^ expected_crcr,
                 dcbaa_phys, dcbaap_check, dcbaap_check == dcbaa_phys
             );
-            crate::println!(
-                "[usb] xHCI CRCR WARN: cmd={:#x} exp={:#x} got={:#x} diff={:#x} — continuing | DCBAAP wrote={:#x} read={:#x} match={}",
-                cmd_phys, expected_crcr, crcr_check, crcr_check ^ expected_crcr,
-                dcbaa_phys, dcbaap_check, dcbaap_check == dcbaa_phys
-            );
-            // Warn and continue — NOOP test is the real functional arbiter
+            // Warn and continue — NOOP test is the real functional arbiter.
+            // Demoted to serial-only: this silicon retains the accepted ring
+            // pointer while CRCR read-back shows 0, so cosmetic screen WARN
+            // text was scaring real-hardware users pointlessly.
         }
         // Event ring: single 128-TRB segment, consumer cycle 1.
         let (evt_virt, evt_phys, _) = dma_page().ok_or("event ring alloc")?;
@@ -1114,6 +1135,16 @@ impl XhciController {
             }
             match kind {
                 HidKind::Keyboard => {
+                    // Trace the bytes as they came off the bus, before the
+                    // 8-byte boot-keyboard slice, so a report whose extended
+                    // usages never arrive is visible here.
+                    if crate::drivers::keyboard::KEY_TRACE {
+                        crate::serial_print!("[key] xhci kb slot={} len={}", idx, len);
+                        for b in &report[..len] {
+                            crate::serial_print!(" {:02x}", b);
+                        }
+                        crate::serial_println!();
+                    }
                     let mut kbd = [0u8; 8];
                     kbd.copy_from_slice(&report[..8]);
                     // Idle (all-zero) reports are filtered inside
@@ -2108,7 +2139,7 @@ impl XhciController {
             };
             let binterval = {
                 let s = &self.slots[idx];
-                Self::hid_binterval(&s.cfg, ep_addr)
+                hid_binterval(&s.cfg, ep_addr)
             };
             // SET_PROTOCOL boot (0) â€” like EHCI; continue on fail.
             let setup_proto = setup_packet(0x21, 0x0B, 0, iface as u16, 0);
@@ -2134,6 +2165,16 @@ impl XhciController {
                     slot_id,
                     ep_addr
                 );
+                if crate::drivers::keyboard::KEY_TRACE {
+                    crate::serial_println!(
+                        "[key] xhci claimed slot={} ep={:#x} maxpacket={} binterval={} xfer_len={}",
+                        idx,
+                        ep_addr,
+                        max_raw,
+                        binterval,
+                        self.slots[idx].hid_xfer_len
+                    );
+                }
             } else {
                 crate::println!(
                     "[usb] xHCI {:04x}:{:04x} HID claim failed (slot {})",
@@ -2182,7 +2223,7 @@ impl XhciController {
             };
             let binterval = {
                 let s = &self.slots[idx];
-                Self::hid_binterval(&s.cfg, ep_addr)
+                hid_binterval(&s.cfg, ep_addr)
             };
             let (xfer_len, layout, label) = match kind {
                 HidPointerKind::BootMouse => {
@@ -2292,26 +2333,6 @@ impl XhciController {
                 );
             }
         }
-    }
-
-    /// Find bInterval for `ep_addr` in a config descriptor. Defaults to 8ms.
-    fn hid_binterval(cfg: &[u8], ep_addr: u8) -> u8 {
-        let mut i = 0;
-        while i + 2 <= cfg.len() {
-            let len = cfg[i] as usize;
-            let dtype = cfg[i + 1];
-            if len == 0 || i + len > cfg.len() {
-                break;
-            }
-            if dtype == 5 && len >= 7 && cfg[i + 2] == ep_addr {
-                let v = cfg[i + 6];
-                if v != 0 {
-                    return v;
-                }
-            }
-            i += len;
-        }
-        8
     }
 
     /// xHCI Interval field (125us units exponent) for an interrupt endpoint.

@@ -2,174 +2,157 @@
 //! Author: Alexander Matzen
 //! Licensed under the MIT license.
 
-//! System information: CPU identity (vendor/brand/features), physical
-//! memory summary stashed from the bootloader memory map, and last-app
-//! accounting shared by `ps` and `top`.
+//! System information: CPU identity (vendor/brand/features/address width),
+//! the interpreted physical memory layout, and last-app accounting.
 //!
 //! All helpers are `no_std` + `alloc` compatible. CPUID uses the same
 //! `push rbx` / `pop rbx` pattern as the shell so PIC builds stay safe.
+//!
+//! The memory half is a thin snapshot layer over
+//! [`crate::memory::memmap::MemoryLayout`]: `kernel_main` builds the layout
+//! once (classifying every firmware region and subtracting kernel-owned
+//! spans) and hands it to [`stash_memory_layout`], which keeps it available
+//! for the `mem` command. Nothing here re-derives totals, so what the shell
+//! reports and what the frame allocator was given cannot drift apart.
 
 use alloc::string::String;
-use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use spin::Mutex;
 
-/// Maximum bootloader memory regions copied at boot.
-pub const MAX_REGIONS: usize = 64;
+use crate::memory::memmap;
 
-/// Region-kind tags (mirrors `MemoryRegionKind` in bootloader_api 0.11).
-pub const KIND_USABLE: u8 = 0;
-pub const KIND_BOOTLOADER: u8 = 1;
-pub const KIND_UNKNOWN_UEFI: u8 = 2;
-pub const KIND_UNKNOWN_BIOS: u8 = 3;
+/// Snapshot of the interpreted memory map.
+static MEM_LAYOUT: Mutex<Option<memmap::MemoryLayout>> = Mutex::new(None);
 
-/// Copied physical memory region (start inclusive, end exclusive).
-#[derive(Clone, Copy)]
-pub struct MemRegion {
-    pub start: u64,
-    pub end: u64,
-    pub kind_tag: u8,
-    pub kind_extra: u32,
+/// Store the interpreted memory layout. Called once from `kernel_main`
+/// before the shell runs; later calls replace the snapshot.
+pub fn stash_memory_layout(layout: &memmap::MemoryLayout) {
+    *MEM_LAYOUT.lock() = Some(layout.clone());
 }
 
-impl MemRegion {
-    pub const fn empty() -> Self {
-        Self {
-            start: 0,
-            end: 0,
-            kind_tag: KIND_BOOTLOADER,
-            kind_extra: 0,
-        }
-    }
+/// The stashed layout, if boot produced one.
+pub fn memory_layout() -> Option<memmap::MemoryLayout> {
+    MEM_LAYOUT.lock().clone()
+}
 
-    pub fn len(&self) -> u64 {
-        self.end.saturating_sub(self.start)
-    }
+/// Aggregate totals, or all-zero before boot stashes the layout.
+pub fn memory_summary() -> memmap::MemoryLayout {
+    MEM_LAYOUT.lock().clone().unwrap_or_default()
 }
 
 /// Aggregate physical memory totals computed at boot.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemorySummary {
+    /// Bytes described by the firmware map.
     pub total_bytes: u64,
+    /// Bytes that are RAM rather than a PCI MMIO / port-space window.
+    pub ram_bytes: u64,
+    /// Bytes in memory-mapped I/O windows (excluded from `ram_bytes`).
+    pub mmio_bytes: u64,
+    /// Bytes the kernel may allocate from, before reservations.
     pub usable_bytes: u64,
-    pub bootloader_bytes: u64,
-    pub unknown_bytes: u64,
+    /// Allocatable bytes a 32-bit DMA controller can reach.
+    pub usable_low_bytes: u64,
+    /// Allocatable bytes above the 32-bit DMA limit.
+    pub usable_high_bytes: u64,
+    /// Bytes the kernel reserves for itself.
+    pub reserved_bytes: u64,
+    /// Allocatable bytes after reservations.
+    pub allocatable_bytes: u64,
+    /// Retained regions listed.
     pub region_count: usize,
+    /// Regions dropped by the [`memmap::MAX_REGIONS`] cap.
     pub truncated: bool,
 }
 
-static MEM_SUMMARY: Mutex<Option<MemorySummary>> = Mutex::new(None);
-static MEM_REGIONS: Mutex<([MemRegion; MAX_REGIONS], usize)> =
-    Mutex::new(([MemRegion::empty(); MAX_REGIONS], 0));
+impl From<&memmap::MemoryLayout> for MemorySummary {
+    fn from(l: &memmap::MemoryLayout) -> Self {
+        Self {
+            total_bytes: l.total_bytes,
+            ram_bytes: l.ram_bytes(),
+            mmio_bytes: l.mmio_bytes,
+            usable_bytes: l.allocatable_bytes,
+            usable_low_bytes: l.allocatable_low_bytes,
+            usable_high_bytes: l.allocatable_high_bytes,
+            reserved_bytes: l.boot_owned_bytes,
+            allocatable_bytes: l.allocatable_after_reservations,
+            region_count: l.regions.len(),
+            truncated: l.truncated,
+        }
+    }
+}
 
-fn tag_of(kind: &MemoryRegionKind) -> (u8, u32) {
-    match *kind {
-        MemoryRegionKind::Usable => (KIND_USABLE, 0),
-        MemoryRegionKind::Bootloader => (KIND_BOOTLOADER, 0),
-        MemoryRegionKind::UnknownUefi(v) => (KIND_UNKNOWN_UEFI, v),
-        MemoryRegionKind::UnknownBios(v) => (KIND_UNKNOWN_BIOS, v),
-        _ => (KIND_UNKNOWN_BIOS, 0xFFFF_FFFF),
+/// Summary of the stashed layout, if boot stashed one.
+pub fn memory_summary_opt() -> Option<MemorySummary> {
+    MEM_LAYOUT.lock().as_ref().map(MemorySummary::from)
+}
+
+/// Calls `f` with the retained region list.
+pub fn with_regions<R>(f: impl FnOnce(&[memmap::LayoutRegion]) -> R) -> R {
+    let guard = MEM_LAYOUT.lock();
+    match guard.as_ref() {
+        Some(l) => f(&l.regions),
+        None => f(&[]),
     }
 }
 
-/// Copy the bootloader memory map into static storage.
-///
-/// Must be called once from `kernel_main` before the shell runs. Later
-/// calls overwrite the previous snapshot.
-pub fn stash_memory_map(regions: &MemoryRegions) {
-    let mut total = 0u64;
-    let mut usable = 0u64;
-    let mut bootloader = 0u64;
-    let mut unknown = 0u64;
-    let mut guard = MEM_REGIONS.lock();
-    let mut count = 0usize;
-    let mut truncated = false;
-    for r in regions.iter() {
-        let len = r.end.saturating_sub(r.start);
-        total = total.saturating_add(len);
-        let (tag, extra) = tag_of(&r.kind);
-        match tag {
-            KIND_USABLE => usable = usable.saturating_add(len),
-            KIND_BOOTLOADER => bootloader = bootloader.saturating_add(len),
-            _ => unknown = unknown.saturating_add(len),
-        }
-        if count < MAX_REGIONS {
-            guard.0[count] = MemRegion {
-                start: r.start,
-                end: r.end,
-                kind_tag: tag,
-                kind_extra: extra,
-            };
-            count += 1;
-        } else {
-            truncated = true;
+/// Calls `f` with the kernel-owned reservations.
+pub fn with_reservations<R>(f: impl FnOnce(&[memmap::Reservation]) -> R) -> R {
+    let guard = MEM_LAYOUT.lock();
+    match guard.as_ref() {
+        Some(l) => f(&l.reservations),
+        None => f(&[]),
+    }
+}
+
+/// Short display name for a region class, including the firmware tag when
+/// the region arrived as an `Unknown*` kind.
+pub fn region_kind_name(
+    class: memmap::RegionClass,
+    firmware_tag: u32,
+    buf: &mut [u8; 32],
+) -> &str {
+    if firmware_tag == 0 {
+        return class.label();
+    }
+    let base = class.label().as_bytes();
+    let mut len = 0usize;
+    for &b in base {
+        if len < buf.len() {
+            buf[len] = b;
+            len += 1;
         }
     }
-    let full_count = regions.iter().count();
-    guard.1 = count;
-    *MEM_SUMMARY.lock() = Some(MemorySummary {
-        total_bytes: total,
-        usable_bytes: usable,
-        bootloader_bytes: bootloader,
-        unknown_bytes: unknown,
-        region_count: full_count,
-        truncated,
-    });
-}
-
-/// Returns the stashed memory summary, if boot stashed it.
-pub fn memory_summary() -> Option<MemorySummary> {
-    *MEM_SUMMARY.lock()
-}
-
-/// Calls `f` with the copied region list.
-pub fn with_regions<R>(f: impl FnOnce(&[MemRegion]) -> R) -> R {
-    let guard = MEM_REGIONS.lock();
-    f(&guard.0[..guard.1])
-}
-
-/// Short display name for a region-kind tag.
-pub fn region_kind_name(tag: u8, extra: u32, buf: &mut [u8; 32]) -> &str {
-    let s: &str = match tag {
-        KIND_USABLE => "Usable",
-        KIND_BOOTLOADER => "Bootloader",
-        KIND_UNKNOWN_UEFI => "UnknownUefi",
-        KIND_UNKNOWN_BIOS => "UnknownBios",
-        _ => "Unknown",
-    };
-    if tag == KIND_UNKNOWN_UEFI || tag == KIND_UNKNOWN_BIOS {
-        let mut len = 0usize;
-        for &b in s.as_bytes() {
-            if len < buf.len() {
-                buf[len] = b;
-                len += 1;
-            }
-        }
-        // Append "(0xNN)" suffix.
-        let hex = b"0123456789ABCDEF";
-        let suffix: [u8; 12] = [
-            b'(',
-            b'0',
-            b'x',
-            hex[((extra >> 28) & 0xF) as usize],
-            hex[((extra >> 24) & 0xF) as usize],
-            hex[((extra >> 20) & 0xF) as usize],
-            hex[((extra >> 16) & 0xF) as usize],
-            hex[((extra >> 12) & 0xF) as usize],
-            hex[((extra >> 8) & 0xF) as usize],
-            hex[((extra >> 4) & 0xF) as usize],
-            hex[(extra & 0xF) as usize],
-            b')',
-        ];
-        for &b in suffix.iter() {
-            if len < buf.len() {
-                buf[len] = b;
-                len += 1;
-            }
-        }
-        core::str::from_utf8(&buf[..len]).unwrap_or("Unknown")
+    // Append a compact "(0xNN)" tag; truncation keeps the last digit rather
+    // than silently cutting mid-number.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digits = if firmware_tag > 0xFF {
+        4
+    } else if firmware_tag > 0xF {
+        3
     } else {
-        s
+        2
+    };
+    let mut suffix = [0u8; 8];
+    let mut n = 0usize;
+    suffix[n] = b'(';
+    n += 1;
+    suffix[n] = b'0';
+    n += 1;
+    suffix[n] = b'x';
+    n += 1;
+    for i in (0..digits).rev() {
+        suffix[n] = HEX[((firmware_tag >> (i * 4)) & 0xF) as usize];
+        n += 1;
     }
+    suffix[n] = b')';
+    n += 1;
+    for &b in suffix[..n].iter() {
+        if len < buf.len() {
+            buf[len] = b;
+            len += 1;
+        }
+    }
+    core::str::from_utf8(&buf[..len]).unwrap_or("unknown")
 }
 
 // ── CPUID helpers ────────────────────────────────────────────
@@ -231,6 +214,50 @@ pub fn cpu_max_basic() -> u32 {
 /// Maximum extended CPUID leaf (EAX from leaf 0x80000000).
 pub fn cpu_max_extended() -> u32 {
     cpuid(0x8000_0000).0
+}
+
+/// Physical address width reported by the CPU.
+///
+/// `CPUID.0x80000008:EAX[7:0]` is `MAXPHYADDR`, the number of bits of
+/// physical address the CPU implements; `[8:15]` is
+/// `PHYSICAL_ADDRESS_BITS_EXTENSION`, set when the width exceeds 52 bits.
+///
+/// This is the ceiling every physical address in the kernel must respect: a
+/// 64-bit PCI BAR whose base exceeds this width cannot be addressed at all,
+/// and the MMIO mapper has no way to express it. Without it nothing in the
+/// kernel knows how wide physical memory actually is.
+///
+/// `None` when the extended leaf is unavailable, in which case the x86-64
+/// baseline of 40 bits (1 TiB) applies.
+pub fn cpu_max_phys_addr_bits() -> Option<u32> {
+    if cpu_max_extended() < 0x8000_0008 {
+        return None;
+    }
+    let (eax, _, _, _) = cpuid(0x8000_0008);
+    let bits = eax & 0xFF;
+    if bits == 0 {
+        return None;
+    }
+    let extended = ((eax >> 8) & 0xFF) != 0;
+    Some(if extended { bits + 32 } else { bits })
+}
+
+/// Highest physical address the CPU can address, or `None` when unknown.
+pub fn cpu_max_physical_address() -> Option<u64> {
+    cpu_max_phys_addr_bits()
+        .and_then(|bits| {
+            if bits >= 64 {
+                Some(u64::MAX)
+            } else {
+                Some((1u64 << bits) - 1)
+            }
+        })
+}
+
+/// Physical address width, defaulting to the x86-64 baseline when the CPU
+/// does not report one. Always safe to use for range checks.
+pub fn cpu_phys_addr_limit() -> u64 {
+    cpu_max_physical_address().unwrap_or((1u64 << 40) - 1)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

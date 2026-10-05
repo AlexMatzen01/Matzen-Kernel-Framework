@@ -1,4 +1,4 @@
-//! USB host-controller integration (EHCI-first for A1466 built-in keyboard).
+﻿//! USB host-controller integration (EHCI-first for A1466 built-in keyboard).
 //!
 //! Polling-only design: `init()` brings up EHCI controllers, enumerates
 //! ports/hubs, claims HID boot keyboards, and links interrupt QHs into the
@@ -8,12 +8,15 @@
 //! All waits are bounded so missing hardware cannot hang boot. Failures are
 //! logged to framebuffer/serial for Mac photo diagnostics.
 
+use alloc::format;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
+use crate::drivers::ohci::OhciController;
 use crate::drivers::pci::{PciDevice, PCI_VENDOR_INTEL};
+use crate::drivers::uhci::UhciController;
 use crate::drivers::xhci::XhciController;
 
 // ---------------------------------------------------------------------------
@@ -45,38 +48,56 @@ fn translate_virt_to_phys(virt: u64) -> Option<u64> {
         .map(|p| p.as_u64())
 }
 
+/// Physical address for a USB host controller to DMA to/from.
+///
+/// Every HCD in this kernel (EHCI, UHCI, OHCI, xHCI) addresses memory with a
+/// 32-bit physical pointer, so a buffer at or above 4 GiB is unreachable
+/// regardless of which driver asked. The limit itself lives in one place
+/// (`memmap::DMA_PHYS_LIMIT`) because it was previously duplicated in three
+/// drivers with no shared constant.
 fn virt_to_phys_dma(virt: u64) -> Option<u64> {
     if let Some(phys) = translate_virt_to_phys(virt) {
-        if phys < 0x1_0000_0000 {
-            return Some(phys);
+        if let Some(reachable) = crate::memory::addr::dma_phys(phys) {
+            return Some(reachable);
         }
-        crate::serial_println!("[usb] DMA phys {:#x} >= 4GB, EHCI cannot reach", phys);
+        crate::serial_println!("[usb] DMA phys {:#x} >= 4 GiB, HCD cannot reach", phys);
         return None;
     }
-    // Legacy fallback: virt - offset (only valid for direct-mapped heap).
+    // Direct map fallback: only valid for heap buffers, which the boot
+    // sequence guarantees live there.
     let off = phys_offset();
     if off != 0 && virt >= off {
-        let phys = virt - off;
-        if phys < 0x1_0000_0000 {
-            return Some(phys);
-        }
+        return crate::memory::addr::dma_phys(virt - off);
     }
     None
 }
 
 /// Allocates a zeroed 4K page for DMA. Leaked for driver lifetime.
+///
+/// Prefers a page-aligned *physical frame* from the frame allocator's
+/// DMA-reachable pool: every host controller here addresses memory with a
+/// 32-bit physical pointer, so a buffer taken from the heap is usable only
+/// because the heap happens to sit below 4 GiB. Asking the frame allocator
+/// for a low frame makes that a guarantee rather than an accident, and the
+/// heap is only used if the low pool is exhausted.
 pub(crate) fn dma_page() -> Option<(u64, u64, *mut u8)> {
-    use alloc::alloc::{alloc_zeroed, Layout};
-    let layout = Layout::from_size_align(4096, 4096).ok()?;
-    let ptr = unsafe { alloc_zeroed(layout) };
-    if ptr.is_null() {
-        crate::serial_println!("[usb] dma_page alloc failed");
-        return None;
+    use x86_64::structures::paging::FrameAllocator;
+    let frame = crate::memory::frame_allocator::dma_frame_allocator().allocate_frame()?;
+    let phys = frame.start_address().as_u64();
+    let virt = crate::memory::addr::phys_to_direct(phys);
+    // SAFETY: `virt` is `phys_to_direct(phys)` for a frame the frame
+    // allocator just handed out, so it lies inside the bootloader's
+    // full-physical direct map and is valid for reads and writes.
+    let page = virt as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(page, 0, 4096);
+        // Make the zeroing visible to the device, which may be caching.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     }
-    let virt = ptr as u64;
-    let phys = virt_to_phys_dma(virt)?;
-    // Ensure single-page (no cross): page-aligned base guarantees it.
-    Some((virt, phys, ptr))
+    crate::serial_println!("[usb] DMA page at phys {:#x}", phys);
+    // The frame is intentionally leaked: DMA descriptors reference it for the
+    // driver's lifetime, and the pool has no reclamation path yet.
+    Some((virt, phys, page))
 }
 
 pub(crate) fn delay_ms(ms: usize) {
@@ -143,6 +164,41 @@ pub(crate) unsafe fn mmio_r64(base: usize, off: usize) -> u64 {
     let lo = core::ptr::read_volatile((base + off) as *const u32) as u64;
     let hi = core::ptr::read_volatile((base + off + 4) as *const u32) as u64;
     lo | (hi << 32)
+}
+
+/// I/O-space port helpers for UHCI/OHCI. Unlike EHCI/xHCI, those controllers
+/// decode I/O BARs, so they need the port-space twin of the `mmio_*` family
+/// above. Widths are explicit because the register blocks mix 16- and 32-bit
+/// fields at even offsets (UHCI FRBASEADD is 16-bit at base+0x08, FLBASEADD
+/// 32-bit at base+0x14) and a mismatched width faults or reads neighbors.
+#[inline]
+pub(crate) unsafe fn io_r8(port: u16) -> u8 {
+    x86_64::instructions::port::Port::<u8>::new(port).read()
+}
+
+#[inline]
+pub(crate) unsafe fn io_r16(port: u16) -> u16 {
+    x86_64::instructions::port::Port::<u16>::new(port).read()
+}
+
+#[inline]
+pub(crate) unsafe fn io_r32(port: u16) -> u32 {
+    x86_64::instructions::port::Port::<u32>::new(port).read()
+}
+
+#[inline]
+pub(crate) unsafe fn io_w8(port: u16, val: u8) {
+    x86_64::instructions::port::Port::<u8>::new(port).write(val)
+}
+
+#[inline]
+pub(crate) unsafe fn io_w16(port: u16, val: u16) {
+    x86_64::instructions::port::Port::<u16>::new(port).write(val)
+}
+
+#[inline]
+pub(crate) unsafe fn io_w32(port: u16, val: u32) {
+    x86_64::instructions::port::Port::<u32>::new(port).write(val)
 }
 
 // EHCI cap regs
@@ -268,6 +324,8 @@ unsafe impl Send for EhciController {}
 struct UsbState {
     controllers: Vec<EhciController>,
     xhci: Vec<XhciController>,
+    uhci: Vec<UhciController>,
+    ohci: Vec<OhciController>,
     ready: bool,
 }
 
@@ -275,6 +333,8 @@ lazy_static! {
     static ref STATE: Mutex<UsbState> = Mutex::new(UsbState {
         controllers: Vec::new(),
         xhci: Vec::new(),
+        uhci: Vec::new(),
+        ohci: Vec::new(),
         ready: false,
     });
 }
@@ -325,16 +385,21 @@ pub fn init(phys_mem_offset: u64) {
     {
         usb_total += 1;
         let kind = match device.prog_if {
+            0x00 => "UHCI",
+            0x10 => "OHCI",
             0x20 => "EHCI",
             0x30 => "xHCI",
             _ => "USB",
         };
+        // UHCI/OHCI decode I/O BARs; the rest are MMIO. Print whichever
+        // window the firmware actually assigned.
+        let window = match device.bar_io_base(0) {
+            Some(io) => format!("io={:#06x}", io),
+            None => format!("MMIO={:#x}", device.mmio_base().unwrap_or(0)),
+        };
         crate::println!(
-            "[usb] {} {:04x}:{:04x} MMIO={:#x}",
-            kind,
-            device.vendor_id,
-            device.device_id,
-            device.mmio_base().unwrap_or(0)
+            "[usb] {} {:04x}:{:04x} {}",
+            kind, device.vendor_id, device.device_id, window
         );
     }
     crate::println!("[usb] {} controller(s) found", usb_total);
@@ -387,7 +452,24 @@ pub fn init(phys_mem_offset: u64) {
         .map(|d| (d.bus, d.device, d.function))
         .collect();
 
-    if ehci_devs.is_empty() && xhci_devs.is_empty() {
+    // UHCI/OHCI are the full/low-speed companions. On real chipsets they own
+    // the FS/LS half of an EHCI controller's root ports.
+    let uhci_devs: Vec<(u8, u8, u8)> = devices
+        .iter()
+        .filter(|d| d.class_code == 0x0c && d.subclass == 0x03 && d.prog_if == 0x00)
+        .map(|d| (d.bus, d.device, d.function))
+        .collect();
+    let ohci_devs: Vec<(u8, u8, u8)> = devices
+        .iter()
+        .filter(|d| d.class_code == 0x0c && d.subclass == 0x03 && d.prog_if == 0x10)
+        .map(|d| (d.bus, d.device, d.function))
+        .collect();
+
+    if ehci_devs.is_empty()
+        && xhci_devs.is_empty()
+        && uhci_devs.is_empty()
+        && ohci_devs.is_empty()
+    {
         crate::println!("[usb] no USB controllers, HID transport pending");
         return;
     }
@@ -395,27 +477,8 @@ pub fn init(phys_mem_offset: u64) {
     // Re-lookup full PciDevice by location (enumerate again is cheap enough once).
     let all = crate::drivers::pci::enumerate_devices();
     for (bus, dev, func) in ehci_devs {
-        let pci = all
-            .iter()
-            .find(|d| d.bus == bus && d.device == dev && d.function == func);
-        let Some(pci) = pci else { continue };
-        // Reconstruct owned copy via fields (PciDevice is not Clone).
-        let dev_copy = crate::drivers::pci::PciDevice {
-            bus: pci.bus,
-            device: pci.device,
-            function: pci.function,
-            vendor_id: pci.vendor_id,
-            device_id: pci.device_id,
-            subsystem_vendor_id: pci.subsystem_vendor_id,
-            subsystem_id: pci.subsystem_id,
-            revision_id: pci.revision_id,
-            class_code: pci.class_code,
-            subclass: pci.subclass,
-            prog_if: pci.prog_if,
-            bar0: pci.bar0,
-            bar1: pci.bar1,
-            bars: pci.bars,
-            irq_line: pci.irq_line,
+        let Some(dev_copy) = copy_pci(&all, bus, dev, func) else {
+            continue;
         };
         match EhciController::new(dev_copy, phys_mem_offset) {
             Ok(mut ctl) => {
@@ -450,31 +513,12 @@ pub fn init(phys_mem_offset: u64) {
         .iter()
         .map(|c| c.keyboards.len())
         .sum();
-    let ehci_ptr: usize = STATE.lock().controllers.iter().map(|c| c.mice.len()).sum();
 
     // Bring up xHCI controllers (Phase 1: running + proven rings, Phase 2:
     // enumeration, Phase 3: HID claiming + interrupt-IN polling).
     for (bus, dev, func) in xhci_devs {
-        let pci = all
-            .iter()
-            .find(|d| d.bus == bus && d.device == dev && d.function == func);
-        let Some(pci) = pci else { continue };
-        let dev_copy = crate::drivers::pci::PciDevice {
-            bus: pci.bus,
-            device: pci.device,
-            function: pci.function,
-            vendor_id: pci.vendor_id,
-            device_id: pci.device_id,
-            subsystem_vendor_id: pci.subsystem_vendor_id,
-            subsystem_id: pci.subsystem_id,
-            revision_id: pci.revision_id,
-            class_code: pci.class_code,
-            subclass: pci.subclass,
-            prog_if: pci.prog_if,
-            bar0: pci.bar0,
-            bar1: pci.bar1,
-            bars: pci.bars,
-            irq_line: pci.irq_line,
+        let Some(dev_copy) = copy_pci(&all, bus, dev, func) else {
+            continue;
         };
         match XhciController::new(dev_copy, phys_mem_offset) {
             Ok(mut ctl) => {
@@ -514,7 +558,67 @@ pub fn init(phys_mem_offset: u64) {
         .iter()
         .map(|c| c.hid_keyboard_count())
         .sum();
-    let total_kbd = ehci_kbd + xhci_kbd;
+
+    // Bring up UHCI/OHCI companions last. They are full/low-speed only, so
+    // they must not race an EHCI port that is already being driven; the
+    // companion handshake in EhciController::reset_port defers to whichever
+    // side the owner bit says.
+    for (bus, dev, func) in uhci_devs {
+        let Some(dev_copy) = copy_pci(&all, bus, dev, func) else {
+            continue;
+        };
+        match UhciController::new(dev_copy, phys_mem_offset) {
+            Ok(mut ctl) => {
+                ctl.enumerate();
+                let kbd = ctl.hid_keyboard_count();
+                let ptr = ctl.hid_pointer_count();
+                crate::println!(
+                    "[usb] UHCI {:02x}:{:02x}.{} ready, polling ({} HID kbd, {} HID ptr)",
+                    bus, dev, func, kbd, ptr
+                );
+                STATE.lock().uhci.push(ctl);
+            }
+            Err(e) => {
+                crate::println!("[usb] UHCI {:02x}:{:02x}.{} init failed: {}", bus, dev, func, e);
+            }
+        }
+    }
+
+    for (bus, dev, func) in ohci_devs {
+        let Some(dev_copy) = copy_pci(&all, bus, dev, func) else {
+            continue;
+        };
+        match OhciController::new(dev_copy, phys_mem_offset) {
+            Ok(mut ctl) => {
+                ctl.enumerate();
+                let kbd = ctl.hid_keyboard_count();
+                let ptr = ctl.hid_pointer_count();
+                crate::println!(
+                    "[usb] OHCI {:02x}:{:02x}.{} ready, polling ({} HID kbd, {} HID ptr)",
+                    bus, dev, func, kbd, ptr
+                );
+                STATE.lock().ohci.push(ctl);
+            }
+            Err(e) => {
+                crate::println!("[usb] OHCI {:02x}:{:02x}.{} init failed: {}", bus, dev, func, e);
+            }
+        }
+    }
+
+    let uhci_kbd: usize = STATE
+        .lock()
+        .uhci
+        .iter()
+        .map(|c| c.hid_keyboard_count())
+        .sum();
+    let ohci_kbd: usize = STATE
+        .lock()
+        .ohci
+        .iter()
+        .map(|c| c.hid_keyboard_count())
+        .sum();
+
+    let total_kbd = ehci_kbd + xhci_kbd + uhci_kbd + ohci_kbd;
     let total_ptr = hid_pointer_count();
     if total_kbd == 0 && total_ptr == 0 {
         crate::println!("[usb] HID transport pending (no boot HID devices claimed)");
@@ -526,6 +630,42 @@ pub fn init(phys_mem_offset: u64) {
         );
     }
     STATE.lock().ready = true;
+}
+
+/// `PciDevice` is not `Clone`, so a controller taking it by value needs an
+/// owned copy re-looked-up by BDF.
+fn copy_pci(all: &[PciDevice], bus: u8, dev: u8, func: u8) -> Option<PciDevice> {
+    let pci = all
+        .iter()
+        .find(|d| d.bus == bus && d.device == dev && d.function == func)?;
+    Some(PciDevice {
+        bus: pci.bus,
+        device: pci.device,
+        function: pci.function,
+        vendor_id: pci.vendor_id,
+        device_id: pci.device_id,
+        subsystem_vendor_id: pci.subsystem_vendor_id,
+        subsystem_id: pci.subsystem_id,
+        revision_id: pci.revision_id,
+        class_code: pci.class_code,
+        subclass: pci.subclass,
+        prog_if: pci.prog_if,
+        bar0: pci.bar0,
+        bar1: pci.bar1,
+        bars: pci.bars,
+        irq_line: pci.irq_line,
+    })
+}
+
+/// True when a full/low-speed companion controller is driving this machine.
+///
+/// On real chipsets an EHCI root port is shared with a UHCI/OHCI companion,
+/// and the EHCI `PORT_OWNER` bit says which half currently owns it. When a
+/// companion driver is present the EHCI driver must respect that bit rather
+/// than clearing it, otherwise both halves fight over the same port.
+pub fn companion_present() -> bool {
+    let state = STATE.lock();
+    !state.uhci.is_empty() || !state.ohci.is_empty()
 }
 
 /// Physical address for DMA, or `None` when unreachable (>= 4 GiB).
@@ -570,15 +710,21 @@ pub fn probe_report() {
         let bar0 = d.read_config(0x10);
         let bar1 = d.read_config(0x14);
         let cmd = d.read_config(0x04);
+        // I/O controllers (UHCI/OHCI) report the decoded port window;
+        // MMIO ones (EHCI/xHCI) report a physical address.
+        let window = match d.bar_io_base(0) {
+            Some(io) => format!("io={:#06x}", io),
+            None => format!("MMIO={:#x}", d.mmio_base().unwrap_or(0)),
+        };
         crate::println!(
-            "[usb] {:<4} {:02x}:{:02x}.{} {:04x}:{:04x} MMIO={:#x} IRQ={} BAR0={:#x} BAR1={:#x} CMD={:#x}",
+            "[usb] {:<4} {:02x}:{:02x}.{} {:04x}:{:04x} {} IRQ={} BAR0={:#x} BAR1={:#x} CMD={:#x}",
             kind,
             d.bus,
             d.device,
             d.function,
             d.vendor_id,
             d.device_id,
-            d.mmio_base().unwrap_or(0),
+            window,
             d.irq_line,
             bar0,
             bar1,
@@ -588,33 +734,53 @@ pub fn probe_report() {
     if uhci + ohci + ehci + xhci == 0 {
         crate::println!("[usb] no PCI USB controllers found");
     }
-    if uhci > 0 {
-        crate::println!(
-            "[usb] UHCI x{}: no kernel driver (unsupported) - PS/2 fallback",
-            uhci
-        );
-    }
-    if ohci > 0 {
-        crate::println!(
-            "[usb] OHCI x{}: no kernel driver (unsupported) - PS/2 fallback",
-            ohci
-        );
-    }
     {
         let state = STATE.lock();
         let ehci_kbd: usize = state.controllers.iter().map(|c| c.keyboards.len()).sum();
         let ehci_ptr: usize = state.controllers.iter().map(|c| c.mice.len()).sum();
         let xhci_kbd: usize = state.xhci.iter().map(|c| c.hid_keyboard_count()).sum();
         let xhci_ptr: usize = state.xhci.iter().map(|c| c.hid_pointer_count()).sum();
+        let uhci_live = state.uhci.len();
+        let uhci_kbd: usize = state.uhci.iter().map(|c| c.hid_keyboard_count()).sum();
+        let uhci_ptr: usize = state.uhci.iter().map(|c| c.hid_pointer_count()).sum();
+        let ohci_live = state.ohci.len();
+        let ohci_kbd: usize = state.ohci.iter().map(|c| c.hid_keyboard_count()).sum();
+        let ohci_ptr: usize = state.ohci.iter().map(|c| c.hid_pointer_count()).sum();
         crate::println!(
-            "[usb] status: EHCI x{} ({} kbd, {} ptr), xHCI x{} ({} kbd, {} ptr), PS/2 kbd active",
+            "[usb] status: EHCI x{} ({} kbd, {} ptr), xHCI x{} ({} kbd, {} ptr), UHCI x{} ({} kbd, {} ptr), OHCI x{} ({} kbd, {} ptr)",
             state.controllers.len(),
             ehci_kbd,
             ehci_ptr,
             state.xhci.len(),
             xhci_kbd,
             xhci_ptr,
+            uhci_live,
+            uhci_kbd,
+            uhci_ptr,
+            ohci_live,
+            ohci_kbd,
+            ohci_ptr,
         );
+        // A controller present on the bus but absent from the driver list
+        // means bring-up failed; say which, so the diagnostic is actionable.
+        if uhci > uhci_live {
+            crate::println!(
+                "[usb] UHCI: {} found, {} claimed (init failed or BAR unassigned)",
+                uhci,
+                uhci_live
+            );
+        }
+        if ohci > ohci_live {
+            crate::println!(
+                "[usb] OHCI: {} found, {} claimed (init failed or BAR unassigned)",
+                ohci,
+                ohci_live
+            );
+        }
+        if !state.uhci.is_empty() || !state.ohci.is_empty() {
+            crate::println!("[usb] companion: FS/LS ports owned by UHCI/OHCI, EHCI restricted to HS");
+        }
+        crate::println!("[usb] PS/2 kbd active (always available as fallback)");
     }
     {
         let present = crate::drivers::mouse::is_present();
@@ -632,7 +798,7 @@ pub fn probe_report() {
     }
 }
 
-/// Number of claimed USB HID keyboards (EHCI + xHCI).
+/// Number of claimed USB HID keyboards across every controller type.
 pub fn hid_keyboard_count() -> usize {
     let state = STATE.lock();
     state
@@ -645,9 +811,20 @@ pub fn hid_keyboard_count() -> usize {
             .iter()
             .map(|c| c.hid_keyboard_count())
             .sum::<usize>()
+        + state
+            .uhci
+            .iter()
+            .map(|c| c.hid_keyboard_count())
+            .sum::<usize>()
+        + state
+            .ohci
+            .iter()
+            .map(|c| c.hid_keyboard_count())
+            .sum::<usize>()
 }
 
-/// Number of claimed USB HID pointers (EHCI boot mice + xHCI mice/tablets).
+/// Number of claimed USB HID pointers (boot mice + tablets) across every
+/// controller type.
 pub fn hid_pointer_count() -> usize {
     let state = STATE.lock();
     state
@@ -660,12 +837,27 @@ pub fn hid_pointer_count() -> usize {
             .iter()
             .map(|c| c.hid_pointer_count())
             .sum::<usize>()
+        + state
+            .uhci
+            .iter()
+            .map(|c| c.hid_pointer_count())
+            .sum::<usize>()
+        + state
+            .ohci
+            .iter()
+            .map(|c| c.hid_pointer_count())
+            .sum::<usize>()
 }
 
-/// Number of live controllers by type (ehci, xhci).
-pub fn controller_counts() -> (usize, usize) {
+/// Number of live controllers by type (ehci, xhci, uhci, ohci).
+pub fn controller_counts() -> (usize, usize, usize, usize) {
     let state = STATE.lock();
-    (state.controllers.len(), state.xhci.len())
+    (
+        state.controllers.len(),
+        state.xhci.len(),
+        state.uhci.len(),
+        state.ohci.len(),
+    )
 }
 
 /// Polls completed USB transfers. Called from shell loop; never blocks long.
@@ -673,7 +865,10 @@ pub fn poll() {
     // Fast path: avoid locking when no controllers.
     let has_usb = {
         let state = STATE.lock();
-        state.controllers.is_empty() && state.xhci.is_empty()
+        state.controllers.is_empty()
+            && state.xhci.is_empty()
+            && state.uhci.is_empty()
+            && state.ohci.is_empty()
     };
     if has_usb {
         return;
@@ -684,6 +879,12 @@ pub fn poll() {
         ctl.poll_mice();
     }
     for ctl in state.xhci.iter_mut() {
+        ctl.poll();
+    }
+    for ctl in state.uhci.iter_mut() {
+        ctl.poll();
+    }
+    for ctl in state.ohci.iter_mut() {
         ctl.poll();
     }
     // Periodic hotplug rescan: the boot scan is one-shot, so replugged or
@@ -699,6 +900,12 @@ pub fn poll() {
                 ctl.rescan_ports();
             }
             for ctl in state.xhci.iter_mut() {
+                ctl.rescan_ports();
+            }
+            for ctl in state.uhci.iter_mut() {
+                ctl.rescan_ports();
+            }
+            for ctl in state.ohci.iter_mut() {
                 ctl.rescan_ports();
             }
         }
@@ -734,7 +941,7 @@ impl EhciController {
         if mmio_phys == 0 {
             return Err("EHCI BAR zero");
         }
-        // Fixed non-destructive mapping (caps + op + ≤16 ports); failures
+        // Fixed non-destructive mapping (caps + op + â‰¤16 ports); failures
         // return Err so the VGA "init failed" line fires instead of stalling.
         let mmio_virt = crate::drivers::pci::map_mmio_region(
             mmio_phys,
@@ -743,6 +950,16 @@ impl EhciController {
             &mut crate::memory::frame_allocator::frame_allocator(),
         )
         .ok_or("EHCI MMIO map failed")?;
+
+        // Same guard as the xHCI path: never touch a BAR window that has no
+        // page-table entry, otherwise the first CAPLENGTH read panics.
+        if !crate::drivers::pci::is_mapped(mmio_virt, phys_offset) {
+            crate::println!(
+                "[usb] EHCI {:02x}:{:02x}.{} BAR phys {:#x} window {:#x} UNMAPPED",
+                pci.bus, pci.device, pci.function, mmio_phys, mmio_virt
+            );
+            return Err("EHCI MMIO window unmapped");
+        }
 
         // Ensure PCI COMMAND memory-space enable (bit 1) so MMIO reads work.
         // Firmware normally sets it; harmless if already set.
@@ -1014,11 +1231,28 @@ impl EhciController {
         // it. A root reset that leaves CONNECTED set but ENABLED clear still
         // deserves a hub probe (QEMU has the keyboard directly on the root,
         // so ENABLED is set there). Retry once; real HW needs longer settle.
+        //
+        // Companion handling: when a UHCI/OHCI driver owns the FS/LS half of
+        // this controller, the PORTSC owner bit selects which half may drive
+        // the port. Honour it instead of clearing it, otherwise both halves
+        // reset and enable the same physical port. With no companion loaded
+        // the historical steal-the-port behavior is kept so nothing regresses.
+        let companion = companion_present();
         for attempt in 0..2 {
+            if companion && self.portsc(port) & PORT_OWNER != 0 {
+                crate::serial_println!(
+                    "[usb] EHCI port{} owned by companion (UHCI/OHCI), skipping",
+                    port
+                );
+                return false;
+            }
+
             // Power + clear owner, then reset pulse.
             let mut v = self.portsc(port);
             v |= PORT_POWER;
-            v &= !PORT_OWNER;
+            if !companion {
+                v &= !PORT_OWNER;
+            }
             // Clear change bits by writing 1s. Set them to clear.
             v |= PORT_ENABLE_CHANGE;
             self.set_portsc(port, v);
@@ -1028,7 +1262,9 @@ impl EhciController {
             let mut v = self.portsc(port);
             // Preserve power; do not set change bits on assert.
             v = (v & !PORT_CHANGE_BITS) | PORT_POWER | PORT_RESET;
-            v &= !PORT_OWNER;
+            if !companion {
+                v &= !PORT_OWNER;
+            }
             self.set_portsc(port, v);
             delay_ms(100);
             // Deassert via hardware clear: poll for reset clear.
@@ -1311,7 +1547,7 @@ impl EhciController {
             crate::println!("[usb] HID SET_PROTOCOL failed, continuing");
         }
 
-        // SET_IDLE (0, report only on change) — like the xHCI claim path;
+        // SET_IDLE (0, report only on change) â€” like the xHCI claim path;
         // continue on failure, most devices default sensibly.
         let setup_idle = setup_packet(0x21, 0x0A, 0, iface as u16, 0);
         if self
@@ -1974,6 +2210,72 @@ pub(crate) fn setup_packet(bm: u8, req: u8, value: u16, index: u16, len: u16) ->
 
 /// Walk a config descriptor for the first boot-keyboard interface with an
 /// interrupt-IN endpoint. Returns (interface, endpoint, maxpacket).
+/// Which HID report format a claimed endpoint produces. Shared by the UHCI
+/// and OHCI drivers so both decode identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamKind {
+    Keyboard,
+    BootMouse,
+    Tablet,
+}
+
+/// Routes one completed HID interrupt report into the keyboard or mouse
+/// subsystem. Shared by UHCI and OHCI so a keyboard behaves the same
+/// regardless of which companion controller claimed it.
+pub(crate) fn dispatch_report(kind: StreamKind, layout: Option<TabletLayout>, data: &[u8]) {
+    match kind {
+        StreamKind::Keyboard => {
+            if data.len() >= 8 {
+                let mut report = [0u8; 8];
+                report.copy_from_slice(&data[..8]);
+                crate::drivers::keyboard::push_usb_report(report);
+            }
+        }
+        StreamKind::BootMouse => {
+            if data.len() >= 3 {
+                let buttons = data[0];
+                let dx = data[1] as i8 as i16;
+                let dy = data[2] as i8 as i16;
+                crate::drivers::mouse::push_usb_mouse(buttons, dx, dy);
+            }
+        }
+        StreamKind::Tablet => {
+            let l = layout.unwrap_or_else(TabletLayout::qm_fallback);
+            if l.buttons_at >= data.len() || data.len() < l.x_at + 2 || data.len() < l.y_at + 2 {
+                return;
+            }
+            let buttons = data[l.buttons_at] & 0x07;
+            let x = u16::from_le_bytes([data[l.x_at], data[l.x_at + 1]]) as u32;
+            let y = u16::from_le_bytes([data[l.y_at], data[l.y_at + 1]]) as u32;
+            crate::drivers::mouse::push_usb_tablet(x, y, l.x_max, l.y_max, buttons);
+        }
+    }
+}
+
+/// Find `bInterval` for `ep_addr` in a config descriptor. Defaults to 8ms.
+///
+/// Shared by every HCD: xHCI turns it into an interval exponent, UHCI/OHCI
+/// into a frame/ED poll period. Lives here so there is one walker rather than
+/// a private copy per driver.
+pub(crate) fn hid_binterval(cfg: &[u8], ep_addr: u8) -> u8 {
+    let mut i = 0;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        let dtype = cfg[i + 1];
+        if len == 0 || i + len > cfg.len() {
+            break;
+        }
+        if dtype == 5 && len >= 7 && cfg[i + 2] == ep_addr {
+            let v = cfg[i + 6];
+            if v != 0 {
+                return v;
+            }
+        }
+        i += len;
+    }
+    8
+}
+
 pub(crate) fn find_hid_keyboard(cfg: &[u8]) -> Option<(u8, u8, u16)> {
     // Walk config descriptor for interface (9) + endpoint (7) records.
     let mut i = 0;
@@ -2009,7 +2311,7 @@ pub(crate) fn find_hid_keyboard(cfg: &[u8]) -> Option<(u8, u8, u16)> {
 /// Pointer-device kinds a single HID interrupt endpoint can serve. One
 /// xHCI slot (and one EHCI QH) carries exactly one claimed endpoint, so a
 /// composite keyboard+mouse device claims across separate interfaces only
-/// when they live on separate endpoints — the common QEMU case (usb-kbd
+/// when they live on separate endpoints â€” the common QEMU case (usb-kbd
 /// and usb-tablet are separate devices/slots).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HidPointerKind {

@@ -121,15 +121,13 @@ impl Compositor {
         }
         fb_gfx::set_draw_clip(None);
 
-        // Swap + present exactly the regions we painted. NOTE: the scene
-        // list was already drained above, so use the local copy — the
-        // scene list is empty here by design.
+        // Publish exactly the regions we painted. The scene list was drained
+        // above, so use the local copy.
         let dirty_px: Vec<(usize, usize, usize, usize)> = dirty_regions
             .iter()
             .map(|r| (r.x as usize, r.y as usize, r.w as usize, r.h as usize))
             .collect();
-        crate::drivers::fb_gfx::swap_buffers(&dirty_px);
-        crate::drivers::fb_gfx::present_to_hardware(&dirty_px);
+        crate::drivers::fb_gfx::present(&dirty_px);
 
         self.render_cycles += unsafe { core::arch::x86_64::_rdtsc() } - start_cycles;
         if self.frame_count % 120 == 0 {
@@ -194,12 +192,13 @@ impl Compositor {
             14,
             clip,
         );
-        // Launchers: Shell | Files | Drive | Settings
+        // Launchers: Shell | Files | Drive | Settings | Doom
         let launchers = [
             (scene.shell_launcher_rect(), "Shell"),
             (scene.files_launcher_rect(), "Files"),
             (scene.drive_launcher_rect(), "Drive"),
             (scene.settings_launcher_rect(), "Settings"),
+            (scene.doom_launcher_rect(), "Doom"),
         ];
         for (launcher, name) in launchers {
             self.fill_rect(
@@ -227,7 +226,7 @@ impl Compositor {
             );
         }
         // Focused/active window titles as task buttons.
-        let last_launcher = scene.settings_launcher_rect();
+        let last_launcher = scene.doom_launcher_rect();
         let mut tx = last_launcher.x as usize + last_launcher.w as usize + 12;
         for &win_id in scene.windows_z_order() {
             if let Some(win) = scene.windows.get(&win_id) {

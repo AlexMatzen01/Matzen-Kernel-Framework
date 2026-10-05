@@ -655,6 +655,17 @@ impl Scene {
         )
     }
 
+    pub fn doom_launcher_rect(&self) -> Rect {
+        let tb_h = self.theme.metrics.taskbar_height;
+        let s = self.settings_launcher_rect();
+        Rect::new(
+            s.x + s.w as i32 + 6,
+            (self.screen_bounds.h.saturating_sub(tb_h)) as i32 + 5,
+            60,
+            tb_h.saturating_sub(10),
+        )
+    }
+
     pub fn bring_to_front(&mut self, id: WindowId) {
         self.window_z_order.retain(|&wid| wid != id);
         self.window_z_order.push(id);

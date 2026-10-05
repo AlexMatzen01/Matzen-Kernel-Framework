@@ -29,6 +29,8 @@ This document lists all important files in the Matzen Kernel Framework and their
 | File | OS | Shell | Purpose |
 |------|-----|-------|---------|
 | `setup-vbox-windows.ps1` | Windows | PowerShell | Verify VirtualBox prerequisites |
+| `setup-hyperv-windows.ps1` | Windows | PowerShell | Verify Hyper-V role, switches, converters |
+| `tools/hyperv-serial.ps1` | Windows | PowerShell | Capture Hyper-V COM1 pipe to log |
 | `setup-vbox-linux.sh` | Linux | Bash | Verify VirtualBox prerequisites |
 | `setup-vbox-macos.sh` | macOS | Bash | Verify VirtualBox prerequisites |
 
@@ -48,6 +50,7 @@ This document lists all important files in the Matzen Kernel Framework and their
 | File | Purpose |
 |------|---------|
 | [VIRTUALBOX_SETUP.md](VIRTUALBOX_SETUP.md) | VirtualBox configuration and troubleshooting |
+| [HYPERV_SETUP.md](HYPERV_SETUP.md) | Hyper-V Gen2 configuration and troubleshooting |
 | [NETWORKING.md](NETWORKING.md) | Network protocol stack documentation |
 | [MIGRATION_QEMU_TO_VBOX.md](MIGRATION_QEMU_TO_VBOX.md) | Migrating from QEMU to VirtualBox |
 | [ICMP_STATUS.md](ICMP_STATUS.md) | ICMP/ping status and issues |
@@ -107,6 +110,7 @@ This document lists all important files in the Matzen Kernel Framework and their
 | `kernel/src/drivers/` | Device drivers (VGA, serial, ATA, E1000, etc.) |
 | `kernel/src/fs/` | Filesystem implementation |
 | `kernel/src/net/` | Network stack (Ethernet, ARP, IP, ICMP, UDP, TCP) |
+| `kernel/src/archive/` | Archive handling (tar + wrappers, zip, 7z, native `.mfk`) |
 | `kernel/src/shell/` | Interactive shell |
 | [tools/](tools/) | Runner tool source (`mfk-runner` crate) |
 | `tools/src/main.rs` | Runner entry point (disk image creation, VM launch) |

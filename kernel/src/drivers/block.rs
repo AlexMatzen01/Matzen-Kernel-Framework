@@ -195,3 +195,88 @@ impl BlockDevice for RamDisk {
         self.block_count
     }
 }
+
+/// In-memory block device that tallies I/O requests.
+///
+/// `RamDisk` answers a request in microseconds, so it hides algorithms whose
+/// cost is the *number* of requests rather than the work per request. Counting
+/// the requests makes such algorithms observable from tests, which is the only
+/// way to catch e.g. a filesystem that re-walks an indirect-block chain once
+/// per block and issues quadratically many reads for a large file.
+#[cfg(test)]
+pub struct CountingDisk {
+    inner: RamDisk,
+    read_requests: usize,
+    read_sectors: usize,
+    write_requests: usize,
+    write_sectors: usize,
+}
+
+#[cfg(test)]
+impl CountingDisk {
+    pub fn new(block_count: u64) -> Self {
+        Self {
+            inner: RamDisk::new(block_count),
+            read_requests: 0,
+            read_sectors: 0,
+            write_requests: 0,
+            write_sectors: 0,
+        }
+    }
+
+    pub fn reset_counters(&mut self) {
+        self.read_requests = 0;
+        self.read_sectors = 0;
+        self.write_requests = 0;
+        self.write_sectors = 0;
+    }
+
+    /// Number of `read_blocks` calls issued.
+    pub fn read_requests(&self) -> usize {
+        self.read_requests
+    }
+
+    /// Total sectors requested via `read_blocks`.
+    pub fn read_sectors(&self) -> usize {
+        self.read_sectors
+    }
+
+    /// Number of `write_blocks` calls issued.
+    pub fn write_requests(&self) -> usize {
+        self.write_requests
+    }
+
+    /// Total sectors written via `write_blocks`.
+    pub fn write_sectors(&self) -> usize {
+        self.write_sectors
+    }
+}
+
+#[cfg(test)]
+impl BlockDevice for CountingDisk {
+    fn read_blocks(
+        &mut self,
+        start_block: u64,
+        count: usize,
+        buffer: &mut [u8],
+    ) -> Result<(), &'static str> {
+        self.read_requests += 1;
+        self.read_sectors += count;
+        self.inner.read_blocks(start_block, count, buffer)
+    }
+
+    fn write_blocks(
+        &mut self,
+        start_block: u64,
+        count: usize,
+        buffer: &[u8],
+    ) -> Result<(), &'static str> {
+        self.write_requests += 1;
+        self.write_sectors += count;
+        self.inner.write_blocks(start_block, count, buffer)
+    }
+
+    fn block_count(&self) -> u64 {
+        self.inner.block_count()
+    }
+}

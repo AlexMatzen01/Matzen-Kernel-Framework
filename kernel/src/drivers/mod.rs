@@ -21,9 +21,16 @@ pub mod pit;
 pub mod pm_timer;
 pub mod rtc;
 pub mod serial;
+pub mod smbios;
 pub mod time_source;
 pub mod tsc;
 pub mod vga;
+
+#[cfg(feature = "usb")]
+pub mod ohci;
+
+#[cfg(feature = "usb")]
+pub mod uhci;
 
 #[cfg(feature = "usb")]
 pub mod usb;

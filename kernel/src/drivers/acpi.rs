@@ -134,6 +134,12 @@ fn validate_checksum(base: u64, length: u32, phys_offset: u64) -> bool {
 
 /// Searches for RSDP in EBDA and BIOS ROM area.
 fn find_rsdp(phys_offset: u64) -> Option<u64> {
+    // phys_offset == 0 means "no direct map": every low-address read would
+    // dereference a wild virtual address and page-fault the kernel.
+    if phys_offset == 0 {
+        crate::serial_println!("[acpi] find_rsdp called with phys_offset=0, refusing");
+        return None;
+    }
     // 1. EBDA (Extended BIOS Data Area) at 0x40:0x0E (physical 0x40E)
     // EBDA segment is at 0x40E, segment * 16 = physical address
     let ebda_seg = read_phys_u16(0x40E, phys_offset);

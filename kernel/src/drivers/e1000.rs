@@ -7,7 +7,7 @@
 //! Basic driver for Intel E1000 network card (commonly used in QEMU)
 
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
@@ -21,7 +21,9 @@ const REG_CTRL: u32 = 0x0000;
 const REG_STATUS: u32 = 0x0008;
 const REG_EEPROM: u32 = 0x0014;
 const REG_CTRL_EXT: u32 = 0x0018;
+const REG_ICR: u32 = 0x00C0;
 const REG_IMASK: u32 = 0x00D0;
+const REG_IMC: u32 = 0x00E0;
 const REG_RCTRL: u32 = 0x0100;
 const REG_RXDESCLO: u32 = 0x2800;
 const REG_RXDESCHI: u32 = 0x2804;
@@ -41,6 +43,37 @@ const REG_RSRPD: u32 = 0x2C00;
 
 // Control bits
 const CTRL_SLU: u32 = 0x40;
+/// CTRL.Phy Reset (bit 31). Set and cleared around link setup.
+const CTRL_PHY_RST: u32 = 1 << 31;
+
+// Interrupt Mask Set / Interrupt Cause Register bits. The two registers share a
+// bit layout, so one set of names covers reading a cause and setting a mask.
+const IMS_TXDW: u32 = 1 << 0;
+/// Transmit FIFO Underflow.
+///
+/// The card asserts this when a packet ends with data still queued in the TX
+/// FIFO, which happens whenever a packet is larger than the FIFO and the card
+/// has to be refilled mid-descriptor. It is expected here: the descriptor
+/// buffer is filled in full before the descriptor is handed over, so there is no
+/// race for the card to lose. It is masked and counted rather than ignored,
+/// because a count that grows with bytes sent means the FIFO is draining per
+/// packet, while a count that grows faster would mean a transmit-path bug.
+const IMS_TDFU: u32 = 1 << 1;
+/// Receive Descriptor minimum threshold exceeded: packets are waiting.
+const IMS_RXD: u32 = 1 << 3;
+/// Link status change. Raised on every carrier transition, so a link that is
+/// still settling produces several before data flows.
+const IMS_LINK: u32 = 1 << 4;
+/// Receive Error: a descriptor arrived with its error bits set.
+const IMS_RXC: u32 = 1 << 7;
+/// Receive Status: a descriptor arrived with status bits set.
+const IMS_RXS: u32 = 1 << 12;
+
+const IMS_RECEIVE: u32 = IMS_RXD | IMS_RXC | IMS_RXS;
+/// Everything acknowledged as expected. Any cause outside this set is counted
+/// rather than ignored, so a bit this driver does not model is visible instead of
+/// silently discarded.
+const IMS_ALL: u32 = IMS_RECEIVE | IMS_TXDW | IMS_TDFU | IMS_LINK;
 const RCTL_EN: u32 = 1 << 1;
 const RCTL_SBP: u32 = 1 << 2;
 const RCTL_UPE: u32 = 1 << 3;
@@ -141,8 +174,38 @@ impl E1000 {
         }
     }
 
+    /// Physical address for the NIC to DMA to/from.
+    ///
+    /// Returns `0` on failure rather than a plausible-looking address: the
+    /// previous version logged and then returned the *untranslated* virtual
+    /// address, handing the DMA engine a target in the middle of the kernel
+    /// image. A descriptor pointing at the wrong page corrupts memory silently;
+    /// a zero address is at least a dead ring the caller can detect.
+    ///
+    /// Translation walks the page tables (correct for any mapping), then falls
+    /// back to the direct map for heap buffers, and finally confirms the
+    /// result is reachable by the E1000's 32-bit DMA engine.
     fn dma_addr(&self, ptr: *const u8) -> u64 {
         let virt = ptr as u64;
+        let phys = self.translate(virt).unwrap_or_else(|| {
+            crate::serial_println!("[e1000] cannot translate DMA address {:#x}", virt);
+            0
+        });
+        // The E1000's descriptor engine uses 32-bit physical addresses.
+        match crate::memory::addr::dma_phys(phys) {
+            Some(p) => p,
+            None => {
+                crate::serial_println!(
+                    "[e1000] DMA phys {:#x} >= 4 GiB, descriptor engine cannot reach it",
+                    phys
+                );
+                0
+            }
+        }
+    }
+
+    /// Best-effort physical address for `virt`, with no reachability check.
+    fn translate(&self, virt: u64) -> Option<u64> {
         if self.phys_mem_offset != 0 {
             use x86_64::registers::control::Cr3;
             use x86_64::structures::paging::{OffsetPageTable, PageTable, Translate};
@@ -157,17 +220,18 @@ impl E1000 {
             let mapper =
                 unsafe { OffsetPageTable::new(page_table, VirtAddr::new(self.phys_mem_offset)) };
             if let Some(phys) = mapper.translate_addr(VirtAddr::new(virt)) {
-                return phys.as_u64();
+                return Some(phys.as_u64());
             }
         }
+        // Identity mapping (BIOS, or a low heap).
         if virt < 0x1_0000_0000 {
-            return virt;
+            return Some(virt);
         }
+        // Direct map (heap carved from the firmware map).
         if self.phys_mem_offset != 0 && virt >= self.phys_mem_offset {
-            return virt - self.phys_mem_offset;
+            return Some(virt - self.phys_mem_offset);
         }
-        crate::serial_println!("[e1000] cannot translate DMA address {:#x}", virt);
-        virt
+        None
     }
 
     fn read_eeprom(&self, addr: u8) -> u16 {
@@ -242,12 +306,24 @@ impl E1000 {
 
         // Enable transmit
         self.write_reg(REG_TCTRL, TCTL_EN | TCTL_PSP | (15 << 4) | (64 << 12));
+
+        // Start with interrupts masked: the cause register latches whatever the
+        // card saw during this sequence, and an unmasked line with a stale cause
+        // bit fires once immediately for work already handled here.
+        self.write_reg(REG_IMASK, 0);
     }
 
     pub fn mac_address(&self) -> [u8; 6] {
         self.mac_address
     }
 
+    /// Hand one frame to the card.
+    ///
+    /// Blocks until the target descriptor's DD bit is set, so the TX ring cannot
+    /// be overrun by a caller that sends faster than the link drains. With
+    /// interrupts enabled the wait could instead park until the TX interrupt,
+    /// but the pump is the only context that runs, so spinning here is what
+    /// actually makes progress.
     pub fn send_packet(&mut self, data: &[u8]) -> Result<(), &'static str> {
         if data.len() > BUFFER_SIZE {
             return Err("Packet too large");
@@ -353,6 +429,139 @@ lazy_static! {
     pub static ref E1000_DRIVER: Mutex<Option<E1000>> = Mutex::new(None);
 }
 
+/// Whether an RX interrupt has arrived and not yet been serviced.
+///
+/// The handler itself only sets this flag. Draining the ring touches the
+/// descriptor array and allocates for the packet, neither of which belongs in
+/// interrupt context: the handler can interrupt `receive_packet` mid-update and
+/// deadlock on the driver lock. The pump is the only place that takes it.
+static RX_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Counters for `netstat`, so an interrupt-driven path that silently stops
+/// delivering is distinguishable from one that was never enabled.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct E1000Stats {
+    pub interrupts: u64,
+    pub tx_interrupts: u64,
+    /// Cause bits seen that the handler did not expect.
+    pub unexpected_causes: u64,
+    /// Transmit FIFO underflows: the card ran out of data mid-packet.
+    pub tx_underflows: u64,
+    /// Ring drains that produced a packet.
+    pub notified_packets: u64,
+}
+
+// Interrupt counters are atomics rather than a locked struct: the handler runs
+// in interrupt context and must not block on a lock the pump may already hold.
+static STATS_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+static STATS_TX_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+static STATS_UNEXPECTED: AtomicU64 = AtomicU64::new(0);
+static STATS_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
+static STATS_PACKETS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the interrupt counters, for the shell.
+pub fn stats() -> E1000Stats {
+    E1000Stats {
+        interrupts: STATS_INTERRUPTS.load(Ordering::Relaxed),
+        tx_interrupts: STATS_TX_INTERRUPTS.load(Ordering::Relaxed),
+        unexpected_causes: STATS_UNEXPECTED.load(Ordering::Relaxed),
+        tx_underflows: STATS_UNDERFLOWS.load(Ordering::Relaxed),
+        notified_packets: STATS_PACKETS.load(Ordering::Relaxed),
+    }
+}
+
+/// Take and clear the pending-RX flag.
+pub fn take_rx_pending() -> bool {
+    RX_PENDING.swap(false, Ordering::AcqRel)
+}
+
+/// True when an RX interrupt is waiting to be serviced.
+pub fn rx_pending() -> bool {
+    RX_PENDING.load(Ordering::Acquire)
+}
+
+/// Acknowledge and mask all interrupts, leaving the driver polling-only.
+///
+/// Used by the test path and as the recovery when a handler is not wired up.
+pub fn disable_interrupts() {
+    if let Some(d) = E1000_DRIVER.lock().as_ref() {
+        d.write_reg(REG_IMC, IMS_ALL);
+        d.write_reg(REG_IMASK, 0);
+    }
+    RX_PENDING.store(false, Ordering::Release);
+}
+
+/// Masked cause bits from the last interrupt, for diagnostics.
+static LAST_CAUSE: AtomicUsize = AtomicUsize::new(0);
+
+/// Cause bits from the most recent interrupt.
+pub fn last_cause() -> u32 {
+    LAST_CAUSE.load(Ordering::Relaxed) as u32
+}
+
+/// Service one interrupt.
+///
+/// Uses no lock of any kind. Taking `E1000_DRIVER` here would deadlock: on a
+/// uniprocessor the interrupt can arrive while the pump already holds that spin
+/// lock inside `receive_packet`, and the handler would spin forever waiting for
+/// a lock its own interrupt preempts. The MMIO window and the counters are
+/// therefore plain atomics, published during `init`.
+///
+/// Reads ICR, which clears the latched cause and lets the line deassert, then
+/// records the cause and flags receive work for the pump. Doing the ring walk
+/// here instead would allocate in interrupt context and hit the same lock.
+pub fn handle_interrupt() {
+    let base = MMIO_BASE.load(Ordering::Relaxed);
+    let cause = if base == 0 {
+        0
+    } else {
+        // SAFETY: the address was published by `init` from a BAR0 the driver
+        // already holds, and only this handler and `init` ever read it here.
+        unsafe { core::ptr::read_volatile((base + REG_ICR as usize) as *const u32) }
+    };
+    LAST_CAUSE.store(cause as usize, Ordering::Relaxed);
+
+    if cause != 0 {
+        STATS_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+        if cause & IMS_TXDW != 0 {
+            STATS_TX_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+        }
+        if cause & IMS_TDFU != 0 {
+            STATS_UNDERFLOWS.fetch_add(1, Ordering::Relaxed);
+        }
+        if cause & !(IMS_ALL) != 0 {
+            STATS_UNEXPECTED.fetch_add(1, Ordering::Relaxed);
+        }
+        if cause & IMS_RECEIVE != 0 {
+            RX_PENDING.store(true, Ordering::Release);
+        }
+    }
+
+    // A spurious interrupt can arrive with no cause set; it still has to be
+    // acknowledged or the line stays asserted.
+    unsafe {
+        crate::pic::PICS
+            .lock()
+            .notify_end_of_interrupt(PIC_VECTOR.load(Ordering::Relaxed) as u8);
+    }
+}
+
+/// MMIO window base, published by `init` so the interrupt handler can reach the
+/// registers without taking the driver lock.
+static MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// PIC interrupt vector this device was assigned, or `0` when interrupts are
+/// not in use.
+static PIC_VECTOR: AtomicUsize = AtomicUsize::new(0);
+
+/// The PIC vector this device interrupts on, if interrupts are enabled.
+pub fn interrupt_vector() -> Option<usize> {
+    match PIC_VECTOR.load(Ordering::Relaxed) {
+        0 => None,
+        v => Some(v),
+    }
+}
+
 pub fn init(phys_mem_offset: u64) -> Result<(), &'static str> {
     crate::serial_println!("E1000: Starting initialization...");
 
@@ -387,6 +596,31 @@ pub fn init(phys_mem_offset: u64) -> Result<(), &'static str> {
     let virt_base = (phys_mem_offset + mem_base) as usize;
     crate::serial_println!("  Virtual memory base: {:#x}", virt_base);
 
+    // Published before the card is enabled, so the interrupt handler can reach
+    // the registers from the moment the first interrupt can arrive.
+    MMIO_BASE.store(virt_base, Ordering::Release);
+
+    let driver = E1000::new(virt_base, phys_mem_offset);
+    let mac = driver.mac_address();
+    if mac == [0; 6] {
+        return Err("E1000 EEPROM did not return a MAC address");
+    }
+
+    crate::serial_println!("E1000 initialized");
+    crate::serial_println!(
+        "  MAC Address: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5]
+    );
+
+    // Only a handful of lines have a handler installed, so a card placed anywhere
+    // else keeps polling: unmasking its cause register with no vector behind it
+    // would leave the PIC's interrupt stuck asserted.
+    let irq = pci_dev.interrupt_pin_line().map(|(_, line)| line);
     let driver = E1000::new(virt_base, phys_mem_offset);
     let mac = driver.mac_address();
     if mac == [0; 6] {
@@ -405,6 +639,37 @@ pub fn init(phys_mem_offset: u64) -> Result<(), &'static str> {
     );
 
     *E1000_DRIVER.lock() = Some(driver);
+
+    crate::serial_println!(
+        "  PCI interrupt pin {} line {}",
+        pci_dev.interrupt_pin_line().map(|p| p.0).unwrap_or(0),
+        irq.unwrap_or(0)
+    );
+
+    match irq {
+        Some(irq) if crate::interrupts::is_nic_irq(irq) => {
+            let vector = crate::interrupts::PIC_BASE as usize + irq as usize;
+            {
+                let driver = E1000_DRIVER.lock();
+                if let Some(d) = driver.as_ref() {
+                    d.write_reg(REG_IMASK, IMS_ALL);
+                }
+            }
+            PIC_VECTOR.store(vector, Ordering::Release);
+            unsafe {
+                crate::pic::PICS.lock().set_mask(irq, false);
+            }
+            crate::serial_println!("  IRQ {} (vector {}), interrupts enabled", irq, vector);
+        }
+        Some(irq) => {
+            crate::serial_println!(
+                "  IRQ {} has no installed handler, staying in polling mode",
+                irq
+            );
+        }
+        None => crate::serial_println!("  No INTx line assigned, polling"),
+    }
+
     Ok(())
 }
 
@@ -420,7 +685,11 @@ pub fn send_packet(data: &[u8]) -> Result<(), &'static str> {
 pub fn receive_packet() -> Option<Vec<u8>> {
     let mut driver = E1000_DRIVER.lock();
     if let Some(ref mut d) = *driver {
-        d.receive_packet()
+        let packet = d.receive_packet();
+        if packet.is_some() {
+            STATS_PACKETS.fetch_add(1, Ordering::Relaxed);
+        }
+        packet
     } else {
         None
     }

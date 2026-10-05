@@ -1,6 +1,6 @@
 # Matzen Kernel Framework (MFK)
 
-A small educational terminal OS written in Rust for x86_64. MFK contains a tiny kernel (`mfk-kernel`) with VGA driver, PS/2 keyboard support, ATA disk driver, filesystem, networking (E1000), and a built-in shell. The `mfk-runner` tool builds bootable disk images and runs them in **VirtualBox** (or optionally QEMU).
+A small educational terminal OS written in Rust for x86_64. MFK contains a tiny kernel (`mfk-kernel`) with VGA driver, PS/2 and USB HID keyboard support (EHCI/xHCI/UHCI/OHCI), ATA disk driver, filesystem, networking (E1000), and a built-in shell. The `mfk-runner` tool builds bootable disk images and runs them in **VirtualBox** (or optionally QEMU).
 
 **Status:** active development — use for experimentation and learning.
 
@@ -11,7 +11,7 @@ A small educational terminal OS written in Rust for x86_64. MFK contains a tiny 
 
 ## Features
 - VGA text mode output
-- PS/2 keyboard input
+- PS/2 keyboard input, plus USB HID keyboards via EHCI, xHCI, UHCI or OHCI
 - ATA PIO disk driver
 - SimplFS filesystem (custom implementation)
 - Intel E1000 network driver
@@ -38,6 +38,7 @@ A small educational terminal OS written in Rust for x86_64. MFK contains a tiny 
 - Rust (nightly) and build tools
 - **VirtualBox** (default hypervisor, provides unrestricted networking)
   - Alternative: QEMU (use `./run.sh --qemu`)
+  - Windows opt-in: Hyper-V Gen2/UEFI (use `.\run.ps1 --hyperv --uefi`, see `HYPERV_SETUP.md`)
 
 ### Installation by Platform
 
@@ -153,7 +154,14 @@ VirtualBox is the default for better networking support. To use QEMU:
 ./run.sh --qemu
 ```
 
-Both use the same kernel binary and disk images.
+To use Hyper-V on Windows (Gen2/UEFI, opt-in):
+
+```powershell
+.\setup-hyperv-windows.ps1  # as Administrator
+.\run.ps1 --hyperv --uefi
+```
+
+See [HYPERV_SETUP.md](HYPERV_SETUP.md). Both use the same kernel binary and disk images.
 
 ## Manual Build Steps
 

@@ -69,8 +69,8 @@ foreach ($component in $componentsToAdd) {
 }
 Write-Host ""
 
-# Step 4: Verify VirtualBox (recommended)
-Write-Host "[Bonus] Checking VirtualBox installation..." -ForegroundColor Yellow
+# Step 4: Verify hypervisors (VirtualBox recommended, Hyper-V optional)
+Write-Host "[Bonus] Checking hypervisor tools..." -ForegroundColor Yellow
 
 $vboxCheck = & VBoxManage --version 2>$null
 if ($LASTEXITCODE -eq 0) {
@@ -81,6 +81,24 @@ else {
     Write-Host "  Install from: https://www.virtualbox.org/wiki/Downloads" -ForegroundColor Gray
     Write-Host "  Or use Chocolatey:"
     Write-Host "    choco install virtualbox"
+}
+
+# Hyper-V is opt-in on Windows (Gen2/UEFI). Detailed check: .\setup-hyperv-windows.ps1
+$hypervModule = Get-Module -ListAvailable -Name Hyper-V
+if ($hypervModule) {
+    Write-Host "✓ Hyper-V PowerShell module present (opt-in: .\run.ps1 --hyperv --uefi)" -ForegroundColor Green
+    Write-Host "  Full check: .\setup-hyperv-windows.ps1 (run as Administrator)" -ForegroundColor Gray
+}
+else {
+    Write-Host "ℹ Hyper-V module not found (optional; needed only for --hyperv)" -ForegroundColor Gray
+    Write-Host "  Enable: OptionalFeatures.exe -> Hyper-V, then reboot" -ForegroundColor Gray
+}
+$qemuImg = Get-Command qemu-img -ErrorAction SilentlyContinue
+if ($qemuImg) {
+    Write-Host "✓ qemu-img found (used for Hyper-V raw->VHDX conversion)" -ForegroundColor Green
+}
+else {
+    Write-Host "ℹ qemu-img not found (optional; Hyper-V falls back to Convert-VHD)" -ForegroundColor Gray
 }
 Write-Host ""
 

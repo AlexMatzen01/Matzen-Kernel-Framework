@@ -104,6 +104,10 @@ pub fn probe(phys_mem_offset: u64) {
             crate::serial_println!("[nvidia] BAR0 mapping failed");
             continue;
         };
+        if !crate::drivers::pci::is_mapped(virt, phys_mem_offset) {
+            crate::serial_println!("[nvidia] BAR0 window {:#x} unmapped", virt);
+            continue;
+        }
 
         print_boot_registers(virt);
     }

@@ -47,7 +47,7 @@ Purpose: get an AI coding agent productive quickly in this repo. Focus on concre
   - **Known issue:** QEMU's user-mode networking has limited ICMP support. Ping may not receive replies due to SLIRP limitations, not kernel bugs. Use TAP networking for proper ICMP testing (see `ICMP_STATUS.md`).
 
 - **Tests & manual checks:**
-  - There are no automated unit tests for the kernel; use `test_commands.txt` for manual shell smoke tests (filesystem, network commands).
+  - The kernel has automated unit tests: `cargo test -p mfk-kernel` runs them on the host (the crate is `no_std` only when not under `cfg(test)`). Tests live in a `#[cfg(test)] mod tests` block at the bottom of the file they cover, use descriptive `snake_case` names without a `test_` prefix, and `RamDisk`/`CountingDisk` in `drivers/block.rs` as the backing store. Add tests alongside new logic. `test_commands.txt` remains useful for manual shell smoke tests.
   - Run the built image in QEMU via the runner to exercise changes end-to-end.
 
 - **When editing build config / targets:**

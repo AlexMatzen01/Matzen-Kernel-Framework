@@ -26,14 +26,13 @@ pub(crate) fn interrupted() -> bool {
     crate::shell::is_interrupted()
 }
 
-pub(crate) fn pump() {
-    crate::net::process_packets();
-    // Keep deadlines progressing even on machines without a working IRQ0.
-    crate::shell::increment_tick();
-    for _ in 0..2000 {
-        core::hint::spin_loop();
-    }
-}
+/// Re-export of [`crate::net::pump`].
+///
+/// This used to be defined here, and TCP called back into it to make progress
+/// while its send buffer was full — so the dependency ran `tcp -> http -> tcp`.
+/// The scheduler belongs to the stack rather than to HTTP, so it moved to
+/// `net`; this alias keeps the existing call sites compiling.
+pub(crate) use crate::net::pump;
 
 pub(crate) fn parse_ipv4(value: &str) -> Option<[u8; 4]> {
     let mut ip = [0u8; 4];

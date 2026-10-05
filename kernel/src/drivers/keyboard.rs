@@ -78,6 +78,38 @@ impl KeyEvent {
     }
 }
 
+// ── Key event tracing (diagnostic) ────────────────────────
+
+/// Set to `true` to trace every key event on the serial console.
+///
+/// Currently on so the arrow/backspace/enter loss can be pinned to a layer.
+/// Turn it back to `false` once you have the log: each line is a blocking
+/// write at 115200 baud, while USB reports are drained only once per
+/// shell/desktop/editor loop iteration, so tracing fast input can overflow the
+/// xHCI event ring and swallow the very reports under investigation.
+pub const KEY_TRACE: bool = true;
+
+/// Traces a raw byte buffer as hex. Allocation-free so it is safe from an
+/// interrupt handler.
+pub fn trace_raw(tag: &str, bytes: &[u8]) {
+    if !KEY_TRACE {
+        return;
+    }
+    crate::serial_print!("[key] {} =", tag);
+    for b in bytes {
+        crate::serial_print!(" {:02x}", b);
+    }
+    crate::serial_println!();
+}
+
+/// Traces a single decoded key, tagged with the source that produced it.
+pub fn trace_key(src: &str, key: Key) {
+    if !KEY_TRACE {
+        return;
+    }
+    crate::serial_println!("[key] {} -> {:?}", src, key);
+}
+
 // ── Internal circular buffer for KeyEvent ─────────────────
 
 struct KeyboardBuffer {
@@ -257,15 +289,30 @@ pub fn init() {
     let mut data_port: Port<u8> = Port::new(0x60);
     let mut status_port: Port<u8> = Port::new(0x64);
 
-    while unsafe { status_port.read() } & 0x01 != 0 {
+    // Drain stale controller output, but bound the loop: on machines
+    // with no PS/2 port the status register reads 0xFF (bit0 always set),
+    // which used to spin here forever and hang boot.
+    for _ in 0..32 {
+        let status = unsafe { status_port.read() };
+        if status == 0xFF || status & 0x01 == 0 {
+            break;
+        }
         unsafe { data_port.read() };
     }
 
     serial_println!("Keyboard driver initialized (serial + PS/2, KeyEvent mode)");
 }
 
+/// Pushes a decoded PS/2 event to the buffer, tracing it when `KEY_TRACE` is
+/// on. Every PS/2 push site goes through here so the trace cannot miss one.
+fn push_traced(buffer: &mut KeyboardBuffer, ev: KeyEvent) {
+    trace_key("ps2", ev.key);
+    let _ = buffer.push(ev);
+}
+
 /// Called by PS/2 keyboard interrupt handler when a scancode arrives
 pub fn handle_interrupt(scancode: u8) {
+    trace_raw("ps2 sc", &[scancode]);
     let mut keyboard = KEYBOARD.lock();
 
     // We need to track modifier state ourselves by inspecting raw scancodes.
@@ -303,7 +350,7 @@ pub fn handle_interrupt(scancode: u8) {
                         if ctrl_char == 'C' {
                             crate::shell::request_interrupt();
                         }
-                        let _ = buffer.push(KeyEvent {
+                        push_traced(&mut buffer, KeyEvent {
                             key: Key::Ctrl(ctrl_char),
                             shift: mods.shift,
                             alt: mods.alt,
@@ -317,7 +364,7 @@ pub fn handle_interrupt(scancode: u8) {
                             if ctrl_char == 'C' {
                                 crate::shell::request_interrupt();
                             }
-                            let _ = buffer.push(KeyEvent {
+                            push_traced(&mut buffer, KeyEvent {
                                 key: Key::Ctrl(ctrl_char),
                                 shift: mods.shift,
                                 alt: mods.alt,
@@ -327,7 +374,7 @@ pub fn handle_interrupt(scancode: u8) {
                             // e.g., Enter already handled via RawKey; but handle \r \n, Backspace, etc.
                             match character {
                                 '\n' | '\r' => {
-                                    let _ = buffer.push(KeyEvent {
+                                    push_traced(&mut buffer, KeyEvent {
                                         key: Key::Enter,
                                         shift: mods.shift,
                                         alt: mods.alt,
@@ -335,7 +382,7 @@ pub fn handle_interrupt(scancode: u8) {
                                     });
                                 }
                                 '\x08' | '\x7f' => {
-                                    let _ = buffer.push(KeyEvent {
+                                    push_traced(&mut buffer, KeyEvent {
                                         key: Key::Backspace,
                                         shift: mods.shift,
                                         alt: mods.alt,
@@ -343,7 +390,7 @@ pub fn handle_interrupt(scancode: u8) {
                                     });
                                 }
                                 '\x09' => {
-                                    let _ = buffer.push(KeyEvent {
+                                    push_traced(&mut buffer, KeyEvent {
                                         key: Key::Tab,
                                         shift: mods.shift,
                                         alt: mods.alt,
@@ -351,7 +398,7 @@ pub fn handle_interrupt(scancode: u8) {
                                     });
                                 }
                                 '\x1b' => {
-                                    let _ = buffer.push(KeyEvent {
+                                    push_traced(&mut buffer, KeyEvent {
                                         key: Key::Esc,
                                         shift: mods.shift,
                                         alt: mods.alt,
@@ -359,7 +406,7 @@ pub fn handle_interrupt(scancode: u8) {
                                     });
                                 }
                                 _ => {
-                                    let _ = buffer.push(KeyEvent {
+                                    push_traced(&mut buffer, KeyEvent {
                                         key: Key::Char(character),
                                         shift: mods.shift,
                                         alt: mods.alt,
@@ -370,7 +417,7 @@ pub fn handle_interrupt(scancode: u8) {
                         }
                     } else {
                         // Regular char – if alt held, mark alt
-                        let _ = buffer.push(KeyEvent {
+                        push_traced(&mut buffer, KeyEvent {
                             key: Key::Char(character),
                             shift: mods.shift,
                             alt: mods.alt,
@@ -382,7 +429,7 @@ pub fn handle_interrupt(scancode: u8) {
                     // Check modifier-only keys already handled above – ignore extra
                     if let Some(k) = map_keycode(keycode) {
                         let mut buffer = BUFFER.lock();
-                        let _ = buffer.push(KeyEvent {
+                        push_traced(&mut buffer, KeyEvent {
                             key: k,
                             shift: mods.shift,
                             alt: mods.alt,
@@ -598,6 +645,10 @@ pub fn push_usb_report(report: [u8; 8]) {
     let ctrl = modifier & 0x11 != 0;
     let alt = modifier & 0x44 != 0;
 
+    // Trace before any filtering, so a report that never arrived can be told
+    // apart from one that arrived and was then suppressed below.
+    trace_raw("usb raw", &report);
+
     interrupts::without_interrupts(|| {
         let mut last = LAST_HID_REPORT.lock();
         let mut buf = BUFFER.lock();
@@ -606,6 +657,7 @@ pub fn push_usb_report(report: [u8; 8]) {
                 continue; // empty slot / error rollover
             }
             if last[2..].contains(&usage) {
+                trace_raw("usb suppress", &[usage]);
                 continue; // held key: no repeat event
             }
             let ev = if let Some((plain, shifted)) = hid_to_ascii(usage) {
@@ -626,11 +678,13 @@ pub fn push_usb_report(report: [u8; 8]) {
                 ev.ctrl = ctrl;
                 ev
             } else {
+                trace_raw("usb unmapped", &[usage]);
                 continue;
             };
             if matches!(ev.key, Key::Ctrl('C')) {
                 crate::shell::request_interrupt();
             }
+            trace_key("usb", ev.key);
             let _ = buf.push(ev);
         }
         *last = report;

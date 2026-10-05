@@ -131,6 +131,21 @@ Devices → PIC → IRQ → CPU
 - IRQ 5 → Vector 37 (Parallel port)
 - IRQ 6 → Vector 38 (Floppy disk)
 - IRQ 7 → Vector 39 (Parallel port)
+- IRQ 8 → Vector 40 (RTC)
+- IRQ 9 → Vector 41 (ACPI/IRQ sharing)
+- IRQ 10 → Vector 42 (E1000)
+- IRQ 11 → Vector 43 (E1000, QEMU `pc` default)
+- IRQ 12 → Vector 44 (PS/2 mouse)
+- IRQ 13 → Vector 45 (Coprocessor error)
+- IRQ 14 → Vector 46 (Primary ATA)
+- IRQ 15 → Vector 47 (Secondary ATA)
+
+The constants live in `interrupts.rs` (`IRQ_TIMER`, `IRQ_KEYBOARD`, `IRQ_COM1`,
+`IRQ_MOUSE`, `NIC_IRQ_LINES`) and the vectors in `InterruptIndex`. Each vector
+has a fixed handler function, because an `x86-interrupt` function cannot take a
+runtime argument. Vectors with no device attached still get one: it sends the
+EOI and returns, so a masked line that somehow fires cannot escalate into a
+fault or re-trigger forever.
 
 ### PIC Initialization
 
@@ -202,6 +217,27 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
     }
 }
 ```
+
+### What a handler may and may not do
+
+A handler runs with interrupts masked and can interrupt the code that raised the
+interrupt. Two consequences shape every handler in this kernel:
+
+- **Do not take a spin lock that the interrupted code might already hold.** The
+  E1000 handler is the clearest case: it cannot take the driver lock, because on
+  a uniprocessor it would be waiting for `receive_packet` — the very code it
+  interrupted — to release it. It reaches the card's registers through a
+  published MMIO base and its counters through atomics, then sets a flag for the
+  pump to act on.
+- **Do not allocate.** The heap allocator takes a lock for the same reason, and
+  an allocation in interrupt context is unbounded work under interrupts masked.
+
+The E1000 handler therefore acknowledges, records, and flags. Copying frames out
+of descriptors happens in `net::process_packets`, in ordinary context, where
+taking the driver lock is correct.
+
+A spurious interrupt arrives with no cause set. It still has to be acknowledged,
+so the EOI is sent unconditionally rather than only when work was found.
 
 ## Interrupt Flow
 

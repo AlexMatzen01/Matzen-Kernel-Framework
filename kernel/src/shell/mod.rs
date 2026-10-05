@@ -1,4 +1,4 @@
-//! Copyright (c) Alexander Matzen. All rights reserved.
+﻿//! Copyright (c) Alexander Matzen. All rights reserved.
 //! Author: Alexander Matzen
 //! Licensed under the MIT license.
 
@@ -9,7 +9,7 @@
 use crate::drivers::keyboard::Key;
 use crate::drivers::{keyboard, vga};
 use crate::{print, println};
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
@@ -40,6 +40,7 @@ const BUILTINS: &[&str] = &[
     "diskinfo",
     "mkfs",
     "mount",
+    "fsck",
     "ls",
     "dir",
     "touch",
@@ -51,6 +52,7 @@ const BUILTINS: &[&str] = &[
     "cd",
     "pwd",
     "ifconfig",
+    "dhcp",
     "ping",
     "netstat",
     "tcpconnect",
@@ -66,6 +68,8 @@ const BUILTINS: &[&str] = &[
     "ps",
     "appinfo",
     "desktop",
+    "doominfo",
+    "doom",
     "install",
     "usb",
     "mouse",
@@ -73,6 +77,7 @@ const BUILTINS: &[&str] = &[
     "arp",
     "udp-send",
     "udp-recv",
+    "udp-ping",
     "wget",
     "speedtest",
     "speedtest-server",
@@ -80,6 +85,12 @@ const BUILTINS: &[&str] = &[
     "tlsinfo",
     "tcpstatus",
     "tcprecv",
+    "tcpsockets",
+    "tar",
+    "zip",
+    "unzip",
+    "7z",
+    "mfk",
 ];
 
 /// Shell prompt string (dynamic in code, fallback)
@@ -292,6 +303,7 @@ pub fn execute_command(cmd: &str) -> bool {
         "diskinfo" => cmd_diskinfo(parts.1),
         "mkfs" => cmd_mkfs(parts.1),
         "mount" => cmd_mount(parts.1),
+        "fsck" => cmd_fsck(parts.1),
         "ls" | "dir" => cmd_ls(parts.1),
         "touch" => cmd_touch(parts.1),
         "cat" => cmd_cat(parts.1),
@@ -301,13 +313,20 @@ pub fn execute_command(cmd: &str) -> bool {
         "rmdir" => cmd_rmdir(parts.1),
         "cd" => cmd_cd(parts.1),
         "pwd" => cmd_pwd(),
+        "tar" => cmd_tar(parts.1),
+        "zip" => cmd_zip(parts.1),
+        "unzip" => cmd_unzip(parts.1),
+        "7z" | "7za" => cmd_7z(parts.1),
+        "mfk" => cmd_mfk(parts.1),
         "ifconfig" => cmd_ifconfig(parts.1),
+        "dhcp" => cmd_dhcp(parts.1),
         "ping" => cmd_ping(parts.1),
         "netstat" => cmd_netstat(parts.1),
         "dns" => cmd_dns(parts.1),
         "arp" => cmd_arp(parts.1),
         "udp-send" => cmd_udp_send(parts.1),
         "udp-recv" => cmd_udp_recv(parts.1),
+        "udp-ping" => cmd_udp_ping(parts.1),
         "wget" => crate::net::wget::cmd_run(parts.1),
         "speedtest" => crate::net::speedtest::cmd_run(parts.1),
         "speedtest-server" => crate::net::speedtest::cmd_server(parts.1),
@@ -318,6 +337,7 @@ pub fn execute_command(cmd: &str) -> bool {
         "tcpclose" => cmd_tcpclose(parts.1),
         "tcpstatus" => cmd_tcpstatus(parts.1),
         "tcprecv" => cmd_tcprecv(parts.1),
+        "tcpsockets" => cmd_tcpsockets(parts.1),
         "nano" | "edit" | "mfkedit" => cmd_edit(parts.1),
         "run" | "exec" => cmd_run(parts.1),
         "mkapp" => cmd_mkapp(parts.1),
@@ -331,6 +351,8 @@ pub fn execute_command(cmd: &str) -> bool {
                 cmd_desktop();
             }
         }
+        "doominfo" => cmd_doominfo(parts.1),
+        "doom" => cmd_doom(parts.1),
         "install" => cmd_install(parts.1),
         "usb" => cmd_usb(),
         "mouse" => cmd_mouse(),
@@ -369,6 +391,8 @@ fn cmd_help() {
     println!("  diskinfo [--rescan] - Display all drives (0-3 ATA, 4+ virtio-blk)");
     println!("  mkfs [drive] [--yes] - Format drive with SimplFS (default drive 1)");
     println!("  mount [drive] - Mount drive filesystem (default drive 1)");
+    println!("  fsck [-v]   - Check filesystem consistency (read-only)");
+    println!("  fsck [-v]   - Check filesystem consistency (read-only)");
     println!("  ls/dir [path] - List files (e.g., 'ls', 'ls /docs')");
     println!("  touch     - Create a new file (e.g., 'touch test.txt', 'touch dir/file.txt')");
     println!("  cat       - Display file contents (e.g., 'cat test.txt')");
@@ -378,6 +402,18 @@ fn cmd_help() {
     println!("  rmdir     - Remove empty directory (e.g., 'rmdir docs')");
     println!("  cd        - Change directory (e.g., 'cd docs', 'cd ..', 'cd /')");
     println!("  pwd       - Print working directory");
+    println!();
+    println!("Archive Commands:");
+    println!("  tar       - Create/list/extract tarballs (e.g., 'tar -cvf a.tar.gz docs')");
+    println!("             Read: .tar .gz .bz2 .xz .lz4 .zst .lz .lzma .Z (one wrapper)");
+    println!("             Write: all but .bz2 and .Z; -z/-J force gzip/xz");
+    println!("  zip       - Create a zip archive (e.g., 'zip -v a.zip docs')");
+    println!("  unzip     - List/extract a zip (e.g., 'unzip -lv a.zip -d out')");
+    println!("  7z        - 7-Zip archives (e.g., '7z a -v a.7z docs', '7z x a.7z -oout')");
+    println!("             Stored/LZMA/LZMA2; 'l' lists, 't' tests, 'x' extracts");
+    println!("  mfk       - Native .mfk archives (e.g., 'mfk c -v a.mfk docs')");
+    println!("             Per-member CRC32; 'l' lists, 't' tests, 'x' extracts");
+    println!("  All of the above take -v, plus operands to pick individual members");
     println!();
     println!("Editor Commands (nano-like):");
     println!("  nano/edit  - Text editor (e.g., 'nano file.txt', 'edit --help')");
@@ -394,10 +430,16 @@ fn cmd_help() {
     println!("  writehex      - Write binary from hex (e.g., 'writehex /tmp/a.bin 4D464B45...')");
     println!("  appinfo       - Show app file info (e.g., 'appinfo /apps/hello.mfke')");
     println!("  ps            - Show process status (Phase 1: cooperative)");
+    println!("  doominfo      - Inspect Doom WAD (e.g., 'doominfo /wad/doom1.wad')");
+    println!("  doom          - Play Doom (e.g., 'doom', 'doom run', 'doom /wad/doom2.wad')");
     println!();
     println!("Network Commands:");
     println!("  ifconfig     - Show/configure address [netmask] [gateway]");
     println!("                 e.g. ifconfig 10.0.2.15 255.255.255.0 10.0.2.2");
+    println!("  dhcp         - Obtain an address from a DHCP server [start|status]");
+    println!("  udp-send     - Send a UDP datagram, e.g. 'udp-send 10.0.2.2 49153 5555 <text>'");
+    println!("                 a payload over the link MTU is fragmented by IPv4");
+    println!("  udp-recv     - Receive a queued datagram: 'udp-recv <port> [count]'");
     println!("  ping         - Ping IPv4 address or hostname (e.g., 'ping example.com 4')");
     println!("  dns          - Resolve IPv4 hostname (e.g., 'dns example.com')");
     println!("  arp          - Show cache or resolve IPv4 (e.g., 'arp 10.0.2.2')");
@@ -458,17 +500,345 @@ fn cmd_uptime() {
     println!("({} ms)", ticks);
 }
 
+/// Check filesystem consistency (read-only)
+fn cmd_fsck(args: &str) {
+    let verbose = args.trim() == "-v" || args.trim() == "--verbose";
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    let mut device = mounted_device();
+    if let Some(ref mut fs) = *fs_guard {
+        match fs.check(&mut device) {
+            Ok(report) => {
+                if verbose {
+                    println!("Filesystem check (drive {}):", mounted_drive());
+                    println!(
+                        "  Total blocks:   {} ({} data, first at LBA {})",
+                        report.total_blocks, report.data_blocks, report.data_block_start
+                    );
+                    println!(
+                        "  Bitmap:         LBA {}, {} block(s)",
+                        report.bitmap_start, report.bitmap_blocks
+                    );
+                    println!(
+                        "  Inodes:         {} in use across {} block(s)",
+                        report.inode_count, report.inode_blocks
+                    );
+                    println!(
+                        "  Free blocks:    {} reported, {} in bitmap",
+                        report.free_blocks, report.bitmap_free
+                    );
+                    println!();
+                }
+                println!("  Geometry:       {}", verdict(report.geometry_errors, "ok", "inconsistent"));
+                println!("  Block counts:   {}", verdict(report.count_errors, "consistent", "bitmap disagrees with superblock"));
+                println!("  Block pointers: {}", verdict(report.bad_block_refs, "all in range", "outside the data region"));
+                println!("  Indirect chains: {}", verdict(report.chain_cycles, "all terminate", "cyclic or unterminated"));
+                println!("  Dir entries:    {}", verdict(report.dangling_entries, "all resolve", "dangling"));
+                println!("  Space refs:     {}", verdict(report.missing_refs, "all accounted", "referenced but marked free"));
+                println!("  Leaked space:   {}", verdict(report.orphan_blocks, "none", "allocated but unreferenced"));
+                println!();
+                if report.is_clean {
+                    println!("Filesystem is clean.");
+                } else {
+                    println!(
+                        "Found {} problem(s). The check is read-only; nothing was modified.",
+                        report.problem_count()
+                    );
+                    println!("Rebuilding the image with 'mkfs' and re-copying data is the safe fix.");
+                }
+            }
+            Err(e) => println!("fsck: failed: {}", e),
+        }
+    }
+}
+
+/// `ok` when `count` is zero, otherwise `problem` plus the count.
+fn verdict(count: usize, ok: &str, problem: &str) -> alloc::string::String {
+    if count == 0 {
+        alloc::format!("{}", ok)
+    } else {
+        alloc::format!("{} - {} x {}", problem, count, problem)
+    }
+}
+
 /// Displays memory information
+///
+/// Everything printed here is read from live state: the interpreted firmware
+/// map (`sysinfo::memory_layout`), the heap accounting in `allocator`, and the
+/// frame allocator's counters. The previous version printed a fixed 1994-era
+/// 640 KB/384 KB/ROM map that matches no real machine â€” `docs/reference/
+/// shell-commands.md` still reproduced it verbatim.
 fn cmd_memory() {
+    let summary = crate::sysinfo::memory_summary_opt().unwrap_or_default();
+    let heap = crate::allocator::heap_info();
+    let frames = crate::memory::frame_allocator::stats();
+
     println!("Memory Information:");
-    println!("  VGA Buffer:    0xB8000 (4 KB)");
-    println!("  Kernel loaded: 0x100000 (varies)");
+    println!(
+        "  Allocatable:  {} after kernel-owned reservations",
+        human_bytes(summary.allocatable_bytes)
+    );
+    println!(
+        "  Firmware map: {} described across {} region(s){}",
+        human_bytes(summary.total_bytes),
+        summary.region_count,
+        if summary.truncated { " (list truncated)" } else { "" }
+    );
+    // Per-class byte totals. A firmware map routinely contains a PCI MMIO hole
+    // covering most of the upper address space, reported with an unspecified
+    // type, so without this breakdown the map total cannot be reconciled with
+    // the allocatable figure â€” and "total RAM" would be a fiction.
+    let layout = crate::sysinfo::memory_layout();
+    if let Some(l) = layout.as_ref() {
+        let classes = l.by_class.non_empty();
+        if classes.len() > 1 {
+            for (class, bytes) in classes {
+                println!(
+                    "    {:<14} {:>10}  {:.1}%",
+                    class.label(),
+                    human_bytes(bytes),
+                    if l.total_bytes == 0 {
+                        0.0
+                    } else {
+                        (bytes as f64) * 100.0 / (l.total_bytes as f64)
+                    }
+                );
+            }
+        }
+    }
+    if summary.usable_low_bytes > 0 || summary.usable_high_bytes > 0 {
+        println!(
+            "  DMA reach:    {} below 4 GiB, {} above (32-bit controllers)",
+            human_bytes(summary.usable_low_bytes),
+            human_bytes(summary.usable_high_bytes)
+        );
+    }
     println!();
-    println!("Memory Layout:");
-    println!("  0x00000000 - 0x0009FFFF: Conventional Memory (640 KB)");
-    println!("  0x000A0000 - 0x000BFFFF: VGA Memory");
-    println!("  0x000C0000 - 0x000FFFFF: ROM Area");
-    println!("  0x00100000+            : Extended Memory (Kernel)");
+
+    println!("Kernel Heap:");
+    if heap.is_fallback {
+        println!(
+            "  Static fallback: {} (no usable run below 4 GiB)",
+            human_bytes(heap.size as u64)
+        );
+    } else {
+        println!("  Carve:       {} at physical {:#x}", human_bytes(heap.size as u64), heap.base);
+    }
+    println!(
+        "  Used/Free:   {} / {} ({:.1}% used)",
+        human_bytes(heap.used as u64),
+        human_bytes(heap.free as u64),
+        heap.used_ratio() * 100.0
+    );
+    println!(
+        "  Peak:        {} live, largest single {}",
+        human_bytes(heap.peak_bytes as u64),
+        human_bytes(heap.peak_single as u64)
+    );
+    println!(
+        "  Requests:    {} total, {} outstanding",
+        heap.alloc_requests, heap.live_allocations
+    );
+    if heap.reserve_size > 0 {
+        println!(
+            "  Reserve:     {} used of {} (OOM-time allocations)",
+            human_bytes(heap.reserve_used as u64),
+            human_bytes(heap.reserve_size as u64)
+        );
+    }
+    if heap.oom_events > 0 {
+        println!("  OOM events:  {} (heap exhausted at least once)", heap.oom_events);
+    } else {
+        println!("  OOM events:  0");
+    }
+    println!();
+
+    println!("Physical Frames:");
+    println!(
+        "  Free/Used:   {} / {}",
+        human_bytes(frames.free_frames * 4096),
+        human_bytes(frames.used_frames * 4096)
+    );
+    println!(
+        "  DMA pool:    {} frames below 4 GiB, {} above",
+        frames.free_low_frames, frames.free_high_frames
+    );
+    println!(
+        "  Operations:  {} allocs, {} frees, {} huge, {} failures",
+        frames.alloc_count, frames.free_count, frames.huge_alloc_count, frames.failures
+    );
+    if frames.failures > 0 {
+        println!("  Note:        allocation failures mean the map is exhausted");
+    }
+    println!();
+
+    println!("Memory Regions:");
+    let mut buf = [0u8; 32];
+    let mut printed = 0usize;
+    crate::sysinfo::with_regions(|regions| {
+        for r in regions.iter() {
+            if printed >= MAX_MEM_REGIONS_PRINTED {
+                return;
+            }
+            let class = crate::sysinfo::region_kind_name(r.class, r.firmware_tag, &mut buf);
+            println!(
+                "  {:#014x} - {:#014x}  {:>8}  {}",
+                r.start,
+                r.end,
+                human_bytes(r.len()),
+                class
+            );
+            printed += 1;
+        }
+    });
+    if summary.region_count == 0 {
+        println!("  (no firmware map captured)");
+    } else if summary.truncated {
+        println!("  ... {} regions total", summary.region_count);
+    }
+    println!();
+
+    let reservation_count = {
+        let mut n = 0usize;
+        crate::sysinfo::with_reservations(|r| {
+            for res in r.iter() {
+                println!(
+                    "  Kernel-owned: {:#014x} - {:#014x}  {:>8}  {}",
+                    res.start,
+                    res.end,
+                    human_bytes(res.len()),
+                    res.kind.label()
+                );
+                n += 1;
+            }
+        });
+        n
+    };
+    if reservation_count > 0 {
+        println!("  Kernel-owned total: {}", human_bytes(summary.reserved_bytes));
+    }
+    println!();
+
+    // What the RAM physically is, per SMBIOS. Distinct from the map above:
+    // the map says how much is addressable, this says what it is.
+    let phys_bits = crate::sysinfo::cpu_max_phys_addr_bits();
+    match phys_bits {
+        Some(bits) if bits > 64 => println!(
+            "Physical Addressing: {} bits reported, 64 usable (max {:#x})",
+            bits,
+            u64::MAX
+        ),
+        Some(bits) => println!(
+            "Physical Addressing: {} bits (max {:#x})",
+            bits,
+            crate::sysinfo::cpu_max_physical_address().unwrap_or(0)
+        ),
+        None => println!(
+            "Physical Addressing: unreported (assuming 40 bits, max {:#x})",
+            crate::sysinfo::cpu_phys_addr_limit()
+        ),
+    }
+    match crate::drivers::smbios::inventory() {
+        Some(inv) if !inv.devices.is_empty() => {
+            println!(
+                "SMBIOS Memory:  {} MiB installed across {} slot(s)",
+                inv.installed_mb(),
+                inv.devices.len()
+            );
+            for array in inv.arrays.iter() {
+                let max = match array.max_size_mb {
+                    Some(mb) => alloc::format!("max {}", human_bytes(mb * 1024 * 1024)),
+                    None => alloc::string::String::from("max unknown"),
+                };
+                println!(
+                    "  Array #{:04x}: {} slots, {}, {}",
+                    array.handle,
+                    array.device_count,
+                    max,
+                    if array.ecc_methods == 0 { "no ECC" } else { "ECC" }
+                );
+            }
+            for d in inv.devices.iter() {
+                if !d.installed {
+                    let locator = if d.locator.is_empty() { "(no locator)" } else { &d.locator };
+                    println!("  {:<12} empty slot", locator);
+                    continue;
+                }
+                let width = if d.total_width_bits > 0 {
+                    alloc::format!("{}-bit bus", d.total_width_bits)
+                } else {
+                    alloc::string::String::from("width unknown")
+                };
+                let speed = match d.speed_mts {
+                    Some(mts) => alloc::format!("{} MT/s", mts),
+                    None => alloc::string::String::from("speed unknown"),
+                };
+                let part = if d.part_number.is_empty() {
+                    alloc::string::String::from("")
+                } else {
+                    alloc::format!(" [{}]", d.part_number)
+                };
+                println!(
+                    "  {:<12} {:>6} MiB  {}  {}  {}{}",
+                    d.locator,
+                    d.size_mb,
+                    technology_short(d.technology),
+                    width,
+                    speed,
+                    part
+                );
+            }
+        }
+        _ => println!(
+            "SMBIOS Memory:  not exposed by firmware (no guest-reachable entry point)"
+        ),
+    }
+}
+
+/// Short memory-technology label for the `mem` device list.
+fn technology_short(tech: u8) -> &'static str {
+    match tech {
+        6..=10 => "LPDDR",
+        13 => "DDR",
+        14 => "DDR2",
+        15 => "DDR3",
+        16 => "DDR4",
+        17 | 18 => "DDR5",
+        11 => "HBM",
+        12 => "HBM2",
+        19 => "HBM3",
+        1 => "DRAM",
+        0xFF => "unknown",
+        _ => "other",
+    }
+}
+
+/// Regions printed before the `mem` list is truncated on screen. The full map
+/// can hold `memmap::MAX_REGIONS` entries, which overflows a terminal.
+const MAX_MEM_REGIONS_PRINTED: usize = 12;
+
+/// Format a byte count with a binary unit, e.g. `1.5 MiB`.
+pub(crate) fn human_bytes(bytes: u64) -> alloc::string::String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return alloc::format!("{} B", bytes);
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value >= 100.0 {
+        alloc::format!("{:.0} {}", value, UNITS[unit])
+    } else if value >= 10.0 {
+        alloc::format!("{:.1} {}", value, UNITS[unit])
+    } else {
+        alloc::format!("{:.2} {}", value, UNITS[unit])
+    }
 }
 
 /// Reboots the system
@@ -824,10 +1194,10 @@ fn cmd_mkfs(args: &str) {
     }
     if !confirmed {
         println!(
-            "mkfs: will ERASE drive {} ({} sectors, {} MB) with SimplFS.",
+            "mkfs: will ERASE drive {} ({} sectors, {}) with SimplFS.",
             target,
             info.total_sectors,
-            info.total_sectors / 2048
+            human_bytes(info.total_sectors.saturating_mul(512))
         );
         println!("Re-run as 'mkfs {} --yes' to confirm.", target);
         return;
@@ -1180,6 +1550,686 @@ fn cmd_pwd() {
     }
 }
 
+// ── Archives: tar / zip / unzip / 7z / mfk ──────────────────────────
+
+/// One member staged for writing: the payload is buffered because the
+/// archivers take slices, and SimplFS has no streaming read.
+struct PendingEntry {
+    name: String,
+    data: Vec<u8>,
+    is_dir: bool,
+}
+
+/// Resolve an archive operand to the bytes on disk.
+fn archive_read(path: &str) -> Result<Vec<u8>, &'static str> {
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        return Err("Filesystem not mounted. Use 'mount' first.");
+    }
+    let mut device = mounted_device();
+    let fs = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Err("Filesystem not mounted"),
+    };
+    fs.read_file(&mut device, path.trim())
+}
+
+/// Write `data` to `path`, creating parent directories as needed.
+fn archive_write(path: &str, data: &[u8]) -> Result<(), &'static str> {
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        return Err("Filesystem not mounted. Use 'mount' first.");
+    }
+    let mut device = mounted_device();
+    let fs = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Err("Filesystem not mounted"),
+    };
+    archive_ensure_parents(fs, &mut device, path)?;
+    let inode = match fs.resolve_file_or_dir(&mut device, path) {
+        Ok(ino) => {
+            if fs.is_dir(ino) {
+                return Err("target is a directory");
+            }
+            ino
+        }
+        Err(_) => fs.create_file(&mut device, path)?,
+    };
+    fs.write_file_by_inode(&mut device, inode, data)
+}
+
+/// Create `path` as a directory, ignoring "already exists".
+fn archive_mkdir(path: &str) -> Result<(), &'static str> {
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        return Err("Filesystem not mounted. Use 'mount' first.");
+    }
+    let mut device = mounted_device();
+    let fs = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Err("Filesystem not mounted"),
+    };
+    archive_ensure_parents(fs, &mut device, path)?;
+    match fs.create_directory(&mut device, path) {
+        Ok(_) => Ok(()),
+        // An existing directory is exactly what we wanted.
+        Err("File exists") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Create every parent directory of `path`, outermost first.
+fn archive_ensure_parents(
+    fs: &mut crate::fs::SimpleFilesystem,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+    path: &str,
+) -> Result<(), &'static str> {
+    let mut built = String::new();
+    let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    // The last component is the entry itself.
+    for comp in &components[..components.len().saturating_sub(1)] {
+        if !built.is_empty() {
+            built.push('/');
+        }
+        built.push_str(comp);
+        if fs.resolve_file_or_dir(device, &built).is_ok() {
+            continue;
+        }
+        match fs.create_directory(device, &built) {
+            Ok(_) => {}
+            Err("File exists") => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Walk `path` (file or directory) into `out`, recursing into
+/// directories in sorted order so archives are deterministic.
+fn archive_collect(
+    fs: &mut crate::fs::SimpleFilesystem,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+    path: &str,
+    out: &mut Vec<PendingEntry>,
+    depth: usize,
+) -> Result<(), &'static str> {
+    // Bound recursion so a pathological tree cannot exhaust the heap.
+    if depth > 16 {
+        return Err("directory nesting too deep");
+    }
+    if out.len() >= crate::archive::tar::MAX_ENTRIES {
+        return Err("too many files to archive");
+    }
+    let inode = fs.resolve_file_or_dir(device, path)?;
+    // `path` is always relative to the operand root, so the sanitized path is
+    // already the member name (children are built by appending to it).
+    let name = crate::archive::tar::sanitize_path(path)?.0;
+    if fs.is_dir(inode) {
+        out.push(PendingEntry { name: name.clone(), data: Vec::new(), is_dir: true });
+        let mut entries = fs.list_directory(device, inode)?;
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for entry in entries {
+            let child = alloc::format!("{}/{}", path.trim_end_matches('/'), entry.name);
+            archive_collect(fs, device, &child, out, depth + 1)?;
+        }
+        return Ok(());
+    }
+    let data = fs.read_file(device, path)?;
+    out.push(PendingEntry { name, data, is_dir: false });
+    Ok(())
+}
+
+/// Stage every operand into `out`; fails if the filesystem is unmounted.
+fn archive_stage(operands: &[String]) -> Result<Vec<PendingEntry>, &'static str> {
+    let mut fs_guard = FILESYSTEM.lock();
+    if fs_guard.is_none() {
+        return Err("Filesystem not mounted. Use 'mount' first.");
+    }
+    let mut device = mounted_device();
+    let fs = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Err("Filesystem not mounted"),
+    };
+    let mut out: Vec<PendingEntry> = Vec::new();
+    for operand in operands {
+        let trimmed = operand.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        archive_collect(fs, &mut device, trimmed, &mut out, 0)?;
+    }
+    if out.is_empty() {
+        return Err("nothing to archive");
+    }
+    Ok(out)
+}
+
+/// Borrowed view of staged entries in the shape `tar::build` expects.
+fn archive_as_build_entries(entries: &[PendingEntry]) -> Vec<crate::archive::tar::BuildEntry<'_>> {
+    entries
+        .iter()
+        .map(|e| crate::archive::tar::BuildEntry {
+            name: &e.name,
+            data: if e.is_dir { None } else { Some(e.data.as_slice()) },
+        })
+        .collect()
+}
+
+/// Join a destination directory with a member name, normalising the
+/// separators SimplFS expects.
+fn archive_target(dest: Option<&str>, name: &str) -> String {
+    match dest.map(str::trim).filter(|d| !d.is_empty()) {
+        None | Some(".") | Some("/") => name.to_string(),
+        Some(d) => alloc::format!("{}/{}", d.trim_end_matches('/'), name),
+    }
+}
+
+/// True when `name` is `filter` itself or lives below it, so `tar xf a.tar
+/// dir` also pulls in `dir/file`.
+fn archive_member_matches(name: &str, filter: &str) -> bool {
+    let filter = filter.trim_end_matches('/');
+    name == filter || name.starts_with(&alloc::format!("{}/", filter))
+}
+
+/// Narrow `members` to the operands the user named. With no operands every
+/// member is kept. Returns `Err` when an operand matches nothing, because
+/// silently extracting zero entries reads as success.
+fn archive_select(
+    mut members: Vec<(String, bool, Vec<u8>)>,
+    filters: &[String],
+) -> Result<Vec<(String, bool, Vec<u8>)>, &'static str> {
+    if filters.is_empty() {
+        return Ok(members);
+    }
+    for filter in filters {
+        if !members.iter().any(|(name, ..)| archive_member_matches(name, filter)) {
+            return Err("no such member");
+        }
+    }
+    members.retain(|(name, ..)| filters.iter().any(|f| archive_member_matches(name, f)));
+    Ok(members)
+}
+
+/// Extract `members` into the filesystem, reporting progress when `verbose`.
+/// Returns `(written, failed)`: a bad member never aborts the rest, matching
+/// how `tar` keeps going after one unusable path.
+fn archive_extract_members(
+    members: &[(String, bool, Vec<u8>)],
+    dest: Option<&str>,
+    verbose: bool,
+    verb: &str,
+) -> (usize, usize) {
+    let mut written = 0usize;
+    let mut failed = 0usize;
+    for (name, is_dir, data) in members {
+        let target = archive_target(dest, name);
+        let result = if *is_dir {
+            archive_mkdir(&target)
+        } else {
+            archive_write(&target, data)
+        };
+        match result {
+            Ok(()) => {
+                if verbose {
+                    println!("{} {}", verb, name);
+                }
+                written += 1;
+            }
+            Err(e) => {
+                println!("{}: {}: {}", verb, name, e);
+                failed += 1;
+            }
+        }
+    }
+    (written, failed)
+}
+
+/// Report an extraction outcome, calling out partial failures.
+fn archive_report_extract(verb: &str, archive: &str, written: usize, failed: usize) {
+    if failed == 0 {
+        println!("{}: extracted {} entries from '{}'", verb, written, archive);
+    } else {
+        println!(
+            "{}: extracted {}/{} entries from '{}' ({} failed)",
+            verb,
+            written,
+            written + failed,
+            archive,
+            failed
+        );
+    }
+}
+
+/// `tar` — create, list or extract a tarball in any supported wrapper.
+fn cmd_tar(args: &str) {
+    let parsed = match crate::archive::cli::parse_tar(args) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("tar: {}", e);
+            println!("Usage: tar -c|-t|-x [-v] [-f ARCHIVE] [-C DIR] [FILES...]");
+            return;
+        }
+    };
+    match parsed.mode {
+        crate::archive::cli::TarMode::Create => {
+            let staged = match archive_stage(&parsed.operands) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("tar: {}", e);
+                    return;
+                }
+            };
+            let build = archive_as_build_entries(&staged);
+            // `-z`/`-J` override whatever the output name implies.
+            let bytes = match crate::archive::build_tar_auto(&build, &parsed.archive, parsed.force) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("tar: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = archive_write(&parsed.archive, &bytes) {
+                println!("tar: {}: {}", parsed.archive, e);
+                return;
+            }
+            if parsed.verbose {
+                for entry in &staged {
+                    println!("a {}", entry.name);
+                }
+            }
+            println!("tar: created '{}' ({} bytes, {} entries)", parsed.archive, bytes.len(), staged.len());
+        }
+        crate::archive::cli::TarMode::List => {
+            let data = match archive_read(&parsed.archive) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("tar: {}: {}", parsed.archive, e);
+                    return;
+                }
+            };
+            let body = match crate::archive::tar_body(&data, &parsed.archive) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("tar: {}", e);
+                    return;
+                }
+            };
+            let entries = match crate::archive::tar::read_entries(
+                &body,
+                crate::archive::MAX_DECOMPRESSED_BYTES,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    println!("tar: {}", e);
+                    return;
+                }
+            };
+            for entry in &entries {
+                if parsed.verbose {
+                    println!("{} {:>8} {}", if entry.is_dir { 'd' } else { '-' }, entry.data.len(), entry.name);
+                } else {
+                    println!("{}", entry.name);
+                }
+            }
+        }
+        crate::archive::cli::TarMode::Extract => {
+            let data = match archive_read(&parsed.archive) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("tar: {}: {}", parsed.archive, e);
+                    return;
+                }
+            };
+            let body = match crate::archive::tar_body(&data, &parsed.archive) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("tar: {}", e);
+                    return;
+                }
+            };
+            let entries = match crate::archive::tar::read_entries(
+                &body,
+                crate::archive::MAX_DECOMPRESSED_BYTES,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    println!("tar: {}", e);
+                    return;
+                }
+            };
+            let mut members: Vec<(String, bool, Vec<u8>)> = Vec::new();
+            for entry in &entries {
+                members.push((entry.name.clone(), entry.is_dir, entry.data.to_vec()));
+            }
+            let members = match archive_select(members, &parsed.operands) {
+                Ok(m) => m,
+                Err(e) => {
+                    println!("tar: {}: {}", parsed.archive, e);
+                    return;
+                }
+            };
+            let dest = parsed.dest.as_deref();
+            let (written, failed) = archive_extract_members(&members, dest, parsed.verbose, "x");
+            archive_report_extract("tar", &parsed.archive, written, failed);
+        }
+    }
+}
+
+/// `zip` — create a zip archive.
+fn cmd_zip(args: &str) {
+    let parsed = match crate::archive::cli::parse_zip(args) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("zip: {}", e);
+            println!("Usage: zip [-0|-9] [-v] <archive.zip> <FILE...>");
+            return;
+        }
+    };
+    let staged = match archive_stage(&parsed.operands) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("zip: {}", e);
+            return;
+        }
+    };
+    let build: Vec<crate::archive::zip::BuildEntry<'_>> = staged
+        .iter()
+        .map(|e| crate::archive::zip::BuildEntry {
+            name: &e.name,
+            data: if e.is_dir { None } else { Some(e.data.as_slice()) },
+        })
+        .collect();
+    let pack = if parsed.stored {
+        crate::archive::zip::Pack::Stored
+    } else {
+        crate::archive::zip::Pack::Deflated
+    };
+    let bytes = match crate::archive::zip::build(&build, pack) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("zip: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = archive_write(&parsed.archive, &bytes) {
+        println!("zip: {}: {}", parsed.archive, e);
+        return;
+    }
+    if parsed.verbose {
+        for entry in &staged {
+            println!("a {}", entry.name);
+        }
+    }
+    println!("zip: created '{}' ({} bytes, {} entries)", parsed.archive, bytes.len(), staged.len());
+}
+
+/// `unzip` — list or extract a zip archive.
+fn cmd_unzip(args: &str) {
+    let parsed = match crate::archive::cli::parse_unzip(args) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("unzip: {}", e);
+            println!("Usage: unzip [-l] [-v] <archive.zip> [-d DIR]");
+            return;
+        }
+    };
+    let data = match archive_read(&parsed.archive) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("unzip: {}: {}", parsed.archive, e);
+            return;
+        }
+    };
+    if parsed.list_only {
+        match crate::archive::zip::list(&data) {
+            Ok(infos) => {
+                for info in &infos {
+                    if parsed.verbose {
+                        println!(
+                            "{} {:>8} {:>8} {}",
+                            if info.is_dir { 'd' } else { '-' },
+                            info.comp_size,
+                            info.uncomp_size,
+                            info.name
+                        );
+                    } else {
+                        println!("{}", info.name);
+                    }
+                }
+            }
+            Err(e) => println!("unzip: {}", e),
+        }
+        return;
+    }
+    let entries = match crate::archive::zip::extract(&data, crate::archive::MAX_DECOMPRESSED_BYTES) {
+        Ok(e) => e,
+        Err(e) => {
+            println!("unzip: {}", e);
+            return;
+        }
+    };
+    let members: Vec<(String, bool, Vec<u8>)> = entries
+        .into_iter()
+        .map(|e| (e.name, e.is_dir, e.data.into_owned()))
+        .collect();
+    let (written, failed) = archive_extract_members(&members, parsed.dest.as_deref(), parsed.verbose, "x");
+    archive_report_extract("unzip", &parsed.archive, written, failed);
+}
+
+/// `7z` — create, list, test or extract a 7z archive.
+fn cmd_7z(args: &str) {
+    use crate::archive::cli::{SevenZMode};
+    let parsed = match crate::archive::cli::parse_7z(args) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("7z: {}", e);
+            println!("Usage: 7z <a|x|t|l> [-v] [-oDIR] <archive.7z> [FILES...]");
+            return;
+        }
+    };
+    match parsed.mode {
+        SevenZMode::Add => {
+            let staged = match archive_stage(&parsed.operands) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("7z: {}", e);
+                    return;
+                }
+            };
+            let build = archive_as_build_entries(&staged);
+            let bytes = match crate::archive::sevenz::build(&build) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("7z: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = archive_write(&parsed.archive, &bytes) {
+                println!("7z: {}: {}", parsed.archive, e);
+                return;
+            }
+            if parsed.verbose {
+                for entry in &staged {
+                    println!("a {}", entry.name);
+                }
+            }
+            println!("7z: created '{}' ({} bytes, {} entries)", parsed.archive, bytes.len(), staged.len());
+        }
+        SevenZMode::List | SevenZMode::Test => {
+            let data = match archive_read(&parsed.archive) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("7z: {}: {}", parsed.archive, e);
+                    return;
+                }
+            };
+            let infos = match crate::archive::sevenz::list(&data) {
+                Ok(i) => i,
+                Err(e) => {
+                    println!("7z: {}", e);
+                    return;
+                }
+            };
+            if parsed.mode == SevenZMode::Test {
+                match crate::archive::sevenz::extract(&data, crate::archive::MAX_DECOMPRESSED_BYTES) {
+                    Ok(members) => println!("7z: '{}' is OK ({} entries)", parsed.archive, members.len()),
+                    Err(e) => println!("7z: '{}': {}", parsed.archive, e),
+                }
+                return;
+            }
+            for info in &infos {
+                if parsed.verbose {
+                    println!(
+                        "{} {:>8} {}",
+                        if info.is_dir { 'd' } else { '-' },
+                        info.size,
+                        info.name
+                    );
+                } else {
+                    println!("{}", info.name);
+                }
+            }
+        }
+        SevenZMode::Extract => {
+            let data = match archive_read(&parsed.archive) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("7z: {}: {}", parsed.archive, e);
+                    return;
+                }
+            };
+            let members = match crate::archive::sevenz::extract(&data, crate::archive::MAX_DECOMPRESSED_BYTES) {
+                Ok(m) => m,
+                Err(e) => {
+                    println!("7z: {}", e);
+                    return;
+                }
+            };
+            let members = match archive_select(members, &parsed.operands) {
+                Ok(m) => m,
+                Err(e) => {
+                    println!("7z: {}: {}", parsed.archive, e);
+                    return;
+                }
+            };
+            let (written, failed) = archive_extract_members(&members, parsed.dest.as_deref(), parsed.verbose, "x");
+            archive_report_extract("7z", &parsed.archive, written, failed);
+        }
+    }
+}
+
+/// `mfk` — create, list, test or extract an `.mfk` archive.
+fn cmd_mfk(args: &str) {
+    use crate::archive::cli::MfkMode;
+    let parsed = match crate::archive::cli::parse_mfk(args) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("mfk: {}", e);
+            println!("Usage: mfk <c|x|t|l> [-v] [-d DIR] <archive.mfk> [FILES...]");
+            return;
+        }
+    };
+    match parsed.mode {
+        MfkMode::Create => {
+            let staged = match archive_stage(&parsed.operands) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("mfk: {}", e);
+                    return;
+                }
+            };
+            let build: Vec<crate::archive::mfk::BuildEntry<'_>> = staged
+                .iter()
+                .map(|e| crate::archive::mfk::BuildEntry {
+                    name: &e.name,
+                    data: if e.is_dir { None } else { Some(e.data.as_slice()) },
+                })
+                .collect();
+            let bytes = match crate::archive::mfk::build(&build, crate::archive::mfk::Pack::Deflate) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("mfk: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = archive_write(&parsed.archive, &bytes) {
+                println!("mfk: {}: {}", parsed.archive, e);
+                return;
+            }
+            if parsed.verbose {
+                for entry in &staged {
+                    println!("a {}", entry.name);
+                }
+            }
+            println!("mfk: created '{}' ({} bytes, {} entries)", parsed.archive, bytes.len(), staged.len());
+        }
+        MfkMode::List | MfkMode::Test => {
+            let data = match archive_read(&parsed.archive) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("mfk: {}: {}", parsed.archive, e);
+                    return;
+                }
+            };
+            if parsed.mode == MfkMode::Test {
+                match crate::archive::mfk::extract(&data, crate::archive::MAX_DECOMPRESSED_BYTES) {
+                    Ok(entries) => println!("mfk: '{}' is OK ({} entries)", parsed.archive, entries.len()),
+                    Err(e) => println!("mfk: '{}': {}", parsed.archive, e),
+                }
+                return;
+            }
+            match crate::archive::mfk::list(&data) {
+                Ok(infos) => {
+                    for info in &infos {
+                        if parsed.verbose {
+                            println!(
+                                "{} {:>8} {:>8} {:>7} {}",
+                                if info.is_dir { 'd' } else { '-' },
+                                info.comp_size,
+                                info.uncomp_size,
+                                if info.stored { "store" } else { "deflate" },
+                                info.name
+                            );
+                        } else {
+                            println!("{}", info.name);
+                        }
+                    }
+                }
+                Err(e) => println!("mfk: {}", e),
+            }
+        }
+        MfkMode::Extract => {
+            let data = match archive_read(&parsed.archive) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("mfk: {}: {}", parsed.archive, e);
+                    return;
+                }
+            };
+            let entries = match crate::archive::mfk::extract(&data, crate::archive::MAX_DECOMPRESSED_BYTES) {
+                Ok(e) => e,
+                Err(e) => {
+                    println!("mfk: {}", e);
+                    return;
+                }
+            };
+            let members: Vec<(String, bool, Vec<u8>)> = entries
+                .into_iter()
+                .map(|e| (e.name, e.is_dir, e.data.into_owned()))
+                .collect();
+            let members = match archive_select(members, &parsed.operands) {
+                Ok(m) => m,
+                Err(e) => {
+                    println!("mfk: {}: {}", parsed.archive, e);
+                    return;
+                }
+            };
+            let (written, failed) = archive_extract_members(&members, parsed.dest.as_deref(), parsed.verbose, "x");
+            archive_report_extract("mfk", &parsed.archive, written, failed);
+        }
+    }
+}
+
 /// Configure network interface (`-d`/`--debug` enables packet tracing).
 fn cmd_ifconfig(args: &str) {
     let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
@@ -1469,7 +2519,7 @@ fn cmd_netstat(args: &str) {
         }
         println!(
             "  ARP cache: {} entr(y/ies)",
-            crate::net::arp::entries().len()
+            crate::net::arp::stats().entries
         );
         println!();
         println!("Protocol Stack:");
@@ -1487,7 +2537,163 @@ fn cmd_netstat(args: &str) {
                 "needs IP config"
             }
         );
-        println!("  UDP RX   - {} queued", crate::net::udp::queued_count());
+        let udp = crate::net::udp::stats();
+        println!(
+            "  UDP RX   - {} queued ({} KiB of {} KiB)",
+            udp.queued,
+            udp.queued_bytes / 1024,
+            crate::net::udp::MAX_QUEUED_BYTES / 1024
+        );
+        if udp.dropped_full > 0 || udp.dropped_oversized > 0 {
+            println!(
+                "            {} dropped: queue full, {} oversized",
+                udp.dropped_full, udp.dropped_oversized
+            );
+        }
+        if udp.bad_checksum > 0 {
+            println!(
+                "            {} dropped: bad checksum",
+                udp.bad_checksum
+            );
+        }
+
+        let ip = crate::net::ip::stats();
+        println!(
+            "  IP       - {} fragmented into {} piece(s), {} reassembled ({} held)",
+            ip.fragmented_sent,
+            ip.fragments_sent,
+            ip.fragments_reassembled,
+            crate::net::ip::reassembly_count()
+        );
+        if ip.bad_checksum > 0 {
+            println!(
+                "            {} packet(s) dropped: bad header checksum",
+                ip.bad_checksum
+            );
+        }
+        if ip.malformed > 0 {
+            println!("            {} malformed or refused fragment(s)", ip.malformed);
+        }
+
+        let icmp = crate::net::icmp::stats();
+        println!(
+            "  ICMP     - {} echo request(s), {} reply(s), {} error(s)",
+            icmp.echo_requests, icmp.echo_replies, icmp.errors
+        );
+        if icmp.echo_dropped_oversized > 0 {
+            println!(
+                "            {} oversized echo request(s) not reflected",
+                icmp.echo_dropped_oversized
+            );
+        }
+        for report in crate::net::icmp::errors().iter().rev().take(3) {
+            println!(
+                "            {} from {}.{}.{}.{} (for {}.{}.{}.{})",
+                report.error.name(),
+                report.from_ip[0],
+                report.from_ip[1],
+                report.from_ip[2],
+                report.from_ip[3],
+                report.quoted_dst[0],
+                report.quoted_dst[1],
+                report.quoted_dst[2],
+                report.quoted_dst[3]
+            );
+        }
+        let nic = crate::drivers::e1000::stats();
+        match crate::drivers::e1000::interrupt_vector() {
+            Some(vector) => println!("  NIC IRQ  - vector {}", vector),
+            None => println!("  NIC IRQ  - polling (no INTx line)"),
+        }
+        println!(
+            "            {} interrupts ({} tx, {} tx underflow, last cause {:#x})",
+            nic.interrupts,
+            nic.tx_interrupts,
+            nic.tx_underflows,
+            crate::drivers::e1000::last_cause()
+        );
+        if nic.unexpected_causes > 0 {
+            println!(
+                "            {} interrupts with an unmodelled cause bit",
+                nic.unexpected_causes
+            );
+        }
+
+        let arp = crate::net::arp::stats();
+        let dhcp = crate::net::dhcp::stats();
+        if dhcp.discovers_sent > 0 {
+            println!(
+                "  DHCP     - {} lease(s), {} ack(s) from {}.{}.{}.{}",
+                dhcp.leases_obtained,
+                dhcp.acks_received,
+                crate::net::dns::server()[0],
+                crate::net::dns::server()[1],
+                crate::net::dns::server()[2],
+                crate::net::dns::server()[3],
+            );
+        }
+        println!(
+            "  ARP      - {} req sent, {} req recv, {} reply sent, {} reply recv",
+            arp.requests_sent, arp.requests_received, arp.replies_sent, arp.replies_received
+        );
+        if arp.spoof_rejected > 0 || arp.self_claim_rejected > 0 {
+            println!(
+                "            {} rejected: sender MAC did not match the frame source",
+                arp.spoof_rejected + arp.self_claim_rejected
+            );
+        }
+        if arp.replies_rate_limited > 0 {
+            println!(
+                "            {} replies rate limited (flood protection)",
+                arp.replies_rate_limited
+            );
+        }
+        if arp.evicted > 0 || arp.expired > 0 {
+            println!(
+                "            {} evicted, {} expired (table holds {})",
+                arp.evicted, arp.expired, crate::net::arp::ARP_MAX_ENTRIES
+            );
+        }
+        if arp.stale_hits > 0 {
+            println!("            {} lookups served a stale mapping", arp.stale_hits);
+        }
+
+        let tcp = crate::net::tcp::stats();
+        println!("  TCP      - {} active, {} total", tcp.active_connections, tcp.total_connections);
+        println!(
+            "            {} seg sent ({} retransmitted), {} received",
+            tcp.segments_sent, tcp.segments_retransmitted, tcp.segments_received
+        );
+        println!(
+            "            {} buffered, {} in flight",
+            tcp.bytes_buffered, tcp.bytes_in_flight
+        );
+        if tcp.out_of_window > 0 || tcp.resets > 0 || tcp.timeouts > 0 {
+            println!(
+                "            {} out of window, {} resets, {} timeouts",
+                tcp.out_of_window, tcp.resets, tcp.timeouts
+            );
+        }
+
+        let live = crate::net::tcp::connections();
+        if !live.is_empty() {
+            println!();
+            println!("TCP connections:");
+            for c in &live {
+                println!(
+                    "  :{:<5} -> {}.{}.{}.{}:{}  {}  rx {} / tx {}",
+                    c.local_port,
+                    c.remote_ip[0],
+                    c.remote_ip[1],
+                    c.remote_ip[2],
+                    c.remote_ip[3],
+                    c.remote_port,
+                    c.state.name(),
+                    c.recv_buffer.len(),
+                    c.unacked_bytes() + c.send_buffer.len()
+                );
+            }
+        }
     } else {
         println!("Network interface not initialized");
     }
@@ -1518,6 +2724,86 @@ fn cmd_dns(args: &str) {
     }
 }
 
+fn cmd_dhcp(args: &str) {
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let arg = args_owned.as_str().trim();
+
+    match arg {
+        "" | "start" | "renew" => {
+            println!("Requesting a DHCP lease...");
+            match crate::net::dhcp::configure() {
+                Ok(lease) => {
+                    println!(
+                        "DHCP lease: {}.{}.{}.{} via {}.{}.{}.{}",
+                        lease.address[0],
+                        lease.address[1],
+                        lease.address[2],
+                        lease.address[3],
+                        lease.server_id.map(|s| s[0]).unwrap_or(0),
+                        lease.server_id.map(|s| s[1]).unwrap_or(0),
+                        lease.server_id.map(|s| s[2]).unwrap_or(0),
+                        lease.server_id.map(|s| s[3]).unwrap_or(0),
+                    );
+                    println!(
+                        "  netmask {}.{}.{}.{}, lease {}s",
+                        lease.netmask[0],
+                        lease.netmask[1],
+                        lease.netmask[2],
+                        lease.netmask[3],
+                        lease.lease_secs
+                    );
+                    println!(
+                        "  resolver {}.{}.{}.{}",
+                        crate::net::dns::server()[0],
+                        crate::net::dns::server()[1],
+                        crate::net::dns::server()[2],
+                        crate::net::dns::server()[3],
+                    );
+                }
+                Err(e) => println!("dhcp: {}", e),
+            }
+        }
+        "status" => {
+            let stats = crate::net::dhcp::stats();
+            if stats.discovers_sent == 0 {
+                println!("DHCP has not been attempted; address is manually configured");
+                return;
+            }
+            println!(
+                "DHCP: {} discover(s), {} offer(s), {} request(s), {} ack(s), {} nak(s)",
+                stats.discovers_sent,
+                stats.offers_received,
+                stats.requests_sent,
+                stats.acks_received,
+                stats.naks_received
+            );
+            println!(
+                "      {} lease(s) obtained, interface {}",
+                stats.leases_obtained,
+                if stats.configured {
+                    "configured by DHCP"
+                } else {
+                    "not configured by DHCP"
+                }
+            );
+            if stats.leases_rejected > 0 {
+                println!(
+                    "      {} lease(s) refused; last reason: {}",
+                    stats.leases_rejected,
+                    stats.last_reject_reason.unwrap_or("unspecified")
+                );
+            }
+            if stats.malformed_dropped > 0 {
+                println!("      {} malformed repl(s) discarded", stats.malformed_dropped);
+            }
+        }
+        other => {
+            println!("Usage: dhcp [start|renew|status]");
+            let _ = other;
+        }
+    }
+}
+
 fn cmd_arp(args: &str) {
     let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
     let arg = args_owned.as_str().trim();
@@ -1526,10 +2812,11 @@ fn cmd_arp(args: &str) {
         if entries.is_empty() {
             println!("ARP cache is empty");
         } else {
-            for (ip, mac) in entries {
+            for (ip, mac, stale) in entries {
                 println!(
-                    "{}.{}.{}.{}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                    ip[0], ip[1], ip[2], ip[3], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                    "{}.{}.{}.{}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}{}",
+                    ip[0], ip[1], ip[2], ip[3], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                    if stale { "  (stale)" } else { "" }
                 );
             }
         }
@@ -1545,6 +2832,51 @@ fn cmd_arp(args: &str) {
             ip[0], ip[1], ip[2], ip[3], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         ),
         Err(e) => println!("arp: {}", e),
+    }
+}
+
+/// Send a UDP datagram whose size is given in bytes rather than typed.
+///
+/// `udp-send` takes its payload as a word, which caps it well below the link MTU,
+/// so the fragmentation path cannot be reached from the shell without this. The
+/// payload is a repeating pattern, so a reassembled datagram can be checked for
+/// corruption rather than merely counted.
+fn cmd_udp_ping(args: &str) {
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let args = args_owned.as_str();
+    let Some((host, rest)) = take_word(args) else {
+        println!("Usage: udp-ping <IPv4|hostname> <bytes> [remote-port]");
+        return;
+    };
+    let Some((size, rest)) = take_word(rest) else {
+        println!("Usage: udp-ping <IPv4|hostname> <bytes> [remote-port]");
+        return;
+    };
+    let port = rest.trim();
+    let port = if port.is_empty() { "5555" } else { port };
+    let Ok(size) = size.parse::<usize>() else {
+        println!("udp-ping: invalid size");
+        return;
+    };
+    if size > 60000 {
+        println!("udp-ping: refusing {} bytes, the protocol limit is 65507", size);
+        return;
+    }
+    let Some(ip) = parse_ipv4(host).or_else(|| crate::net::dns::resolve_ipv4(host).ok()) else {
+        println!("udp-ping: host resolution failed");
+        return;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        println!("udp-ping: invalid port");
+        return;
+    };
+
+    // A counter, not zeros: an all-zero payload would not distinguish a
+    // correctly reassembled datagram from one filled with holes.
+    let payload: alloc::vec::Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    match crate::net::udp::send_packet(ip, 49153, port, &payload) {
+        Ok(()) => println!("Sent {} UDP payload bytes to {}:{}", size, host, port),
+        Err(e) => println!("udp-ping: {}", e),
     }
 }
 
@@ -1700,7 +3032,6 @@ fn cmd_tcpconnect(args: &str) {
         },
     };
 
-    // Parse port
     let port = match parts[1].parse::<u16>() {
         Ok(p) => p,
         Err(_) => {
@@ -1709,57 +3040,29 @@ fn cmd_tcpconnect(args: &str) {
         }
     };
 
-    println!(
-        "Connecting to {}.{}.{}.{}:{}...",
-        target_ip[0], target_ip[1], target_ip[2], target_ip[3], port
-    );
+    let peer = crate::net::socket::SocketAddr::new(target_ip, port);
+    println!("Connecting to {}...", peer);
+    clear_interrupt();
 
-    match crate::net::tcp::connect(target_ip, port) {
-        Ok(local_port) => {
-            println!("Connection initiated from local port {}", local_port);
-            println!("Waiting for connection to establish...");
-
-            // Wait for connection to establish
-            let start_time = monotonic_ms();
-            let timeout_ms: u64 = 5000;
-            let poll_limit = timeout_ms.saturating_mul(1000).max(1);
-            let mut polls = 0u64;
-            clear_interrupt();
-
-            while polls < poll_limit
-                && monotonic_ms().saturating_sub(start_time) < timeout_ms
-                && !is_interrupted()
-            {
-                crate::net::process_packets();
-
-                if let Some(state) = crate::net::tcp::get_state(local_port) {
-                    if state == crate::net::tcp::TcpState::Established {
-                        println!("Connection established! Local port: {}", local_port);
-                        println!("Use 'tcpsend {} <data>' to send data", local_port);
-                        println!("Use 'tcpclose {}' to close connection", local_port);
-                        return;
-                    }
-                }
-
-                increment_tick();
-                polls += 1;
-                core::hint::spin_loop();
-            }
-
-            if is_interrupted() {
-                println!("Connection cancelled by user");
-                clear_interrupt();
-            } else {
-                println!("Connection timeout - no response from server");
+    match crate::net::socket::connect_tcp(peer, 5000) {
+        Ok(handle) => {
+            let local = crate::net::socket::local_port(handle).unwrap_or(0);
+            println!("Connection established: {}", handle);
+            println!("  peer  {}", peer);
+            println!("  local port {}", local);
+            println!("Use 'tcpsend {} <data>' to send data", handle);
+            println!("Use 'tcprecv {} [seconds]' to receive", handle);
+            println!("Use 'tcpclose {}' to close it", handle);
+        }
+        Err(e) => {
+            println!("Failed to connect to {}: {}", peer, e);
+            // The advice is only useful for the case it applies to; "timed out" on
+            // a reachable host usually means nothing is listening.
+            if e == crate::net::socket::SocketError::TimedOut {
                 println!("Note: With QEMU user-mode networking, only connections to");
                 println!("      the host (10.0.2.2) may work. Use TAP networking for");
                 println!("      connections to external servers.");
             }
-            let _ = crate::net::tcp::close(local_port);
-            crate::net::tcp::forget(local_port);
-        }
-        Err(e) => {
-            println!("Failed to initiate connection: {}", e);
         }
     }
 }
@@ -1768,70 +3071,48 @@ fn cmd_tcpsend(args: &str) {
     let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
     let args = args_owned.as_str();
     if args.is_empty() {
-        println!("Usage: tcpsend <local-port> <data>");
-        println!("Example: tcpsend 49152 GET / HTTP/1.0");
+println!("Usage: tcpsend <socket> <data>");
+        println!("Example: tcpsend socket#0g1 GET / HTTP/1.0\\r\\n");
+        println!("Escapes: \\r \\n \\t \\0 \\\\");
         return;
     }
 
     let parts: Vec<&str> = args.splitn(2, ' ').collect();
     if parts.len() < 2 {
-        println!("Error: Missing port or data");
+        println!("Error: Missing socket or data");
         return;
     }
 
-    let port = match parts[0].parse::<u16>() {
-        Ok(p) => p,
-        Err(_) => {
-            println!("Invalid port number");
-            return;
-        }
+    let Some(handle) = parse_socket_handle(parts[0]) else {
+        println!("Invalid or closed socket '{}'", parts[0]);
+        println!("Use 'tcpsockets' to list open sockets");
+        return;
     };
 
-    let data = parts[1].as_bytes();
-
-    match crate::net::tcp::send_data(port, data) {
+    // Escapes, because a line-based protocol needs a terminator and a terminal
+    // cannot type one into an argument.
+    let data = expand_escapes(parts[1]);
+    let sent = data.len();
+    match crate::net::socket::write(handle, &data) {
         Ok(_) => {
-            println!("Sent {} bytes on port {}", data.len(), port);
+            println!("Sent {} bytes on {}", sent, handle);
             println!("Checking for response...");
 
-            // Wait a bit for response
-            let start_time = monotonic_ms();
-            let timeout_ms: u64 = 2000;
-            let poll_limit = timeout_ms.saturating_mul(1000).max(1);
-            let mut polls = 0u64;
-
-            while polls < poll_limit
-                && monotonic_ms().saturating_sub(start_time) < timeout_ms
-                && !is_interrupted()
-            {
-                crate::net::process_packets();
-
-                if let Some(recv_data) = crate::net::tcp::read_data(port) {
-                    println!("Received {} bytes:", recv_data.len());
-                    // Print as string if possible
-                    if let Ok(s) = core::str::from_utf8(&recv_data) {
+            let mut buf = [0u8; 2048];
+            match crate::net::socket::read_timeout(handle, &mut buf, 2000) {
+                Ok(0) => println!("No response received (timeout or peer closed)"),
+                Ok(count) => {
+                    println!("Received {} bytes:", count);
+                    if let Ok(s) = core::str::from_utf8(&buf[..count]) {
                         println!("{}", s);
                     } else {
                         println!("(binary data)");
                     }
-                    return;
                 }
-
-                increment_tick();
-                polls += 1;
-                core::hint::spin_loop();
-            }
-
-            if is_interrupted() {
-                clear_interrupt();
-                println!("TCP receive cancelled");
-            } else {
-                println!("No response received (timeout)");
+                Err(e) => println!("Receive failed: {}", e),
             }
         }
-        Err(e) => {
-            println!("Failed to send data: {}", e);
-        }
+        Err(e) => println!("Failed to send data: {}", e),
     }
 }
 
@@ -1839,88 +3120,198 @@ fn cmd_tcpclose(args: &str) {
     let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
     let args = args_owned.as_str();
     if args.is_empty() {
-        println!("Usage: tcpclose <local-port>");
-        println!("Example: tcpclose 49152");
+        println!("Usage: tcpclose <socket>");
+        println!("Example: tcpclose socket#0g1");
         return;
     }
 
-    let port = match args.trim().parse::<u16>() {
-        Ok(p) => p,
-        Err(_) => {
-            println!("Invalid port number");
-            return;
-        }
+    let Some(handle) = parse_socket_handle(args.trim()) else {
+        println!("Invalid or closed socket '{}'", args.trim());
+        return;
     };
 
-    match crate::net::tcp::close(port) {
-        Ok(_) => println!("Closing connection on port {}", port),
-        Err(e) => println!("Failed to close connection: {}", e),
+    // Readable first: after close the handle is dead, so this has to be asked
+    // before.
+    let peer = crate::net::socket::peer_addr(handle).ok();
+    crate::net::socket::close(handle);
+    match peer {
+        Some(peer) => println!("Closed {} (peer {})", handle, peer),
+        None => println!("Closed {}", handle),
+    }
+}
+
+/// List open sockets, so a user who lost track of a handle can find it again.
+fn cmd_tcpsockets(args: &str) {
+    let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
+    let _ = args_owned;
+    let open = crate::net::socket::sockets();
+    if open.is_empty() {
+        println!("No open sockets");
+        return;
+    }
+    println!("{:<14} {:<5} {:<7} {:<22} {}", "SOCKET", "PROTO", "LOCAL", "PEER", "STATE");
+    for info in open {
+        println!(
+            "{:<14} {:<5} {:<7} {:<22} {}",
+            info.handle.to_string(),
+            info.transport.name(),
+            info.local_port,
+            info.peer.to_string(),
+            info.state.name()
+        );
     }
 }
 
 fn cmd_tcpstatus(args: &str) {
     let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
-    let Ok(port) = args_owned.as_str().trim().parse::<u16>() else {
-        println!("Usage: tcpstatus <local-port>");
+    let text = args_owned.as_str().trim();
+    if text.is_empty() {
+        println!("Usage: tcpstatus <socket>");
+        return;
+    }
+    let Some(handle) = parse_socket_handle(text) else {
+        println!("No such socket '{}'", text);
         return;
     };
-    match crate::net::tcp::get_state(port) {
-        Some(state) => println!("TCP local port {}: {:?}", port, state),
-        None => println!("No TCP connection on local port {}", port),
+    let local = crate::net::socket::local_port(handle).unwrap_or(0);
+    match crate::net::socket::state(handle) {
+        Ok(state) => println!("{}: {} (local port {})", handle, state.name(), local),
+        Err(e) => println!("{}: {}", handle, e),
+    }
+}
+
+/// Resolve a socket argument, accepting what `tcpconnect` printed.
+fn parse_socket_handle(text: &str) -> Option<crate::net::socket::Socket> {
+    crate::net::socket::Socket::parse(text)
+}
+
+#[cfg(test)]
+mod socket_escape_tests {
+    use super::expand_escapes;
+
+    #[test]
+    fn line_terminators_expand_to_real_bytes() {
+        // The point of the function: a terminal cannot type a CR or LF into an
+        // argument, so without this a request line could never be terminated
+        // and no text server would ever reply.
+        assert_eq!(
+            expand_escapes("GET / HTTP/1.0\\r\\n"),
+            b"GET / HTTP/1.0\r\n".to_vec()
+        );
+        assert_eq!(expand_escapes("\\n"), b"\n".to_vec());
+        assert_eq!(expand_escapes("\\t"), b"\t".to_vec());
+        assert_eq!(expand_escapes("\\0"), alloc::vec![0u8]);
+        assert_eq!(expand_escapes("\\\\"), b"\\".to_vec());
+    }
+
+    #[test]
+    fn a_request_with_its_terminator_is_the_documented_example() {
+        let request = expand_escapes("GET /hello.txt HTTP/1.0\\r\\nHost: 10.0.2.2\\r\\n\\r\\n");
+        assert_eq!(
+            request,
+            b"GET /hello.txt HTTP/1.0\r\nHost: 10.0.2.2\r\n\r\n".to_vec()
+        );
+        assert!(request.ends_with(b"\r\n\r\n"), "headers must be closed off");
+    }
+
+    #[test]
+    fn text_without_escapes_is_unchanged() {
+        assert_eq!(expand_escapes("hello"), b"hello".to_vec());
+        assert_eq!(expand_escapes(""), alloc::vec::Vec::<u8>::new());
+        // Interior spaces survive, since the data argument may contain them.
+        assert_eq!(expand_escapes("a b  c"), b"a b  c".to_vec());
+    }
+
+    #[test]
+    fn unknown_and_trailing_backslashes_are_kept_verbatim() {
+        // Dropping an unrecognised escape would silently corrupt a payload such
+        // as a Windows path. `\U` and `\f` are not escapes this shell knows.
+        assert_eq!(expand_escapes("C:\\Users\\file"), b"C:\\Users\\file".to_vec());
+        assert_eq!(expand_escapes("a\\"), b"a\\".to_vec());
+        assert_eq!(expand_escapes("\\q"), b"\\q".to_vec());
+        assert_eq!(expand_escapes("50\\%"), b"50\\%".to_vec());
+    }
+
+    #[test]
+    fn recognised_escapes_win_even_where_a_path_would_have_one() {
+        // `\n` and `\t` are escapes here, so a path containing them is altered.
+        // That is the same trade every shell makes, and the alternative — a
+        // second syntax — is not worth it for one command.
+        assert_eq!(expand_escapes("a\\nb"), b"a\nb".to_vec());
+        assert_eq!(expand_escapes("a\\tb"), b"a\tb".to_vec());
     }
 }
 
 fn cmd_tcprecv(args: &str) {
     let (_net_dbg, args_owned) = crate::net::debug::DebugGuard::acquire(args);
     let mut fields = args_owned.as_str().split_whitespace();
-    let Some(port_text) = fields.next() else {
-        println!("Usage: tcprecv <local-port> [timeout-seconds]");
+    let Some(socket_text) = fields.next() else {
+        println!("Usage: tcprecv <socket> [timeout-seconds]");
         return;
     };
-    let Ok(port) = port_text.parse::<u16>() else {
-        println!("tcprecv: invalid port");
+    let Some(handle) = parse_socket_handle(socket_text) else {
+        println!("tcprecv: no such socket '{}'", socket_text);
+        println!("Use 'tcpsockets' to list open sockets");
         return;
     };
-    if crate::net::tcp::get_state(port).is_none() {
-        println!("tcprecv: no TCP connection on local port {}", port);
-        return;
-    }
     let timeout_s = fields
         .next()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(5)
         .clamp(1, 60);
-    let deadline = monotonic_ms().saturating_add(timeout_s * 1000);
     clear_interrupt();
-    loop {
-        crate::net::process_packets();
-        if let Some(data) = crate::net::tcp::read_data(port) {
-            println!("Received {} bytes:", data.len());
-            if let Ok(text) = core::str::from_utf8(&data) {
+
+    let mut buf = [0u8; 4096];
+    match crate::net::socket::read_timeout(handle, &mut buf, timeout_s * 1000) {
+        Ok(0) => println!("tcprecv: connection closed"),
+        Ok(count) => {
+            println!("Received {} bytes:", count);
+            if let Ok(text) = core::str::from_utf8(&buf[..count]) {
                 println!("{}", text);
             } else {
                 println!("(binary data)");
             }
-            return;
         }
-        if let Some(crate::net::tcp::TcpState::CloseWait | crate::net::tcp::TcpState::Closed) =
-            crate::net::tcp::get_state(port)
-        {
-            println!("tcprecv: connection closed");
-            return;
-        }
-        if is_interrupted() {
-            clear_interrupt();
-            println!("tcprecv cancelled");
-            return;
-        }
-        if monotonic_ms() >= deadline {
-            println!("tcprecv timed out");
-            return;
-        }
-        increment_tick();
-        core::hint::spin_loop();
+        Err(crate::net::socket::SocketError::TimedOut) => println!("tcprecv timed out"),
+        Err(e) => println!("tcprecv: {}", e),
     }
+}
+
+/// Expand backslash escapes in a `tcpsend` argument into real bytes.
+///
+/// Without this, `tcpsend` cannot speak any line-based protocol. A text protocol
+/// needs its request line terminated, and a terminal cannot type a bare CR or LF
+/// into a command argument — so the command's own documented example,
+/// `tcpsend 49152 GET / HTTP/1.0`, could never have produced a reply: the server
+/// sat waiting for a line ending that had no way to be expressed.
+///
+/// Supported: `\r`, `\n`, `\t`, `\0`, `\\`. An unknown escape is kept as written,
+/// so a path like `C:\new` does not silently lose characters.
+fn expand_escapes(text: &str) -> alloc::vec::Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = alloc::vec::Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || i + 1 >= bytes.len() {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        match bytes[i + 1] {
+            b'r' => out.push(b'\r'),
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b'0' => out.push(0),
+            b'\\' => out.push(b'\\'),
+            _ => {
+                // Not an escape we know: keep both bytes so the text survives.
+                out.push(bytes[i]);
+                out.push(bytes[i + 1]);
+            }
+        }
+        i += 2;
+    }
+    out
 }
 
 // ── Editor helpers (exposed for editor crate) ─────────────
@@ -1930,7 +3321,7 @@ pub fn is_mounted() -> bool {
     FILESYSTEM.lock().is_some()
 }
 
-/// Read file contents via FS – returns None if not mounted or not found (path-aware)
+/// Read file contents via FS â€“ returns None if not mounted or not found (path-aware)
 pub fn read_file_contents(
     name: &str,
     device: &mut dyn crate::drivers::block::BlockDevice,
@@ -1946,7 +3337,30 @@ pub fn read_file_contents(
     }
 }
 
-/// Write file contents – creates file if needed, returns static error str on failure (path-aware)
+/// Read up to `out.len()` bytes of a file at `offset` into `out` (streaming,
+/// no whole-file allocation). Returns bytes copied. Used by large-asset
+/// readers (Doom WAD) on extra disks.
+pub fn read_file_chunk(
+    name: &str,
+    device: &mut dyn crate::drivers::block::BlockDevice,
+    offset: u64,
+    out: &mut [u8],
+) -> Result<usize, &'static str> {
+    let mut guard = FILESYSTEM.lock();
+    let fs = guard.as_mut().ok_or("Filesystem not mounted")?;
+    fs.read_file_range(device, name, offset, out)
+}
+
+/// File size in bytes (no data allocation). Used by large-asset readers
+/// (Doom WAD) to validate offsets before streaming.
+pub fn mounted_file_size(name: &str) -> Result<u64, &'static str> {
+    let mut guard = FILESYSTEM.lock();
+    let fs = guard.as_mut().ok_or("Filesystem not mounted")?;
+    let ino = fs.resolve_file_or_dir(&mut mounted_device(), name)?;
+    fs.file_size(ino)
+}
+
+/// Write file contents â€“ creates file if needed, returns static error str on failure (path-aware)
 pub fn write_file_contents(
     name: &str,
     data: &[u8],
@@ -2038,7 +3452,7 @@ pub fn promote_download_file(
     fs.rename_file(device, staging, destination)
 }
 
-// ── GUI bridge (shared by desktop File Explorer + Drive apps) ─────
+// â”€â”€ GUI bridge (shared by desktop File Explorer + Drive apps) â”€â”€â”€â”€â”€
 // These wrap the same FILESYSTEM + DriveBlockDevice logic as the CLI
 // commands so shell and desktop stay in sync. All helpers create
 // their own device, lock FS once, copy results out, and drop the
@@ -2182,7 +3596,7 @@ pub fn gui_read_file(path: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
     }
 }
 
-/// File size in bytes for GUI (metadata only, no buffer allocation — safe
+/// File size in bytes for GUI (metadata only, no buffer allocation â€” safe
 /// to call before attempting a big read).
 pub fn gui_file_size(path: &str) -> Result<u64, &'static str> {
     if !is_mounted() {
@@ -2278,12 +3692,12 @@ pub fn gui_save_settings(text: &str) -> Result<alloc::string::String, &'static s
     }
 }
 
-/// Shell edit command – delegates to nano editor
+/// Shell edit command â€“ delegates to nano editor
 fn cmd_edit(args: &str) {
     crate::editor::run(args);
 }
 
-// ── App commands ─────────────────────────────────────
+// â”€â”€ App commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn cmd_run(args: &str) {
     if args.trim().is_empty() {
@@ -2419,6 +3833,109 @@ fn cmd_appinfo(args: &str) {
     }
 }
 
+/// Inspect a Doom WAD via streaming range reads (no whole-file load).
+/// Works for multi-MB WADs on extra disks: `mount 2`, `doominfo /wad/doom1.wad`.
+fn cmd_doominfo(args: &str) {
+    let path = args.trim();
+    if path.is_empty() {
+        println!("Usage: doominfo <wad-path>  (e.g., 'doominfo /wad/doom1.wad')");
+        println!("Mount the WAD disk first: 'diskinfo', 'mount <drive>'.");
+        return;
+    }
+    match crate::doom::wad_info(path, 12) {
+        Ok(info) => {
+            let magic = String::from_utf8_lossy(&info.magic);
+            println!("WAD '{}' ({} bytes)", path, info.file_size);
+            println!("  Type: {}", magic);
+            println!("  Lumps: {}", info.num_lumps);
+            println!("  Engine: classic Doom ready; Doom64 WAD swaps in later");
+            println!("  Audio: silent v1 (stubs)");
+            for (i, name) in info.first_lumps.iter().enumerate() {
+                println!("    [{}] {}", i, name);
+            }
+            if info.num_lumps > info.first_lumps.len() as u32 {
+                println!(
+                    "    ... ({} more)",
+                    info.num_lumps - info.first_lumps.len() as u32
+                );
+            }
+        }
+        Err(e) => println!("doominfo: {}", e),
+    }
+}
+
+/// Play Doom: validates the WAD (streaming, no full load), queues it for
+/// the desktop Doom launcher, and tells the user how to open it.
+/// With no argument, scans the mounted FS for a known WAD name.
+fn cmd_doom(args: &str) {
+    if !crate::doom::engine::available() {
+        println!("doom: engine not compiled into this build");
+        return;
+    }
+    let arg = args.trim();
+    // Split the optional `run` subcommand from an optional explicit path:
+    // `doom` (scan), `doom run` (scan + play), `doom <path>`,
+    // `doom run <path>`. (`run` is never a WAD path.)
+    let mut words = arg.split_whitespace();
+    let (run_now, explicit) = match words.next() {
+        Some("run") => (true, words.next()),
+        Some(other) => (false, Some(other)),
+        None => (false, None),
+    };
+    let mut candidates: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+    if let Some(path) = explicit {
+        if !path.is_empty() {
+            candidates.push(String::from(path));
+        }
+    }
+    for auto in [
+        "/wad/doom1.wad",
+        "/wad/doom.wad",
+        "/wad/DOOM.WAD",
+        "/wad/doom2.wad",
+        "/wad/DOOM2.WAD",
+        "/wad/tnt.wad",
+        "/wad/plutonia.wad",
+        "/apps/doom1.wad",
+    ] {
+        if !candidates.iter().any(|c| c == auto) {
+            candidates.push(String::from(auto));
+        }
+    }
+    for path in &candidates {
+        match crate::doom::wad_info(path, 1) {
+            Ok(info) => {
+                let magic = String::from_utf8_lossy(&info.magic);
+                println!("WAD '{}' ({} bytes, {} lumps, {})", path, info.file_size, info.num_lumps, magic);
+                crate::desktop::doom::set_pending_wad(path);
+                if !crate::drivers::fb::is_active() {
+                    println!("No framebuffer (VGA text mode): Doom needs UEFI GOP.");
+                    println!("Reboot with --uefi, then 'doom run'.");
+                    return;
+                }
+                // `doom run` enters the desktop straight into the game
+                // (no mouse click needed); plain `doom` only queues it.
+                if run_now {
+                    println!("Starting Doom...");
+                    crate::desktop::run();
+                } else {
+                    println!("Run 'doom run' to play now, or 'desktop' and click Doom.");
+                }
+                return;
+            }
+            Err(_) => continue,
+        }
+    }
+    if !is_mounted() {
+        println!("doom: filesystem not mounted. Try 'diskinfo', 'mount <drive>'.");
+    } else if let Some(path) = explicit {
+        println!("doom: WAD not readable: '{}' (try 'doominfo {}')", path, path);
+    } else {
+        println!("doom: no WAD found. Mount the WAD disk ('mount <drive>'),");
+        println!("  or pass a path: 'doom /wad/doom2.wad'. Check with 'doominfo'.");
+    }
+}
+
 fn cmd_ps() {
     println!("Process list (cooperative, single-task Phase 1):");
     println!("  PID 1  shell  (running)");
@@ -2489,7 +4006,7 @@ fn cmd_mouse() {
     }
 }
 
-// ── TAB completion ───────────────────────────────────
+// â”€â”€ TAB completion â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 pub fn complete_desktop_input(cmd_buffer: &mut [u8; MAX_CMD_LENGTH], cmd_len: &mut usize) {
     handle_tab_completion(cmd_buffer, cmd_len);

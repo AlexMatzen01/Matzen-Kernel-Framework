@@ -147,7 +147,7 @@ pub fn slot_name(index: usize) -> String {
     }
 }
 
-/// One-line description, e.g. "4 virtio-blk #0: 131072 sectors (64 MB) [VIRTIO]".
+/// One-line description, e.g. "4 virtio-blk #0: 131072 sectors (64 MiB) [VIRTIO]".
 pub fn drive_label(index: usize) -> String {
     let base = slot_name(index);
     let Some(info) = drive_info(index) else {
@@ -162,11 +162,11 @@ pub fn drive_label(index: usize) -> String {
         );
     }
     let mut label = format!(
-        "{} {}: {} sectors ({} MB)",
+        "{} {}: {} sectors ({})",
         index,
         base,
         info.total_sectors,
-        info.total_sectors / 2048
+        crate::shell::human_bytes(info.total_sectors.saturating_mul(512))
     );
     label.push_str(match info.kind {
         DriveKind::Ata => " [ATA]",

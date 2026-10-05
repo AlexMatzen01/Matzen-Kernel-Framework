@@ -18,7 +18,11 @@
 //! decoder still reads it.
 
 use alloc::vec::Vec;
-use lzma_rust2::{Read, Write, XzOptions, XzReader, XzWriter};
+use lzma_rust2::{XzOptions, XzReader, XzWriter};
+#[cfg(test)]
+use std::io::{Read, Write};
+#[cfg(not(test))]
+use lzma_rust2::{Read, Write};
 
 /// XZ stream magic: `FD 37 7A 58 5A 00`.
 const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
@@ -50,10 +54,7 @@ pub fn decompress(data: &[u8], limit: usize) -> Result<Vec<u8>, &'static str> {
         if out.len() >= limit {
             return Err("xz: output too large");
         }
-        let n = reader.read(&mut scratch).map_err(|e| match e {
-            lzma_rust2::Error::OutOfMemory(_) => "xz: out of memory (file needs a bigger heap)",
-            _ => "xz: decode error",
-        })?;
+        let n = reader.read(&mut scratch).map_err(|_| "xz: decode error")?;
         if n == 0 {
             break;
         }
@@ -70,9 +71,6 @@ pub fn compress(data: &[u8]) -> Result<Vec<u8>, &'static str> {
     let options = XzOptions::with_preset(ENCODE_PRESET);
     let mut writer =
         XzWriter::new(Vec::<u8>::new(), options).map_err(|_| "xz: encoder init failed")?;
-    writer.write_all(data).map_err(|e| match e {
-        lzma_rust2::Error::OutOfMemory(_) => "xz: out of memory",
-        _ => "xz: encode error",
-    })?;
+    writer.write_all(data).map_err(|_| "xz: encode error")?;
     writer.finish().map_err(|_| "xz: finish failed")
 }

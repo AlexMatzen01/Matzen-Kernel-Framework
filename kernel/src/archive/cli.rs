@@ -11,19 +11,14 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::TarCompress;
+
 /// `tar` operation mode (`-c` / `-t` / `-x`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TarMode {
     Create,
     List,
     Extract,
-}
-
-/// Forced compression on `tar -c` (default: by archive extension).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TarCompress {
-    Gzip,
-    Xz,
 }
 
 /// Parsed `tar` invocation.
@@ -151,6 +146,10 @@ pub fn parse_tar(args: &str) -> Result<TarArgs, &'static str> {
                 archive = Some(String::from(tokens[i]));
                 i += 1;
             }
+        } else if tokens[i] == "-v" {
+            // Split form for a valueless flag: `tar -x -v -f out.tar`.
+            verbose = true;
+            i += 1;
         } else if is_flag(tokens[i]) {
             // No other flags are valid after the archive (file names
             // starting with '-' are unsupported; rename them first).
@@ -175,19 +174,38 @@ pub fn parse_tar(args: &str) -> Result<TarArgs, &'static str> {
 pub struct ZipArgs {
     /// True with `-0` (stored); default is deflated.
     pub stored: bool,
+    pub verbose: bool,
     pub archive: String,
     pub operands: Vec<String>,
 }
 
-/// Parse `zip` arguments: `zip [-0|-6|-9] <archive.zip> <FILE...>`.
+/// Parse `zip` arguments: `zip [-0|-6|-9] [-v] <archive.zip> <FILE...>`.
+///
+/// Short boolean flags may be clustered (`-9v`) as with real `zip`.
 pub fn parse_zip(args: &str) -> Result<ZipArgs, &'static str> {
     let tokens: Vec<&str> = args.split_whitespace().collect();
     let mut i = 0usize;
     let mut stored = false;
+    let mut verbose = false;
     while i < tokens.len() && is_flag(tokens[i]) {
-        match tokens[i] {
+        let cluster = tokens[i];
+        // `-0`, `-6`, `-9` take no value; everything after `-` is a letter.
+        if cluster.len() > 2 && cluster.as_bytes()[1].is_ascii_digit() {
+            for ch in cluster[1..].chars() {
+                match ch {
+                    '0' => stored = true,
+                    '6' | '9' => stored = false,
+                    'v' => verbose = true,
+                    _ => return Err("unknown flag"),
+                }
+            }
+            i += 1;
+            continue;
+        }
+        match cluster {
             "-0" => stored = true,
             "-6" | "-9" => stored = false,
+            "-v" => verbose = true,
             _ => return Err("unknown flag"),
         }
         i += 1;
@@ -200,26 +218,42 @@ pub fn parse_zip(args: &str) -> Result<ZipArgs, &'static str> {
     if i >= tokens.len() {
         return Err("nothing to archive");
     }
-    Ok(ZipArgs { stored, archive, operands: tokens[i..].iter().map(|s| String::from(*s)).collect() })
+    Ok(ZipArgs { stored, verbose, archive, operands: tokens[i..].iter().map(|s| String::from(*s)).collect() })
 }
 
 /// Parsed `unzip` invocation.
 #[derive(Debug, Clone)]
 pub struct UnzipArgs {
     pub list_only: bool,
+    pub verbose: bool,
     pub archive: String,
     /// `-d DIR` (extract only).
     pub dest: Option<String>,
 }
 
-/// Parse `unzip` arguments: `unzip [-l] <archive.zip> [-d DIR]`.
+/// Parse `unzip` arguments: `unzip [-l] [-v] <archive.zip> [-d DIR]`.
+///
+/// Short boolean flags may be clustered (`-lv`) as with real `unzip`.
 pub fn parse_unzip(args: &str) -> Result<UnzipArgs, &'static str> {
     let tokens: Vec<&str> = args.split_whitespace().collect();
     let mut i = 0usize;
     let mut list_only = false;
+    let mut verbose = false;
     while i < tokens.len() && is_flag(tokens[i]) {
+        if tokens[i].len() > 2 && !tokens[i].as_bytes()[1].is_ascii_digit() {
+            for ch in tokens[i][1..].chars() {
+                match ch {
+                    'l' => list_only = true,
+                    'v' => verbose = true,
+                    _ => return Err("unknown flag"),
+                }
+            }
+            i += 1;
+            continue;
+        }
         match tokens[i] {
             "-l" => list_only = true,
+            "-v" => verbose = true,
             _ => return Err("unknown flag"),
         }
         i += 1;
@@ -248,5 +282,200 @@ pub fn parse_unzip(args: &str) -> Result<UnzipArgs, &'static str> {
             return Err("unexpected argument");
         }
     }
-    Ok(UnzipArgs { list_only, archive, dest })
+    Ok(UnzipArgs { list_only, verbose, archive, dest })
+}
+
+/// `7z` operation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SevenZMode {
+    Add,
+    Extract,
+    List,
+    Test,
+}
+
+/// Parsed `7z` invocation.
+#[derive(Debug, Clone)]
+pub struct SevenZArgs {
+    pub mode: SevenZMode,
+    pub verbose: bool,
+    pub archive: String,
+    pub operands: Vec<String>,
+    pub dest: Option<String>,
+}
+
+/// Parse `7z` arguments: `7z <a|x|t|l> [-v] [-oDIR] <archive.7z> [FILES...]`.
+pub fn parse_7z(args: &str) -> Result<SevenZArgs, &'static str> {
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err("need one of a/x/t/l");
+    }
+    let mode = match tokens[0] {
+        "a" => SevenZMode::Add,
+        "x" => SevenZMode::Extract,
+        "l" => SevenZMode::List,
+        "t" => SevenZMode::Test,
+        _ => return Err("need one of a/x/t/l"),
+    };
+    let mut i = 1usize;
+    let mut verbose = false;
+    let mut dest: Option<String> = None;
+    while i < tokens.len() && is_flag(tokens[i]) {
+        let t = tokens[i];
+        if t == "-v" || t == "-vv" {
+            verbose = true;
+        } else if t == "-o" || t.starts_with("-o") {
+            if dest.is_some() {
+                return Err("duplicate -o");
+            }
+            if t.len() > 2 {
+                dest = Some(String::from(&t[2..]));
+            } else {
+                i += 1;
+                if i >= tokens.len() {
+                    return Err("-o needs a directory");
+                }
+                dest = Some(String::from(tokens[i]));
+            }
+        } else {
+            return Err("unknown flag");
+        }
+        i += 1;
+    }
+if i >= tokens.len() {
+        return Err("missing archive file");
+    }
+    let archive = String::from(tokens[i]);
+    i += 1;
+    // 7-Zip accepts options on either side of the archive name, so trailing
+    // flags are parsed too rather than being mistaken for member names.
+    let mut operands: Vec<String> = Vec::new();
+    while i < tokens.len() {
+        let t = tokens[i];
+        if t == "-v" || t == "-vv" {
+            verbose = true;
+        } else if t == "-o" || t.starts_with("-o") {
+            if dest.is_some() {
+                return Err("duplicate -o");
+            }
+            if t.len() > 2 {
+                dest = Some(String::from(&t[2..]));
+            } else {
+                i += 1;
+                if i >= tokens.len() {
+                    return Err("-o needs a directory");
+                }
+                dest = Some(String::from(tokens[i]));
+            }
+        } else if is_flag(t) {
+            return Err("unknown flag");
+        } else {
+            operands.push(String::from(t));
+        }
+        i += 1;
+    }
+    if mode == SevenZMode::Add && operands.is_empty() {
+        return Err("nothing to archive");
+    }
+    if mode != SevenZMode::Extract && dest.is_some() {
+        return Err("-o is only valid with x");
+    }
+    Ok(SevenZArgs { mode, verbose, archive, operands, dest })
+}
+
+/// `mfk` operation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MfkMode {
+    Create,
+    Extract,
+    List,
+    Test,
+}
+
+/// Parsed `mfk` invocation.
+#[derive(Debug, Clone)]
+pub struct MfkArgs {
+    pub mode: MfkMode,
+    pub verbose: bool,
+    pub archive: String,
+    pub operands: Vec<String>,
+    pub dest: Option<String>,
+}
+
+/// Parse `mfk` arguments: `mfk <c|x|l|t> [-v] [-d DIR] <archive.mfk> [FILES...]`.
+pub fn parse_mfk(args: &str) -> Result<MfkArgs, &'static str> {
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err("need one of c/x/l/t");
+    }
+    let mode = match tokens[0] {
+        "c" => MfkMode::Create,
+        "x" => MfkMode::Extract,
+        "l" => MfkMode::List,
+        "t" => MfkMode::Test,
+        _ => return Err("need one of c/x/l/t"),
+    };
+    let mut i = 1usize;
+    let mut verbose = false;
+    let mut dest: Option<String> = None;
+    while i < tokens.len() && is_flag(tokens[i]) {
+        let t = tokens[i];
+        if t == "-v" || t == "-vv" {
+            verbose = true;
+        } else if t == "-d" || t.starts_with("-d") {
+            if dest.is_some() {
+                return Err("duplicate -d");
+            }
+            if t.len() > 2 {
+                dest = Some(String::from(&t[2..]));
+            } else {
+                i += 1;
+                if i >= tokens.len() {
+                    return Err("-d needs a directory");
+                }
+                dest = Some(String::from(tokens[i]));
+            }
+        } else {
+            return Err("unknown flag");
+        }
+        i += 1;
+    }
+if i >= tokens.len() {
+        return Err("missing archive file");
+    }
+    let archive = String::from(tokens[i]);
+    i += 1;
+    // Options may also trail the archive name, as they do for `7z`.
+    let mut operands: Vec<String> = Vec::new();
+    while i < tokens.len() {
+        let t = tokens[i];
+        if t == "-v" || t == "-vv" {
+            verbose = true;
+        } else if t == "-d" || t.starts_with("-d") {
+            if dest.is_some() {
+                return Err("duplicate -d");
+            }
+            if t.len() > 2 {
+                dest = Some(String::from(&t[2..]));
+            } else {
+                i += 1;
+                if i >= tokens.len() {
+                    return Err("-d needs a directory");
+                }
+                dest = Some(String::from(tokens[i]));
+            }
+        } else if is_flag(t) {
+            return Err("unknown flag");
+        } else {
+            operands.push(String::from(t));
+        }
+        i += 1;
+    }
+    if mode == MfkMode::Create && operands.is_empty() {
+        return Err("nothing to archive");
+    }
+    if mode != MfkMode::Extract && dest.is_some() {
+        return Err("-d is only valid with x");
+    }
+    Ok(MfkArgs { mode, verbose, archive, operands, dest })
 }
