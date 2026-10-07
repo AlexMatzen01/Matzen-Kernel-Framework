@@ -137,6 +137,55 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=doomc/");
     println!("cargo:rerun-if-changed=../vendor/doomgeneric/");
+    // Mouse cursors: every image in cursors/ is bundled into
+    // src/desktop/cursor_data.rs via tools/convert_cursor.py. Rebuild when
+    // the set changes (a missing re-run only warns; see below).
+    println!("cargo:rerun-if-changed=../cursors/");
+    println!("cargo:rerun-if-changed=src/desktop/cursor_data.rs");
+    println!("cargo:rerun-if-changed=../tools/convert_cursor.py");
+
+    // Warn when cursors/ changed without re-running the bundler script, so
+    // a newly added cursor image is not silently missing from the kernel.
+    {
+        let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        let generated = manifest.join("src/desktop/cursor_data.rs");
+        let dirs = manifest.join("../cursors");
+        let stale = match (
+            std::fs::metadata(&generated).and_then(|m| m.modified()),
+            std::fs::read_dir(&dirs),
+        ) {
+            (Ok(gen_time), Ok(rd)) => rd.filter_map(|e| e.ok()).any(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| {
+                        matches!(
+                            x.to_ascii_lowercase().as_str(),
+                            "png"
+                                | "jpg"
+                                | "jpeg"
+                                | "bmp"
+                                | "gif"
+                                | "webp"
+                                | "ico"
+                                | "cur"
+                                | "hotspot"
+                        )
+                    })
+                    .unwrap_or(false)
+                    && std::fs::metadata(e.path())
+                        .and_then(|m| m.modified())
+                        .map(|t| t > gen_time)
+                        .unwrap_or(false)
+            }),
+            _ => false,
+        };
+        if stale {
+            println!(
+                "cargo:warning=cursors: cursors/ is newer than cursor_data.rs; run `python3 tools/convert_cursor.py` to bundle new cursor images"
+            );
+        }
+    }
 
     let target = env::var("TARGET").unwrap_or_default();
     if !target.contains("mfk") {

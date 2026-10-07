@@ -27,6 +27,161 @@ const WGET_TIMEOUT_MS: u64 = 25000;
 const MAX_PATH_LEN: usize = 128;
 /// Same-scheme redirects followed per invocation.
 const MAX_REDIRECTS: usize = 3;
+/// Width of the `[---...]` meter bar in characters.
+const PROGRESS_BAR_WIDTH: usize = 20;
+/// Minimum milliseconds between meter redraws (serial/console flood guard).
+const PROGRESS_MIN_INTERVAL_MS: u64 = 150;
+/// On-screen width (including `\r`) that a meter line is padded to, so a
+/// shorter redraw always overwrites the previous line. Fits 80 columns.
+const PROGRESS_LINE_WIDTH: usize = 64;
+/// Binary unit labels for the `x.xx` size fields.
+const SIZE_UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+
+/// Pick the display unit index (0 = KiB) for `bytes`: the largest unit whose
+/// value is >= 1. Sub-KiB values render as `0.xx KiB`.
+fn progress_unit(bytes: u64) -> usize {
+    let mut unit = 0;
+    while unit + 1 < SIZE_UNITS.len() && bytes >= 1u64 << (10 * (unit + 2)) {
+        unit += 1;
+    }
+    unit
+}
+
+/// Split `bytes` into whole + two-decimal-fraction parts in `unit`.
+/// Pure integer math (the kernel target is soft-float): the fraction comes
+/// from the bits shifted out, so no overflow is possible for any `u64`.
+fn format_scaled(bytes: u64, unit: usize) -> (u64, u64) {
+    let shift = 10 * (unit + 1);
+    let whole = bytes >> shift;
+    let frac = ((bytes & ((1u64 << shift) - 1)).saturating_mul(100)) >> shift;
+    (whole, frac)
+}
+
+/// Tenths of a percent (0..=1000) of `done / total`; 0 when `total` is 0.
+/// `done` is capped at `total` so an over-long body still reads `100.0%`.
+fn progress_tenths(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    (done.min(total).saturating_mul(1000) / total).min(1000)
+}
+
+/// Live `[---...] xx.x% | x.xx/x.xx UUU` meter state for one download hop.
+/// Unknown totals (chunked / close-delimited bodies) render an empty bar,
+/// `--.-%` and `??` for the total side.
+struct WgetProgress {
+    total: Option<u64>,
+    downloaded: u64,
+    last_draw_ms: u64,
+    active: bool,
+}
+
+impl WgetProgress {
+    fn new() -> Self {
+        Self { total: None, downloaded: 0, last_draw_ms: 0, active: false }
+    }
+
+    /// New hop: close any on-screen line and forget counters/totals.
+    fn reset(&mut self) {
+        if self.active {
+            crate::println!();
+            self.active = false;
+        }
+        self.total = None;
+        self.downloaded = 0;
+        self.last_draw_ms = 0;
+    }
+
+    fn set_total(&mut self, total: Option<u64>) {
+        self.total = total;
+    }
+
+    /// Record sunk body bytes (pure counter update, no I/O: safe to call
+    /// from unit tests, unlike the draw paths which touch the VGA console).
+    fn add(&mut self, bytes: u64) {
+        self.downloaded = self.downloaded.saturating_add(bytes);
+    }
+
+    fn line(&self) -> String {
+        let mut line = match self.total {
+            Some(total) if total > 0 => {
+                let tenths = progress_tenths(self.downloaded, total);
+                let filled = (tenths as usize * PROGRESS_BAR_WIDTH) / 1000;
+                let mut bar = String::from("[");
+                for i in 0..PROGRESS_BAR_WIDTH {
+                    bar.push(if i < filled { '-' } else { '.' });
+                }
+                bar.push(']');
+                // Both sides share the total's unit so they stay comparable.
+                let unit = progress_unit(total);
+                let (done_whole, done_frac) = format_scaled(self.downloaded.min(total), unit);
+                let (total_whole, total_frac) = format_scaled(total, unit);
+                alloc::format!(
+                    "\r{} {}.{}% | {}.{:02}/{}.{:02} {}",
+                    bar,
+                    tenths / 10,
+                    tenths % 10,
+                    done_whole,
+                    done_frac,
+                    total_whole,
+                    total_frac,
+                    SIZE_UNITS[unit]
+                )
+            }
+            _ => {
+                let unit = progress_unit(self.downloaded);
+                let (done_whole, done_frac) = format_scaled(self.downloaded, unit);
+                let mut bar = String::from("[");
+                for _ in 0..PROGRESS_BAR_WIDTH {
+                    bar.push('.');
+                }
+                bar.push(']');
+                alloc::format!(
+                    "\r{} --.-% | {}.{:02} {}/??",
+                    bar, done_whole, done_frac, SIZE_UNITS[unit]
+                )
+            }
+        };
+        while line.len() < PROGRESS_LINE_WIDTH {
+            line.push(' ');
+        }
+        line
+    }
+
+    /// Redraw the meter if it is new or the throttle interval has passed.
+    /// Touches the console: never call from unit tests (assert on `line()`).
+    fn draw_if_due(&mut self, now: u64) {
+        self.maybe_draw(now, false);
+    }
+
+    fn maybe_draw(&mut self, now: u64, force: bool) {
+        if self.active && !force && now.saturating_sub(self.last_draw_ms) < PROGRESS_MIN_INTERVAL_MS
+        {
+            return;
+        }
+        self.last_draw_ms = now;
+        self.active = true;
+        crate::print!("{}", self.line());
+    }
+
+    /// Download complete: force the final draw and close the line.
+    fn finish(&mut self, now: u64) {
+        if !self.active {
+            return;
+        }
+        self.maybe_draw(now, true);
+        crate::println!();
+        self.active = false;
+    }
+
+    /// Download aborted/failed: close any partial line without redrawing.
+    fn abort(&mut self) {
+        if self.active {
+            crate::println!();
+            self.active = false;
+        }
+    }
+}
 
 fn parse_timeout(value: &str) -> Result<u64, &'static str> {
     let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
@@ -347,12 +502,30 @@ where
     Ok(())
 }
 
-fn discard_staging_file(
-    staging: &mut Option<String>,
-    device: &mut dyn crate::drivers::block::BlockDevice,
-) {
+/// `stream_body` plus meter accounting: only bytes actually handed to `sink`
+/// advance the meter (measured as the delta of `body_written`).
+fn stream_body_counted<F>(
+    bytes: &[u8],
+    chunked: bool,
+    decoder: &mut Option<ChunkedDecoder>,
+    content_length: Option<u64>,
+    body_written: &mut u64,
+    progress: &mut WgetProgress,
+    sink: &mut F,
+) -> Result<(), &'static str>
+where
+    F: FnMut(&[u8]) -> Result<(), &'static str>,
+{
+    let before = *body_written;
+    stream_body(bytes, chunked, decoder, content_length, body_written, sink)?;
+    progress.add(body_written.saturating_sub(before));
+    progress.draw_if_due(now_ms());
+    Ok(())
+}
+
+fn discard_staging_file(staging: &mut Option<String>) {
     if let Some(path) = staging.take() {
-        let _ = crate::shell::remove_file_contents(&path, device);
+        let _ = crate::shell::remove_file_contents(&path);
     }
 }
 
@@ -367,13 +540,14 @@ fn fetch_once<F>(
     path: &str,
     ip: [u8; 4],
     timeout_ms: u64,
+    progress: &mut WgetProgress,
     sink: &mut F,
 ) -> Result<FetchResult, &'static str>
 where
     F: FnMut(&[u8]) -> Result<(), &'static str>,
 {
     if secure {
-        return fetch_https_once(host, port, path, ip, timeout_ms, sink);
+        return fetch_https_once(host, port, path, ip, timeout_ms, progress, sink);
     }
     let local = connect_wait(ip, port, core::cmp::min(CONNECT_TIMEOUT_MS, timeout_ms))?;
     let req = build_get(host, path);
@@ -392,18 +566,19 @@ where
             if let Some(chunk) = crate::net::tcp::read_data(local) {
                 last_data = now_ms();
                 if header_len.is_some() {
-                    stream_body(
+                    stream_body_counted(
                         &chunk,
                         chunked,
                         &mut chunk_decoder,
                         content_len,
                         &mut body_written,
+                        progress,
                         sink,
                     )?;
                 } else {
                     headers.extend_from_slice(&chunk);
                     if headers.len() > MAX_HEADER + super::http::TCP_CHUNK
-                        && find_headers_end(&headers).is_none()
+                    && find_headers_end(&headers).is_none()
                     {
                         return Err("HTTP header too large");
                     }
@@ -424,13 +599,15 @@ where
                         } else {
                             parse_content_length(&headers[..end])
                         };
+                        progress.set_total(if chunked { None } else { content_len });
                         let rest = &headers[end..];
-                        stream_body(
+                        stream_body_counted(
                             rest,
                             chunked,
                             &mut chunk_decoder,
                             content_len,
                             &mut body_written,
+                            progress,
                             sink,
                         )?;
                         header_len = Some(end);
@@ -500,28 +677,56 @@ fn fetch_https_once<F>(
     path: &str,
     ip: [u8; 4],
     timeout_ms: u64,
+    progress: &mut WgetProgress,
     sink: &mut F,
 ) -> Result<FetchResult, &'static str>
 where
     F: FnMut(&[u8]) -> Result<(), &'static str>,
 {
+    // fetch_https_once is only called for HTTPS (see fetch_once), so the
+    // clock is always required here.
+    if !crate::time::is_initialized() {
+        return Err("wall clock not set (TLS certificate checks need RTC time)");
+    }
     let mut root_storage = Vec::new();
+    // Largest embedded anchor DER is ~1.4 KiB (ISRG Root X1).
     root_storage.resize(2048, 0);
-    let root = super::tls::load_default_root(&mut root_storage)?;
     let mut read_storage = Vec::new();
     read_storage.resize(16_640, 0);
     let mut write_storage = Vec::new();
     write_storage.resize(16_640, 0);
-    let mut stream = super::tls::TlsStream::connect_with_timeout(
-        host,
-        ip,
-        port,
-        root,
-        &mut read_storage,
-        &mut write_storage,
-        timeout_ms,
-    )
-    .map_err(|_| "TLS handshake or certificate verification failed")?;
+    // A failed handshake consumes its socket and TLS buffers, so each trust
+    // anchor gets a fresh connection. Verification happens before any byte
+    // is requested, hence retrying never duplicates a download.
+    let mut stream = 'anchors: loop {
+        for anchor in 0..super::tls::TRUSTED_ROOTS.len() {
+            let root = super::tls::load_anchor(&mut root_storage, anchor)?;
+            match super::tls::TlsStream::connect_with_timeout(
+                host,
+                ip,
+                port,
+                root,
+                &mut read_storage,
+                &mut write_storage,
+                timeout_ms,
+            ) {
+                Ok(stream) => break 'anchors stream,
+                Err(error)
+                    if super::tls::is_cert_failure(&error)
+                        && anchor + 1 < super::tls::TRUSTED_ROOTS.len() =>
+                {
+                    crate::net_log!(
+                        "TLS: anchor '{}' rejected ({:?}), trying next",
+                        super::tls::TRUSTED_ROOTS[anchor].0,
+                        error
+                    );
+                    continue;
+                }
+                Err(error) => return Err(super::tls::tls_error_message(&error)),
+            }
+        }
+        unreachable!("TRUSTED_ROOTS is never empty");
+    };
     let request = build_get(host, path);
     stream
         .write_all(&request)
@@ -545,12 +750,13 @@ where
         }
         let chunk = &incoming[..count];
         if header_len.is_some() {
-            stream_body(
+            stream_body_counted(
                 chunk,
                 chunked,
                 &mut chunk_decoder,
                 content_len,
                 &mut body_written,
+                progress,
                 sink,
             )?;
         } else {
@@ -576,13 +782,15 @@ where
                 } else {
                     parse_content_length(&headers[..end])
                 };
+                progress.set_total(if chunked { None } else { content_len });
                 let rest = &headers[end..];
-                stream_body(
+                stream_body_counted(
                     rest,
                     chunked,
                     &mut chunk_decoder,
                     content_len,
                     &mut body_written,
+                    progress,
                     sink,
                 )?;
                 header_len = Some(end);
@@ -635,9 +843,10 @@ pub fn cmd_run(args: &str) {
     if args.is_empty() || args == "--help" || args == "-h" || args == "help" {
         crate::println!("Usage: wget [-d|--debug] [-td=5s|--td=5s|--timeout=5s] <http-url> <local-file>");
         crate::println!("  e.g. wget http://10.0.2.2:8000/hello.txt /docs/hello.txt");
-        crate::println!("  HTTP works by default; HTTPS requires a net_tls-enabled build.");
+        crate::println!("  TLS is on by default (build with --no-tls to omit it).");
         crate::println!("  Requires mounted FS ('mount').");
         crate::println!("  Follows up to 3 HTTP(S) redirects.");
+        crate::println!("  Shows a live [---...] xx.x% | x.xx/x.xx UNIT meter.");
         crate::println!("  Timeout: -td=5s, --td=5s or --timeout=5s (also ms and m; default 25s).");
         crate::println!("  Downloads stream to disk and are limited by free filesystem space.");
         crate::println!("  Ctrl+C cancels. Clock granularity is 10 ms.");
@@ -665,6 +874,10 @@ pub fn cmd_run(args: &str) {
             return;
         }
     };
+    if secure && !crate::time::is_initialized() {
+        crate::println!("wget failed: wall clock not set (TLS certificate checks need RTC time)");
+        return;
+    }
     crate::shell::clear_interrupt();
     let start = now_ms();
     crate::println!("Resolving {}...", host);
@@ -682,13 +895,13 @@ pub fn cmd_run(args: &str) {
         port,
         path
     );
-    let mut device = crate::shell::mounted_device();
     let mut staging: Option<String> = None;
     let mut downloaded = 0u64;
+    let mut progress = WgetProgress::new();
     let mut complete = false;
     // Create the staging file up front so an unwritable destination fails
     // fast (before any networking) with the drive in the message.
-    match crate::shell::create_download_staging_file(dest, &mut device) {
+    match crate::shell::create_download_staging_file(dest) {
         Ok(path) => staging = Some(path),
         Err(error) => {
             crate::println!(
@@ -701,28 +914,28 @@ pub fn cmd_run(args: &str) {
         }
     }
     for hop in 0..=MAX_REDIRECTS {
+        progress.reset();
         if interrupted() {
-            discard_staging_file(&mut staging, &mut device);
+            discard_staging_file(&mut staging);
+            progress.abort();
             crate::println!("wget cancelled.");
             crate::shell::clear_interrupt();
             return;
         }
         let elapsed = now_ms().saturating_sub(start);
         if elapsed >= timeout_ms {
-            discard_staging_file(&mut staging, &mut device);
+            discard_staging_file(&mut staging);
+            progress.abort();
             crate::println!("wget failed: operation timed out");
             return;
         }
         let response = {
             let mut sink = |bytes: &[u8]| {
                 if staging.is_none() {
-                    staging = Some(crate::shell::create_download_staging_file(
-                        dest,
-                        &mut device,
-                    )?);
+                    staging = Some(crate::shell::create_download_staging_file(dest)?);
                 }
                 let path = staging.as_ref().ok_or("Staging file unavailable")?;
-                crate::shell::append_file_contents(path, bytes, &mut device)?;
+                crate::shell::append_file_contents(path, bytes)?;
                 downloaded = downloaded.saturating_add(bytes.len() as u64);
                 Ok(())
             };
@@ -733,18 +946,21 @@ pub fn cmd_run(args: &str) {
                 &path,
                 ip,
                 timeout_ms.saturating_sub(elapsed),
+                &mut progress,
                 &mut sink,
             )
         };
         match response {
             Ok(FetchResult::Complete) => {
+                progress.finish(now_ms());
                 complete = true;
                 break;
             }
             Ok(FetchResult::Redirect(loc)) => {
                 if hop >= MAX_REDIRECTS {
+                    progress.abort();
                     crate::println!("wget failed: Too many redirects");
-                    discard_staging_file(&mut staging, &mut device);
+                    discard_staging_file(&mut staging);
                     return;
                 }
                 match resolve_location(secure, &host, port, &path, &loc) {
@@ -766,26 +982,28 @@ pub fn cmd_run(args: &str) {
                             Ok(ip) => ip,
                             Err(e) => {
                                 crate::println!("DNS failed for '{}': {}", host, e);
-                                discard_staging_file(&mut staging, &mut device);
+                                discard_staging_file(&mut staging);
                                 return;
                             }
                         };
                         continue;
                     }
                     Err(e) => {
+                        progress.abort();
                         crate::println!("wget failed: {}", e);
-                        discard_staging_file(&mut staging, &mut device);
+                        discard_staging_file(&mut staging);
                         return;
                     }
                 }
             }
             Err(e) => {
+                progress.abort();
                 if interrupted() {
-                    discard_staging_file(&mut staging, &mut device);
+                    discard_staging_file(&mut staging);
                     crate::println!("wget cancelled.");
                     crate::shell::clear_interrupt();
                 } else {
-                    discard_staging_file(&mut staging, &mut device);
+                    discard_staging_file(&mut staging);
                     crate::println!("wget failed: {}", e);
                 }
                 return;
@@ -793,18 +1011,19 @@ pub fn cmd_run(args: &str) {
         }
     }
     if !complete {
-        discard_staging_file(&mut staging, &mut device);
+        progress.abort();
+        discard_staging_file(&mut staging);
         crate::println!("wget failed: Too many redirects");
         return;
     }
     if interrupted() {
-        discard_staging_file(&mut staging, &mut device);
+        discard_staging_file(&mut staging);
         crate::println!("wget cancelled.");
         crate::shell::clear_interrupt();
         return;
     }
     if staging.is_none() {
-        match crate::shell::create_download_staging_file(dest, &mut device) {
+        match crate::shell::create_download_staging_file(dest) {
             Ok(path) => staging = Some(path),
             Err(error) => {
                 crate::println!(
@@ -818,10 +1037,10 @@ pub fn cmd_run(args: &str) {
         }
     }
     let staged_path = staging.take().unwrap();
-    match crate::shell::promote_download_file(&staged_path, dest, &mut device) {
+    match crate::shell::promote_download_file(&staged_path, dest) {
         Ok(()) => crate::println!("Saved {} bytes to '{}'", downloaded, dest),
         Err(error) => {
-            let _ = crate::shell::remove_file_contents(&staged_path, &mut device);
+            let _ = crate::shell::remove_file_contents(&staged_path);
             crate::println!("Failed to save '{}': {}", dest, error);
         }
     }
@@ -882,5 +1101,56 @@ mod tests {
             parse_wget_args("wget --td 5s").map(|_| ()),
             Err("timeout must use =, e.g. --timeout=5s")
         );
+    }
+
+    #[test]
+    fn progress_unit_picks_largest_fitting_binary_unit() {
+        use super::{format_scaled, progress_tenths, progress_unit};
+        assert_eq!(progress_unit(0), 0);
+        assert_eq!(progress_unit(1023), 0);
+        assert_eq!(progress_unit(1024), 0);
+        assert_eq!(progress_unit(1024 * 1024 - 1), 0);
+        assert_eq!(progress_unit(1024 * 1024), 1);
+        assert_eq!(progress_unit(5 * 1024 * 1024 * 1024), 2);
+        assert_eq!(progress_unit(3 * 1024 * 1024 * 1024 * 1024), 3);
+        assert_eq!(progress_unit(7 * 1024 * 1024 * 1024 * 1024 * 1024), 4);
+        assert_eq!(progress_unit(u64::MAX), 4);
+        assert_eq!(format_scaled(0, 0), (0, 0));
+        assert_eq!(format_scaled(1024, 0), (1, 0));
+        assert_eq!(format_scaled(1536, 0), (1, 50));
+        assert_eq!(format_scaled(1023, 0), (0, 99));
+        assert_eq!(format_scaled(2 * 1024 * 1024 + 512 * 1024, 1), (2, 50));
+        assert_eq!(format_scaled(1024 * 1024 * 1024, 2), (1, 0));
+        assert_eq!(progress_tenths(0, 100), 0);
+        assert_eq!(progress_tenths(50, 100), 500);
+        assert_eq!(progress_tenths(100, 100), 1000);
+        assert_eq!(progress_tenths(250, 100), 1000);
+        assert_eq!(progress_tenths(5, 0), 0);
+    }
+
+    #[test]
+    fn progress_line_matches_spec_format() {
+        use super::WgetProgress;
+        // Half of 200 bytes: 10/20 dashes, 50.0%, shared KiB unit.
+        // (add() never draws, so this stays host-safe; assert on line().)
+        let mut sized = WgetProgress::new();
+        sized.set_total(Some(200));
+        sized.add(100);
+        let line = sized.line();
+        assert!(line.contains("[----------..........]"), "bar: {}", line);
+        assert!(line.contains("50.0%"), "pct: {}", line);
+        assert!(line.contains("0.09/0.19 KiB"), "sizes: {}", line);
+        // Completion caps at 100.0% with a full bar.
+        sized.add(100);
+        let done = sized.line();
+        assert!(done.contains("[--------------------]"), "bar: {}", done);
+        assert!(done.contains("100.0%"), "pct: {}", done);
+        // Unknown total: empty bar, placeholder percent and total side.
+        let mut unknown = WgetProgress::new();
+        unknown.add(1536);
+        let open = unknown.line();
+        assert!(open.contains("[....................]"), "bar: {}", open);
+        assert!(open.contains("--.-%"), "pct: {}", open);
+        assert!(open.contains("1.50 KiB/??"), "sizes: {}", open);
     }
 }

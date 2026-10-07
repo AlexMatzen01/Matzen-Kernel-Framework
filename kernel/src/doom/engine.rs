@@ -168,8 +168,7 @@ pub extern "C" fn mfk_fs_read(
         return -1;
     }
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len as usize) };
-    let mut device = crate::shell::mounted_device();
-    match crate::shell::read_file_chunk(p, &mut device, offset, out) {
+    match crate::shell::read_file_chunk(p, offset, out) {
         Ok(n) => n as i64,
         Err(_) => -1,
     }
@@ -189,8 +188,7 @@ pub extern "C" fn mfk_fs_write(path: *const c_char, buf: *const u8, len: u64) ->
         return -1;
     }
     let data = unsafe { core::slice::from_raw_parts(buf, len as usize) };
-    let mut device = crate::shell::mounted_device();
-    match crate::shell::write_file_contents(p, data, &mut device) {
+    match crate::shell::write_file_contents(p, data) {
         Ok(()) => len as i64,
         Err(_) => -1,
     }

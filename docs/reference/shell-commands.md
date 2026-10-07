@@ -419,8 +419,9 @@ datagram does not fit a 1500-byte link, so it is split into three pieces and put
 back together at the receiver.
 
 ### `wget <http(s)-url> <file>`
-Download an HTTP(S) response to the mounted SimplFS filesystem. HTTP works in
-the default build; HTTPS requires the optional `net_tls` feature.
+Download an HTTP(S) response to the mounted SimplFS filesystem. TLS is
+enabled by default; build with `--no-tls` to omit it (HTTPS then reports
+that TLS is not enabled).
 
 ### `speedtest` / `speedtest-server`
 Run a LibreSpeed-compatible test or display/set its server URL.
@@ -430,7 +431,8 @@ Enable or disable gated per-packet serial diagnostics. `wget` and `speedtest`
 also accept `-d` or `--debug` for one invocation.
 
 ### `tlsinfo`
-Show whether the optional TLS 1.3 backend is compiled into the kernel.
+Show whether the TLS 1.3 backend is compiled into the kernel (on by
+default; `--no-tls` builds the stub instead).
 
 ## File System Commands
 
@@ -446,7 +448,9 @@ Disk Information:
 ```
 
 ### `mkfs`
-Format disk with SimpleFS filesystem.
+Format disk with SimpleFS filesystem. Only SimplFS can be created by MFK
+itself; ext4/exFAT drivers mount existing images (created by host tools)
+but intentionally do not format fresh ones.
 
 ```bash
 mfk> mkfs
@@ -457,21 +461,58 @@ Filesystem created and mounted
 Creates inode table and initializes filesystem structures.
 
 ### `mount`
-Mount the filesystem.
+Mount a filesystem. With no format named, the device is probed (SimplFS,
+then ext4, then exFAT) and whatever is found is mounted; unknown content is
+refused rather than blind-mounted.
 
 ```bash
 mfk> mount
-Filesystem mounted
+simplfs filesystem mounted successfully from drive 1!
+mfk> mount 4 exfat
+exfat filesystem mounted successfully from drive 4!
 ```
 
-Must run after `mkfs` or on an existing formatted disk. Mounting is read-only
-with respect to the superblock, and validates the on-disk geometry (block size,
-inode count, bitmap position and size) before handing back a filesystem.
+Must run after `mkfs` or on an existing formatted disk. Mounting validates
+the on-disk geometry before handing back a filesystem. Only one filesystem
+is active at a time; mounting a new drive replaces the current mount.
 
-`mount` refuses a **version 1** image: version 1 kept free-space state only in
-RAM and reconstructed it by walking every inode, so a block whose owning inode
-record had not reached the platter was handed out a second time. Run `mkfs` to
-reformat.
+`mount` refuses a **version 1** SimplFS image: version 1 kept free-space
+state only in RAM and reconstructed it by walking every inode, so a block
+whose owning inode record had not reached the platter was handed out a
+second time. Run `mkfs` to reformat.
+
+ext4 images mount read-write only when cleanly unmounted (no journal
+recovery pending); otherwise the mount is refused for writing. Images with
+`metadata_csum`, inline data, encryption or casefold are refused outright
+rather than risk silent corruption.
+
+### `umount`
+Unmount the active filesystem.
+
+```bash
+mfk> umount
+Filesystem unmounted.
+```
+
+### `stat <path>`
+Show file metadata (type, size, link count, owner, mode, timestamps).
+
+```bash
+mfk> stat /hello.txt
+  File: /hello.txt
+  Type: file  Size: 15  Links: 1
+```
+
+### `df`
+Show the mounted filesystem type, mount drive, and block-cache hit rate.
+
+### `cp <src> <dst>` / `mv <src> <dst>`
+Copy a file, or move/rename a file or directory. A trailing slash on the
+destination keeps the source file name (`cp a.txt backup/`).
+
+### `ln [-s] <target> <link>`
+Hard link or symbolic link. Only filesystems with link support (ext4)
+accept these; SimplFS and exFAT report `Unsupported`.
 
 ### `fsck`
 Check filesystem consistency. Read-only: nothing on disk is modified.

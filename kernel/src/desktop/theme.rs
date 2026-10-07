@@ -15,8 +15,11 @@ pub struct ThemeColors {
     pub panel_bg: u32,
     pub panel_border: u32,
     pub accent: u32,
+    pub accent_glow: u32,
     pub title_active: u32,
+    pub title_active_top: u32,
     pub title_inactive: u32,
+    pub title_inactive_top: u32,
     pub text: u32,
     pub text_muted: u32,
     pub button_bg: u32,
@@ -27,27 +30,36 @@ pub struct ThemeColors {
     pub scrollbar_bg: u32,
     pub scrollbar_thumb: u32,
     pub scrollbar_hover: u32,
+    pub shadow: u32,
+    pub glass_hi: u32,
+    pub taskbar_bg: u32,
 }
 
 impl ThemeColors {
     pub const fn default() -> Self {
         Self {
-            bg: 0x102a4e,
-            panel_bg: 0x1c4476,
-            panel_border: 0xebebeb,
+            bg: 0x0b0f14,
+            panel_bg: 0x151b24,
+            panel_border: 0x2a3441,
             accent: 0x00be5a,
-            title_active: 0x005cac,
-            title_inactive: 0x696969,
-            text: 0xffffff,
-            text_muted: 0xaaaaaa,
-            button_bg: 0x005cac,
-            button_hover: 0x0078d4,
-            button_press: 0x003d7a,
+            accent_glow: 0x00e06e,
+            title_active: 0x0e5a34,
+            title_active_top: 0x159a58,
+            title_inactive: 0x232b36,
+            title_inactive_top: 0x2e3947,
+            text: 0xf2f5f8,
+            text_muted: 0x8a93a0,
+            button_bg: 0x1d2632,
+            button_hover: 0x26313f,
+            button_press: 0x0e5a34,
             button_text: 0xffffff,
             cursor: 0xffffffff,
-            scrollbar_bg: 0x1c4476,
-            scrollbar_thumb: 0x696969,
-            scrollbar_hover: 0xaaaaaa,
+            scrollbar_bg: 0x151b24,
+            scrollbar_thumb: 0x3a4656,
+            scrollbar_hover: 0x4d5c71,
+            shadow: 0x000000,
+            glass_hi: 0xffffff,
+            taskbar_bg: 0x0e1319,
         }
     }
 }
@@ -101,12 +113,12 @@ pub struct ThemeMetrics {
 impl ThemeMetrics {
     pub const fn default() -> Self {
         Self {
-            window_border: 2,
-            titlebar_height: 28,
+            window_border: 1,
+            titlebar_height: 32,
             button_padding_x: 16,
             button_padding_y: 8,
-            panel_radius: 4,
-            taskbar_height: 36,
+            panel_radius: 9,
+            taskbar_height: 44,
             icon_size: 48,
         }
     }
@@ -158,8 +170,11 @@ impl Theme {
         let (bg, accent) = (bg & 0xFFFFFF, accent & 0xFFFFFF);
         self.colors.bg = bg;
         self.colors.accent = accent;
-        self.colors.button_bg = accent;
-        self.colors.title_active = accent;
+        self.colors.accent_glow = Self::alpha_blend(accent, 0xFFFFFF, 48);
+        // Glass look: buttons stay dark, accent shows on hover/press/title.
+        self.colors.button_bg = Self::alpha_blend(0x1D2632, accent, 18);
+        self.colors.title_active = Self::alpha_blend(accent, 0x000000, 110);
+        self.colors.title_active_top = Self::alpha_blend(accent, 0xFFFFFF, 52);
         self.colors.button_hover = Self::alpha_blend(accent, 0xFFFFFF, 40);
         self.colors.button_press = Self::alpha_blend(accent, 0x000000, 60);
     }

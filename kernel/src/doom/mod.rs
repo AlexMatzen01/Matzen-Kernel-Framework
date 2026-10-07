@@ -88,13 +88,9 @@ fn read_exact_at(path: &str, offset: u64, out: &mut [u8]) -> Result<(), &'static
     if !crate::shell::is_mounted() {
         return Err("Filesystem not mounted. Use 'mount' first.");
     }
-    let mut device = crate::shell::mounted_device();
     let mut done = 0usize;
     while done < out.len() {
-        let n = crate::shell::read_file_chunk(
-            path,
-            &mut device,
-            offset + done as u64,
+        let n = crate::shell::read_file_chunk(path, offset + done as u64,
             &mut out[done..],
         )?;
         if n == 0 {
@@ -111,7 +107,6 @@ pub fn wad_info(path: &str, preview: usize) -> Result<WadInfo, &'static str> {
     if !crate::shell::is_mounted() {
         return Err("Filesystem not mounted. Use 'mount' first.");
     }
-    let mut device = crate::shell::mounted_device();
     let file_size = {
         let guard_size = crate::shell::mounted_file_size(path)?;
         guard_size
@@ -146,7 +141,6 @@ pub fn wad_info(path: &str, preview: usize) -> Result<WadInfo, &'static str> {
             name,
         };
         // Skip device re-resolve: read_exact_at handles it.
-        let _ = &mut device;
         first_lumps.push(lump.name_str());
     }
     Ok(WadInfo {
@@ -207,11 +201,7 @@ pub fn wad_lump_by_index(
         if !crate::shell::is_mounted() {
             return Err("Filesystem not mounted");
         }
-        let mut device = crate::shell::mounted_device();
-        let n = crate::shell::read_file_chunk(
-            path,
-            &mut device,
-            lump.file_pos as u64 + done as u64,
+        let n = crate::shell::read_file_chunk(path, lump.file_pos as u64 + done as u64,
             &mut data[done..],
         )?;
         if n == 0 {

@@ -79,10 +79,9 @@ impl TextBuffer {
         if !mounted {
             return None;
         }
-        let mut device = crate::shell::mounted_device();
         // Need to get file data via FS
         // We need access to FILESYSTEM – we will expose a helper in shell
-        crate::shell::read_file_contents(name, &mut device)
+        crate::shell::read_file_contents(name)
     }
 
     pub fn from_bytes(data: Vec<u8>, filename: Option<String>) -> Self {
@@ -840,8 +839,7 @@ impl TextBuffer {
         }
         let data = self.to_bytes();
         // Use shell's helper to write – it creates if not exists
-        let mut device = crate::shell::mounted_device();
-        crate::shell::write_file_contents(name, &data, &mut device)?;
+        crate::shell::write_file_contents(name, &data)?;
         self.filename = Some(String::from(name));
         self.dirty = false;
         Ok(data.len())

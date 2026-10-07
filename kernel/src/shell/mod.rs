@@ -40,7 +40,13 @@ const BUILTINS: &[&str] = &[
     "diskinfo",
     "mkfs",
     "mount",
+    "umount",
     "fsck",
+    "stat",
+    "df",
+    "cp",
+    "mv",
+    "ln",
     "ls",
     "dir",
     "touch",
@@ -111,18 +117,15 @@ pub fn desktop_prompt() -> alloc::string::String {
 }
 
 fn current_path_string() -> Option<alloc::string::String> {
-    let fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_some() {
-        drop(fs_guard);
-        let mut device = mounted_device();
-        let mut guard = FILESYSTEM.lock();
-        if let Some(ref mut fs) = *guard {
-            if let Ok(p) = fs.current_path(&mut device) {
-                return Some(p);
-            }
-        }
+    if !crate::fs::vfs::is_mounted() {
+        return None;
     }
-    None
+    let p = crate::fs::vfs::cwd();
+    if p.is_empty() {
+        None
+    } else {
+        Some(p)
+    }
 }
 
 /// Millisecond-ish monotonic counter. PIT IRQ0 advances this by 10ms; the
@@ -133,12 +136,9 @@ static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Global interrupt flag for Ctrl+C handling
 static INTERRUPT_FLAG: AtomicBool = AtomicBool::new(false);
 
-/// Global filesystem state
-static FILESYSTEM: Mutex<Option<crate::fs::SimpleFilesystem>> = Mutex::new(None);
-
 /// Which unified drive index the filesystem is mounted from (None = default
 /// data drive). Set on every successful `mount`, cleared on `mkfs` of the
-/// mounted drive.
+/// mounted drive. The mounted filesystem instance itself lives in the VFS.
 static MOUNTED_DRIVE: Mutex<Option<usize>> = Mutex::new(None);
 
 /// Currently mounted drive index (defaults to the data drive).
@@ -146,10 +146,47 @@ pub fn mounted_drive() -> usize {
     (*MOUNTED_DRIVE.lock()).unwrap_or(crate::drivers::drives::DATA_DRIVE)
 }
 
-/// Block device for the currently mounted drive (shared by shell, wget,
-/// editor, app runner and desktop so everything targets the same disk).
-pub fn mounted_device() -> crate::drivers::block::DriveBlockDevice {
-    crate::drivers::block::DriveBlockDevice::new(mounted_drive())
+/// Resolve a user-supplied path against the VFS working directory.
+///
+/// Absolute paths pass through; relative paths are anchored at the cwd.
+/// `.`/`..`/duplicate slashes are normalised without touching the disk.
+pub fn abspath(path: &str) -> alloc::string::String {
+    use alloc::string::String;
+    let t = path.trim();
+    if t.is_empty() {
+        let cwd = crate::fs::vfs::cwd();
+        if cwd.is_empty() {
+            return String::from("/");
+        }
+        return cwd;
+    }
+    let joined = if t.starts_with('/') {
+        String::from(t)
+    } else {
+        let cwd = crate::fs::vfs::cwd();
+        if cwd.is_empty() || cwd == "/" {
+            alloc::format!("/{}", t)
+        } else {
+            alloc::format!("{}/{}", cwd, t)
+        }
+    };
+    // Normalise `.`, `..` and `//`.
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in joined.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    if parts.is_empty() {
+        return String::from("/");
+    }
+    let mut out = String::from("/");
+    out.push_str(&parts.join("/"));
+    out
 }
 
 /// Parse an optional drive index argument (`""`, `"4"`, `"drive4"`).
@@ -303,7 +340,13 @@ pub fn execute_command(cmd: &str) -> bool {
         "diskinfo" => cmd_diskinfo(parts.1),
         "mkfs" => cmd_mkfs(parts.1),
         "mount" => cmd_mount(parts.1),
+        "umount" => cmd_umount(parts.1),
         "fsck" => cmd_fsck(parts.1),
+        "stat" => cmd_stat(parts.1),
+        "df" => cmd_df(parts.1),
+        "cp" => cmd_cp(parts.1),
+        "mv" => cmd_mv(parts.1),
+        "ln" => cmd_ln(parts.1),
         "ls" | "dir" => cmd_ls(parts.1),
         "touch" => cmd_touch(parts.1),
         "cat" => cmd_cat(parts.1),
@@ -390,9 +433,14 @@ fn cmd_help() {
     println!("File System Commands:");
     println!("  diskinfo [--rescan] - Display all drives (0-3 ATA, 4+ virtio-blk)");
     println!("  mkfs [drive] [--yes] - Format drive with SimplFS (default drive 1)");
-    println!("  mount [drive] - Mount drive filesystem (default drive 1)");
-    println!("  fsck [-v]   - Check filesystem consistency (read-only)");
-    println!("  fsck [-v]   - Check filesystem consistency (read-only)");
+    println!("  mount [drive] [auto|simplfs|ext4|exfat] - Mount drive filesystem (probes by default)");
+    println!("  umount    - Unmount the active filesystem");
+    println!("  fsck [-v]   - Check filesystem consistency (read-only, SimplFS)");
+    println!("  stat <path> - Show file metadata (type, size, mode, times)");
+    println!("  df        - Show mounted filesystem and block-cache stats");
+    println!("  cp <s> <d> - Copy a file (e.g., 'cp a.txt b/', 'cp /x /y.txt')");
+    println!("  mv <s> <d> - Move/rename (e.g., 'mv a.txt b/', 'mv /x /y.txt')");
+    println!("  ln [-s] <t> <p> - Hard/symbolic link (ext4 only)");
     println!("  ls/dir [path] - List files (e.g., 'ls', 'ls /docs')");
     println!("  touch     - Create a new file (e.g., 'touch test.txt', 'touch dir/file.txt')");
     println!("  cat       - Display file contents (e.g., 'cat test.txt')");
@@ -500,18 +548,16 @@ fn cmd_uptime() {
     println!("({} ms)", ticks);
 }
 
-/// Check filesystem consistency (read-only)
+/// Check filesystem consistency (read-only; SimplFS only for now)
 fn cmd_fsck(args: &str) {
     let verbose = args.trim() == "-v" || args.trim() == "--verbose";
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    let mut device = mounted_device();
-    if let Some(ref mut fs) = *fs_guard {
-        match fs.check(&mut device) {
-            Ok(report) => {
+    let result = crate::fs::vfs::with(|m| m.fs.check(&mut m.device));
+    match result {
+        Ok(report) => {
                 if verbose {
                     println!("Filesystem check (drive {}):", mounted_drive());
                     println!(
@@ -549,9 +595,8 @@ fn cmd_fsck(args: &str) {
                     );
                     println!("Rebuilding the image with 'mkfs' and re-copying data is the safe fix.");
                 }
-            }
-            Err(e) => println!("fsck: failed: {}", e),
         }
+        Err(e) => println!("fsck: failed: {}", e),
     }
 }
 
@@ -1164,6 +1209,10 @@ fn cmd_diskinfo(args: &str) {
 }
 
 /// Format a drive with SimplFS (`mkfs [drive] [--yes]`, `mkfs --list`).
+///
+/// Only SimplFS can be created by MFK itself: the ext4/exFAT drivers mount
+/// existing images (created by host tools) but intentionally do not invent
+/// fresh ones, since a half-correct formatter would risk silent corruption.
 fn cmd_mkfs(args: &str) {
     let t = args.trim();
     if t == "--list" || t == "list" {
@@ -1212,9 +1261,10 @@ fn cmd_mkfs(args: &str) {
         Ok(()) => {
             // A stale in-memory FS of this drive must not linger after erase.
             if mounted_drive() == target {
-                *FILESYSTEM.lock() = None;
+                let _ = crate::fs::vfs::unmount();
                 *MOUNTED_DRIVE.lock() = None;
             }
+            crate::fs::cache::flush_tag(target);
             println!("Filesystem formatted successfully on drive {}!", target);
             println!("Use 'mount {}' to mount the filesystem.", target);
         }
@@ -1224,7 +1274,11 @@ fn cmd_mkfs(args: &str) {
     }
 }
 
-/// Mount a drive's filesystem (`mount [drive]`, default = data drive).
+/// Mount a drive's filesystem (`mount [drive] [auto|simplfs|ext4|exfat]`).
+///
+/// With no format named, the device is probed (SimplFS, then ext4, then
+/// exFAT) and whatever is found is mounted. Unknown content is refused
+/// rather than blind-mounted.
 fn cmd_mount(args: &str) {
     let target = match parse_drive_arg(args) {
         Ok(None) => crate::drivers::drives::DATA_DRIVE,
@@ -1236,12 +1290,24 @@ fn cmd_mount(args: &str) {
     };
     println!("Mounting filesystem from drive {}...", target);
 
-    let mut device = crate::drivers::block::DriveBlockDevice::new(target);
-    match crate::fs::SimpleFilesystem::mount(&mut device) {
-        Ok(fs) => {
-            *FILESYSTEM.lock() = Some(fs);
+    // Optional second word pins the format; otherwise probe the device.
+    let words: Vec<&str> = args.split_whitespace().collect();
+    let kind = if words.len() >= 2 {
+        match crate::fs::vfs::kind_of(words[1]) {
+            Some(k) => Some(k),
+            None => {
+                println!("mount: unknown filesystem '{}'. Use: mount [drive] [auto|simplfs|ext4|exfat]", words[1]);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    match crate::fs::vfs::mount(target, kind, "/") {
+        Ok(()) => {
             *MOUNTED_DRIVE.lock() = Some(target);
-            println!("Filesystem mounted successfully from drive {}!", target);
+            let detected = crate::fs::vfs::mount_kind().unwrap_or("unknown");
+            println!("{} filesystem mounted successfully from drive {}!", detected, target);
             println!("Root directory ready. Use 'ls' to list files.");
         }
         Err(e) => {
@@ -1254,47 +1320,47 @@ fn cmd_mount(args: &str) {
     }
 }
 
+/// Unmount the active filesystem (`umount`). Refuses when nothing is mounted.
+fn cmd_umount(_args: &str) {
+    match crate::fs::vfs::unmount() {
+        Ok(()) => {
+            *MOUNTED_DRIVE.lock() = None;
+            println!("Filesystem unmounted.");
+        }
+        Err(e) => println!("umount: {}", e),
+    }
+}
+
 /// List files in directory (optional path)
 fn cmd_ls(path: &str) {
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    drop(fs_guard);
-    let mut device = mounted_device();
-    let mut fs_guard = FILESYSTEM.lock();
-    if let Some(ref mut fs) = *fs_guard {
-        // Determine target inode
-        let target = if path.trim().is_empty() {
-            fs.current_directory()
-        } else {
-            match fs.resolve_file_or_dir(&mut device, path.trim()) {
-                Ok(ino) => {
-                    // Must be directory
-                    if !fs.is_dir(ino) {
-                        println!("ls: Not a directory");
-                        return;
-                    }
-                    ino
-                }
-                Err(e) => {
-                    println!("ls: {}: {}", path, e);
-                    return;
-                }
+    let target = abspath(path);
+    let result = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        // Must be a directory.
+        match m.fs.stat(dev, &target) {
+            Ok(s) if !s.is_dir => {
+                println!("ls: Not a directory");
+                return Ok(());
             }
-        };
+            Err(e) => {
+                println!("ls: {}: {}", path, e);
+                return Ok(());
+            }
+            _ => {}
+        }
         // Show path header if explicit
         if !path.trim().is_empty() {
-            let label = path.trim();
-            println!("{}:", label);
+            println!("{}:", path.trim());
         }
-        match fs.list_directory(&mut device, target) {
+        match m.fs.list_dir(dev, &target) {
             Ok(files) => {
                 if files.is_empty() {
                     println!("(empty directory)");
                 } else {
-                    // Sort: directories first already? Keep order
                     for file in files {
                         println!("  {}", file);
                     }
@@ -1304,6 +1370,10 @@ fn cmd_ls(path: &str) {
                 println!("Failed to list directory: {}", e);
             }
         }
+        Ok(())
+    });
+    if let Err(e) = result {
+        println!("ls: {}", e);
     }
 }
 
@@ -1314,24 +1384,18 @@ fn cmd_touch(path: &str) {
         println!("  Supports paths: touch dir/file.txt, touch /a/b/file");
         return;
     }
-
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-
-    let mut device = mounted_device();
-
-    if let Some(ref mut fs) = *fs_guard {
-        match fs.create_file(&mut device, path.trim()) {
-            Ok(inode_num) => {
-                println!("Created file '{}' (inode {})", path.trim(), inode_num);
-            }
-            Err(e) => {
-                println!("Failed to create file: {}", e);
-            }
-        }
+    let target = abspath(path.trim());
+    let result = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.create_file(dev, &target).map(|_| ()).map_err(|e| e)
+    });
+    match result {
+        Ok(()) => println!("Created file '{}'", path.trim()),
+        Err(e) => println!("Failed to create file: {}", e),
     }
 }
 
@@ -1341,17 +1405,16 @@ fn cmd_cat(path: &str) {
         println!("Usage: cat <filename>");
         return;
     }
-
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-
-    let mut device = mounted_device();
-
-    if let Some(ref mut fs) = *fs_guard {
-        match fs.read_file(&mut device, path.trim()) {
+    let target = abspath(path.trim());
+    let result = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.read_file(dev, &target)
+    });
+    match result {
             Ok(data) => {
                 if data.is_empty() {
                     println!("(empty file)");
@@ -1384,7 +1447,6 @@ fn cmd_cat(path: &str) {
                 println!("Failed to read file: {}", e);
             }
         }
-    }
 }
 
 /// Write text to a file (path-aware)
@@ -1399,48 +1461,36 @@ fn cmd_write(args: &str) {
     let filename = parts[0].trim();
     let content = parts[1];
 
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-
-    let mut device = mounted_device();
-
-    if let Some(ref mut fs) = *fs_guard {
-        // Try to resolve existing file (path-aware)
-        let existing = fs.resolve_file_or_dir(&mut device, filename);
-        let inode_num = match existing {
-            Ok(ino) => {
-                if !fs.is_file(ino) {
-                    println!("write: '{}' is a directory", filename);
-                    return;
+    let target = abspath(filename);
+    // Resolve existing file, creating it when missing, then overwrite it.
+    let result = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        match m.fs.stat(dev, &target) {
+            Ok(s) => {
+                if s.is_dir {
+                    return Err(crate::fs::FsError::IsDirectory);
                 }
-                ino
             }
             Err(_) => {
-                // File doesn't exist, create it (path-aware)
-                match fs.create_file(&mut device, filename) {
-                    Ok(inode) => {
-                        println!("Created new file '{}'", filename);
-                        inode
-                    }
-                    Err(e) => {
-                        println!("Failed to create file: {}", e);
-                        return;
-                    }
-                }
+                m.fs.create_file(dev, &target).map(|_| ())?;
+                println!("Created new file '{}'", filename);
             }
-        };
-
-        // Write data to file using inode number directly
-        match fs.write_file_by_inode(&mut device, inode_num, content.as_bytes()) {
-            Ok(()) => {
-                println!("Wrote {} bytes to '{}'", content.len(), filename);
-            }
-            Err(e) => {
-                println!("Failed to write file: {}", e);
-            }
+        }
+        m.fs.write_file(dev, &target, content.as_bytes())
+    });
+    match result {
+        Ok(()) => {
+            println!("Wrote {} bytes to '{}'", content.len(), filename);
+        }
+        Err(crate::fs::FsError::IsDirectory) => {
+            println!("write: '{}' is a directory", filename);
+        }
+        Err(e) => {
+            println!("Failed to write file: {}", e);
         }
     }
 }
@@ -1451,24 +1501,18 @@ fn cmd_rm(path: &str) {
         println!("Usage: rm <filename>");
         return;
     }
-
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-
-    let mut device = mounted_device();
-
-    if let Some(ref mut fs) = *fs_guard {
-        match fs.delete_file(&mut device, path.trim()) {
-            Ok(()) => {
-                println!("Deleted file '{}'", path.trim());
-            }
-            Err(e) => {
-                println!("Failed to delete file: {}", e);
-            }
-        }
+    let target = abspath(path.trim());
+    let result = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.remove_file(dev, &target)
+    });
+    match result {
+        Ok(()) => println!("Deleted file '{}'", path.trim()),
+        Err(e) => println!("Failed to delete file: {}", e),
     }
 }
 
@@ -1479,17 +1523,18 @@ fn cmd_mkdir(path: &str) {
         println!("  Example: mkdir docs, mkdir /a/b, mkdir mydir");
         return;
     }
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    let mut device = mounted_device();
-    if let Some(ref mut fs) = *fs_guard {
-        match fs.create_directory(&mut device, path.trim()) {
-            Ok(ino) => println!("Created directory '{}' (inode {})", path.trim(), ino),
-            Err(e) => println!("mkdir: cannot create directory '{}': {}", path.trim(), e),
-        }
+    let target = abspath(path.trim());
+    let result = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.create_dir(dev, &target)
+    });
+    match result {
+        Ok(()) => println!("Created directory '{}'", path.trim()),
+        Err(e) => println!("mkdir: cannot create directory '{}': {}", path.trim(), e),
     }
 }
 
@@ -1499,54 +1544,214 @@ fn cmd_rmdir(path: &str) {
         println!("Usage: rmdir <directory>");
         return;
     }
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    let mut device = mounted_device();
-    if let Some(ref mut fs) = *fs_guard {
-        match fs.remove_directory(&mut device, path.trim()) {
-            Ok(()) => println!("Removed directory '{}'", path.trim()),
-            Err(e) => println!("rmdir: failed to remove '{}': {}", path.trim(), e),
-        }
+    let target = abspath(path.trim());
+    let result = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.remove_dir(dev, &target)
+    });
+    match result {
+        Ok(()) => println!("Removed directory '{}'", path.trim()),
+        Err(e) => println!("rmdir: failed to remove '{}': {}", path.trim(), e),
     }
 }
 
 /// Change directory
 fn cmd_cd(path: &str) {
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    let mut device = mounted_device();
-    if let Some(ref mut fs) = *fs_guard {
-        let target = if path.trim().is_empty() {
-            "/"
-        } else {
-            path.trim()
-        };
-        match fs.change_directory_path(&mut device, target) {
-            Ok(()) => {}
-            Err(e) => println!("cd: {}: {}", target, e),
+    let target = if path.trim().is_empty() {
+        alloc::string::String::from("/")
+    } else {
+        abspath(path.trim())
+    };
+    let result = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        match m.fs.stat(dev, &target) {
+            Ok(s) if s.is_dir => {
+                crate::fs::vfs::set_cwd(&target);
+                Ok(())
+            }
+            Ok(_) => Err(crate::fs::FsError::NotDirectory),
+            Err(e) => Err(e),
         }
+    });
+    if let Err(e) = result {
+        println!("cd: {}: {}", target, e);
     }
 }
 
 /// Print working directory
 fn cmd_pwd() {
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         println!("Filesystem not mounted. Use 'mount' first.");
         return;
     }
-    let mut device = mounted_device();
-    if let Some(ref mut fs) = *fs_guard {
-        match fs.current_path(&mut device) {
-            Ok(p) => println!("{}", p),
-            Err(e) => println!("pwd: {}", e),
+    println!("{}", crate::fs::vfs::cwd());
+}
+
+/// Show file metadata (`stat <path>`).
+fn cmd_stat(path: &str) {
+    if path.trim().is_empty() {
+        println!("Usage: stat <path>");
+        return;
+    }
+    if !crate::fs::vfs::is_mounted() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    let target = abspath(path.trim());
+    let result = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.stat(dev, &target)
+    });
+    match result {
+        Ok(s) => {
+            let kind = if s.is_dir {
+                "directory"
+            } else if s.is_link {
+                "symlink"
+            } else {
+                "file"
+            };
+            println!("  File: {}", target);
+            println!("  Type: {}  Size: {}  Links: {}", kind, s.size, s.links);
+            println!("  Uid: {}  Gid: {}  Mode: {:o}", s.uid, s.gid, s.mode & 0o7777);
+            println!("  Access: {}  Modify: {}  Change: {}", s.atime, s.mtime, s.ctime);
+            println!("  FS: {}", crate::fs::vfs::mount_kind().unwrap_or("unknown"));
         }
+        Err(e) => println!("stat: {}: {}", path.trim(), e),
+    }
+}
+
+/// Show mounted filesystem usage (`df`).
+fn cmd_df(_args: &str) {
+    if !crate::fs::vfs::is_mounted() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    let kind = crate::fs::vfs::mount_kind().unwrap_or("unknown");
+    println!("Filesystem  Type     Mounted on  Drive");
+    println!("{}  {}  /  {}", kind, kind, mounted_drive());
+    let (hits, misses) = crate::fs::cache::cache_stats();
+    println!("Block cache: {} hits, {} misses", hits, misses);
+}
+
+/// Copy a file (`cp <src> <dst>`). Cross-directory copies on one mount.
+fn cmd_cp(args: &str) {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.len() != 2 {
+        println!("Usage: cp <src> <dst>");
+        return;
+    }
+    if !crate::fs::vfs::is_mounted() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    let src = abspath(parts[0]);
+    let mut dst = abspath(parts[1]);
+    // `cp a b/` copies into the directory keeping the file name.
+    let dst_is_dir = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.stat(dev, &dst).map(|s| s.is_dir)
+    })
+    .unwrap_or(false);
+    if dst_is_dir {
+        if let Some(base) = src.rsplit('/').next() {
+            dst.push('/');
+            dst.push_str(base);
+        }
+    }
+    let data = match crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.read_file(dev, &src)
+    }) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("cp: {}: {}", parts[0], e);
+            return;
+        }
+    };
+    let result = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        if m.fs.stat(dev, &dst).is_err() {
+            m.fs.create_file(dev, &dst).map(|_| ())?;
+        }
+        m.fs.write_file(dev, &dst, &data)
+    });
+    match result {
+        Ok(()) => println!("Copied {} bytes '{}' -> '{}'", data.len(), parts[0], parts[1]),
+        Err(e) => println!("cp: {}", e),
+    }
+}
+
+/// Move/rename (`mv <src> <dst>`).
+fn cmd_mv(args: &str) {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.len() != 2 {
+        println!("Usage: mv <src> <dst>");
+        return;
+    }
+    if !crate::fs::vfs::is_mounted() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    let src = abspath(parts[0]);
+    let mut dst = abspath(parts[1]);
+    let dst_is_dir = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.stat(dev, &dst).map(|s| s.is_dir)
+    })
+    .unwrap_or(false);
+    if dst_is_dir {
+        if let Some(base) = src.rsplit('/').next() {
+            dst.push('/');
+            dst.push_str(base);
+        }
+    }
+    let result = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.rename(dev, &src, &dst)
+    });
+    match result {
+        Ok(()) => println!("Moved '{}' -> '{}'", parts[0], parts[1]),
+        Err(e) => println!("mv: {}", e),
+    }
+}
+
+/// Links (`ln <target> <path>`, `ln -s <target> <path>`). Only filesystems
+/// with link support (ext4) accept these; others report Unsupported.
+fn cmd_ln(args: &str) {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    let (symbolic, target, link) = match parts.len() {
+        3 if parts[0] == "-s" => (true, parts[1], parts[2]),
+        2 => (false, parts[0], parts[1]),
+        _ => {
+            println!("Usage: ln [-s] <target> <link-path>");
+            return;
+        }
+    };
+    if !crate::fs::vfs::is_mounted() {
+        println!("Filesystem not mounted. Use 'mount' first.");
+        return;
+    }
+    let link_abs = abspath(link);
+    let result = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        if symbolic {
+            m.fs.symlink(dev, &link_abs, target)
+        } else {
+            m.fs.hard_link(dev, &link_abs, target)
+        }
+    });
+    match result {
+        Ok(()) => println!("Linked '{}' -> '{}'", link, target),
+        Err(e) => println!("ln: {}", e),
     }
 }
 
@@ -1562,83 +1767,80 @@ struct PendingEntry {
 
 /// Resolve an archive operand to the bytes on disk.
 fn archive_read(path: &str) -> Result<Vec<u8>, &'static str> {
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         return Err("Filesystem not mounted. Use 'mount' first.");
     }
-    let mut device = mounted_device();
-    let fs = match fs_guard.as_mut() {
-        Some(fs) => fs,
-        None => return Err("Filesystem not mounted"),
-    };
-    fs.read_file(&mut device, path.trim())
+    let target = abspath(path.trim());
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.read_file(dev, &target)
+    }).map_err(|e| e.as_str())
 }
 
 /// Write `data` to `path`, creating parent directories as needed.
 fn archive_write(path: &str, data: &[u8]) -> Result<(), &'static str> {
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         return Err("Filesystem not mounted. Use 'mount' first.");
     }
-    let mut device = mounted_device();
-    let fs = match fs_guard.as_mut() {
-        Some(fs) => fs,
-        None => return Err("Filesystem not mounted"),
-    };
-    archive_ensure_parents(fs, &mut device, path)?;
-    let inode = match fs.resolve_file_or_dir(&mut device, path) {
-        Ok(ino) => {
-            if fs.is_dir(ino) {
-                return Err("target is a directory");
+    let target = abspath(path.trim());
+    archive_ensure_parents(&target)?;
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        match m.fs.stat(dev, &target) {
+            Ok(s) => {
+                if s.is_dir {
+                    return Err(crate::fs::FsError::IsDirectory);
+                }
             }
-            ino
+            Err(_) => {
+                m.fs.create_file(dev, &target).map(|_| ())?;
+            }
         }
-        Err(_) => fs.create_file(&mut device, path)?,
-    };
-    fs.write_file_by_inode(&mut device, inode, data)
+        m.fs.write_file(dev, &target, data)
+    }).map_err(|e| e.as_str())
 }
 
 /// Create `path` as a directory, ignoring "already exists".
 fn archive_mkdir(path: &str) -> Result<(), &'static str> {
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         return Err("Filesystem not mounted. Use 'mount' first.");
     }
-    let mut device = mounted_device();
-    let fs = match fs_guard.as_mut() {
-        Some(fs) => fs,
-        None => return Err("Filesystem not mounted"),
-    };
-    archive_ensure_parents(fs, &mut device, path)?;
-    match fs.create_directory(&mut device, path) {
-        Ok(_) => Ok(()),
-        // An existing directory is exactly what we wanted.
-        Err("File exists") => Ok(()),
-        Err(e) => Err(e),
-    }
+    let target = abspath(path.trim());
+    archive_ensure_parents(&target)?;
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        match m.fs.create_dir(dev, &target) {
+            Ok(()) => Ok(()),
+            // An existing directory is exactly what we wanted.
+            Err(crate::fs::FsError::AlreadyExists) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }).map_err(|e| e.as_str())
 }
 
-/// Create every parent directory of `path`, outermost first.
-fn archive_ensure_parents(
-    fs: &mut crate::fs::SimpleFilesystem,
-    device: &mut dyn crate::drivers::block::BlockDevice,
-    path: &str,
-) -> Result<(), &'static str> {
-    let mut built = String::new();
+/// Create every parent directory of absolute `path`, outermost first.
+fn archive_ensure_parents(path: &str) -> Result<(), &'static str> {
     let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
     // The last component is the entry itself.
+    let mut built = alloc::string::String::new();
     for comp in &components[..components.len().saturating_sub(1)] {
-        if !built.is_empty() {
-            built.push('/');
-        }
+        built.push('/');
         built.push_str(comp);
-        if fs.resolve_file_or_dir(device, &built).is_ok() {
+        let exists = crate::fs::vfs::with(|m| {
+            let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+            m.fs.stat(dev, &built).map(|_| ())
+        });
+        if exists.is_ok() {
             continue;
         }
-        match fs.create_directory(device, &built) {
-            Ok(_) => {}
-            Err("File exists") => {}
-            Err(e) => return Err(e),
+        let created = crate::fs::vfs::with(|m| {
+            let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+            m.fs.create_dir(dev, &built)
+        });
+        match created {
+            Ok(()) => {}
+            Err(crate::fs::FsError::AlreadyExists) => {}
+            Err(e) => return Err(e.as_str()),
         }
     }
     Ok(())
@@ -1647,8 +1849,6 @@ fn archive_ensure_parents(
 /// Walk `path` (file or directory) into `out`, recursing into
 /// directories in sorted order so archives are deterministic.
 fn archive_collect(
-    fs: &mut crate::fs::SimpleFilesystem,
-    device: &mut dyn crate::drivers::block::BlockDevice,
     path: &str,
     out: &mut Vec<PendingEntry>,
     depth: usize,
@@ -1660,43 +1860,46 @@ fn archive_collect(
     if out.len() >= crate::archive::tar::MAX_ENTRIES {
         return Err("too many files to archive");
     }
-    let inode = fs.resolve_file_or_dir(device, path)?;
+    let target = abspath(path.trim());
+    let (is_dir, entries, data) = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        let stat = m.fs.stat(dev, &target)?;
+        if stat.is_dir {
+            let mut entries = m.fs.list_dir(dev, &target)?;
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok((true, entries, Vec::new()))
+        } else {
+            let data = m.fs.read_file(dev, &target)?;
+            Ok((false, Vec::new(), data))
+        }
+    }).map_err(|e| e.as_str())?;
     // `path` is always relative to the operand root, so the sanitized path is
     // already the member name (children are built by appending to it).
     let name = crate::archive::tar::sanitize_path(path)?.0;
-    if fs.is_dir(inode) {
+    if is_dir {
         out.push(PendingEntry { name: name.clone(), data: Vec::new(), is_dir: true });
-        let mut entries = fs.list_directory(device, inode)?;
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
         for entry in entries {
             let child = alloc::format!("{}/{}", path.trim_end_matches('/'), entry.name);
-            archive_collect(fs, device, &child, out, depth + 1)?;
+            archive_collect(&child, out, depth + 1)?;
         }
         return Ok(());
     }
-    let data = fs.read_file(device, path)?;
     out.push(PendingEntry { name, data, is_dir: false });
     Ok(())
 }
 
 /// Stage every operand into `out`; fails if the filesystem is unmounted.
 fn archive_stage(operands: &[String]) -> Result<Vec<PendingEntry>, &'static str> {
-    let mut fs_guard = FILESYSTEM.lock();
-    if fs_guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         return Err("Filesystem not mounted. Use 'mount' first.");
     }
-    let mut device = mounted_device();
-    let fs = match fs_guard.as_mut() {
-        Some(fs) => fs,
-        None => return Err("Filesystem not mounted"),
-    };
     let mut out: Vec<PendingEntry> = Vec::new();
     for operand in operands {
         let trimmed = operand.trim();
         if trimmed.is_empty() {
             continue;
         }
-        archive_collect(fs, &mut device, trimmed, &mut out, 0)?;
+        archive_collect(trimmed, &mut out, 0)?;
     }
     if out.is_empty() {
         return Err("nothing to archive");
@@ -3315,26 +3518,25 @@ fn expand_escapes(text: &str) -> alloc::vec::Vec<u8> {
 }
 
 // ── Editor helpers (exposed for editor crate) ─────────────
+///
+/// These go through the VFS so editor/doom/app/http code works on whatever
+/// filesystem is mounted (SimplFS, ext4 or exFAT). Paths may be absolute or
+/// relative to the shell working directory; the VFS device is used, so no
+/// caller needs to build a block device anymore.
 
 /// Check if filesystem is mounted
 pub fn is_mounted() -> bool {
-    FILESYSTEM.lock().is_some()
+    crate::fs::vfs::is_mounted()
 }
 
-/// Read file contents via FS â€“ returns None if not mounted or not found (path-aware)
-pub fn read_file_contents(
-    name: &str,
-    device: &mut dyn crate::drivers::block::BlockDevice,
-) -> Option<alloc::vec::Vec<u8>> {
-    let mut guard = FILESYSTEM.lock();
-    if let Some(ref mut fs) = *guard {
-        match fs.read_file(device, name) {
-            Ok(data) => Some(data),
-            Err(_) => None,
-        }
-    } else {
-        None
-    }
+/// Read file contents via VFS – returns None if not mounted or not found (path-aware)
+pub fn read_file_contents(name: &str) -> Option<alloc::vec::Vec<u8>> {
+    let target = abspath(name);
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.read_file(dev, &target)
+    })
+    .ok()
 }
 
 /// Read up to `out.len()` bytes of a file at `offset` into `out` (streaming,
@@ -3342,120 +3544,121 @@ pub fn read_file_contents(
 /// readers (Doom WAD) on extra disks.
 pub fn read_file_chunk(
     name: &str,
-    device: &mut dyn crate::drivers::block::BlockDevice,
     offset: u64,
     out: &mut [u8],
 ) -> Result<usize, &'static str> {
-    let mut guard = FILESYSTEM.lock();
-    let fs = guard.as_mut().ok_or("Filesystem not mounted")?;
-    fs.read_file_range(device, name, offset, out)
+    let target = abspath(name);
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.read_at(dev, &target, offset, out)
+    })
+    .map_err(|e| e.as_str())
 }
 
 /// File size in bytes (no data allocation). Used by large-asset readers
 /// (Doom WAD) to validate offsets before streaming.
 pub fn mounted_file_size(name: &str) -> Result<u64, &'static str> {
-    let mut guard = FILESYSTEM.lock();
-    let fs = guard.as_mut().ok_or("Filesystem not mounted")?;
-    let ino = fs.resolve_file_or_dir(&mut mounted_device(), name)?;
-    fs.file_size(ino)
+    let target = abspath(name);
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.file_size_at(dev, &target)
+    })
+    .map_err(|e| e.as_str())
 }
 
-/// Write file contents â€“ creates file if needed, returns static error str on failure (path-aware)
-pub fn write_file_contents(
-    name: &str,
-    data: &[u8],
-    device: &mut dyn crate::drivers::block::BlockDevice,
-) -> Result<(), &'static str> {
-    let mut guard = FILESYSTEM.lock();
-    if guard.is_none() {
-        return Err("Filesystem not mounted");
-    }
-    if let Some(ref mut fs) = *guard {
-        // Resolve existing file if present (path-aware)
-        let inode = match fs.resolve_file_or_dir(device, name) {
-            Ok(ino) => {
-                if !fs.is_file(ino) {
-                    return Err("Is a directory");
+/// Write file contents – creates file if needed, returns static error str on failure (path-aware)
+pub fn write_file_contents(name: &str, data: &[u8]) -> Result<(), &'static str> {
+    let target = abspath(name);
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        match m.fs.stat(dev, &target) {
+            Ok(s) => {
+                if s.is_dir {
+                    return Err(crate::fs::FsError::IsDirectory);
                 }
-                ino
             }
-            Err(_) => fs.create_file(device, name)?,
-        };
-        fs.write_file_by_inode(device, inode, data)
-    } else {
-        Err("Filesystem not mounted")
-    }
+            Err(_) => {
+                m.fs.create_file(dev, &target).map(|_| ())?;
+            }
+        }
+        m.fs.write_file(dev, &target, data)
+    })
+    .map_err(|e| e.as_str())
 }
 
 pub fn create_download_staging_file(
     destination: &str,
-    device: &mut dyn crate::drivers::block::BlockDevice,
 ) -> Result<alloc::string::String, &'static str> {
     static NEXT_STAGING_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    let mut guard = FILESYSTEM.lock();
-    let fs = guard.as_mut().ok_or("Filesystem not mounted")?;
-    let destination = destination.trim();
+    let destination = abspath(destination.trim());
     if destination.is_empty() || destination.ends_with('/') {
         return Err("Invalid destination path");
     }
     let parent = match destination.rfind('/') {
-        Some(0) => "/",
-        Some(index) => &destination[..index],
-        None => ".",
+        Some(0) => alloc::string::String::from("/"),
+        Some(index) => alloc::string::String::from(&destination[..index]),
+        None => alloc::string::String::from("/"),
     };
     for _ in 0..32 {
         let id = NEXT_STAGING_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let name = alloc::format!(".wget-{:x}-{:x}.part", monotonic_ms(), id);
         let path = if parent == "/" {
             alloc::format!("/{}", name)
-        } else if parent == "." {
-            name
         } else {
             alloc::format!("{}/{}", parent, name)
         };
-        match fs.create_file(device, &path) {
-            Ok(_) => return Ok(path),
-            Err("File already exists") => continue,
-            Err(error) => return Err(error),
+        let created = crate::fs::vfs::with(|m| {
+            let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+            m.fs.create_file(dev, &path).map(|_| ()).map_err(|e| e)
+        });
+        match created {
+            Ok(()) => return Ok(path),
+            Err(crate::fs::FsError::AlreadyExists) => continue,
+            Err(error) => return Err(error.as_str()),
         }
     }
     Err("Unable to create download staging file")
 }
 
-pub fn append_file_contents(
-    name: &str,
-    data: &[u8],
-    device: &mut dyn crate::drivers::block::BlockDevice,
-) -> Result<(), &'static str> {
-    let mut guard = FILESYSTEM.lock();
-    let fs = guard.as_mut().ok_or("Filesystem not mounted")?;
-    let inode = fs.resolve_file_or_dir(device, name)?;
-    fs.append_file_by_inode(device, inode, data)
+pub fn append_file_contents(name: &str, data: &[u8]) -> Result<(), &'static str> {
+    let target = abspath(name);
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.append_file(dev, &target, data)
+    })
+    .map_err(|e| e.as_str())
 }
 
-pub fn remove_file_contents(
-    name: &str,
-    device: &mut dyn crate::drivers::block::BlockDevice,
-) -> Result<(), &'static str> {
-    let mut guard = FILESYSTEM.lock();
-    let fs = guard.as_mut().ok_or("Filesystem not mounted")?;
-    fs.delete_file(device, name)
+pub fn remove_file_contents(name: &str) -> Result<(), &'static str> {
+    let target = abspath(name);
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.remove_file(dev, &target)
+    })
+    .map_err(|e| e.as_str())
 }
 
-pub fn promote_download_file(
-    staging: &str,
-    destination: &str,
-    device: &mut dyn crate::drivers::block::BlockDevice,
-) -> Result<(), &'static str> {
-    let mut guard = FILESYSTEM.lock();
-    let fs = guard.as_mut().ok_or("Filesystem not mounted")?;
-    fs.rename_file(device, staging, destination)
+pub fn promote_download_file(staging: &str, destination: &str) -> Result<(), &'static str> {
+    let staging = abspath(staging);
+    let destination = abspath(destination);
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        // Replace any existing destination first so the rename behaves the
+        // same on every driver (SimplFS replaces, ext4 refuses).
+        if let Ok(s) = m.fs.stat(dev, &destination) {
+            if s.is_dir {
+                return Err(crate::fs::FsError::IsDirectory);
+            }
+            m.fs.remove_file(dev, &destination)?;
+        }
+        m.fs.rename(dev, &staging, &destination)
+    })
+    .map_err(|e| e.as_str())
 }
 
 // â”€â”€ GUI bridge (shared by desktop File Explorer + Drive apps) â”€â”€â”€â”€â”€
-// These wrap the same FILESYSTEM + DriveBlockDevice logic as the CLI
-// commands so shell and desktop stay in sync. All helpers create
-// their own device, lock FS once, copy results out, and drop the
+// These go through the VFS so shell and desktop stay in sync whatever is
+// mounted. All helpers lock the VFS once, copy results out, and drop the
 // lock before returning (desktop must never hold the lock across
 // compositor.render()).
 
@@ -3470,9 +3673,10 @@ pub fn gui_format_disk(drive: usize) -> Result<alloc::string::String, &'static s
     match crate::fs::SimpleFilesystem::format(&mut device) {
         Ok(()) => {
             if mounted_drive() == drive {
-                *FILESYSTEM.lock() = None;
+                let _ = crate::fs::vfs::unmount();
                 *MOUNTED_DRIVE.lock() = None;
             }
+            crate::fs::cache::flush_tag(drive);
             Ok(alloc::format!(
                 "Drive {} formatted with SimplFS. Use Mount.",
                 drive
@@ -3487,34 +3691,29 @@ pub fn gui_mount_fs(drive: usize) -> Result<alloc::string::String, &'static str>
     if drive >= crate::drivers::drives::drive_count() {
         return Err("Invalid drive index");
     }
-    let mut device = crate::drivers::block::DriveBlockDevice::new(drive);
-    match crate::fs::SimpleFilesystem::mount(&mut device) {
-        Ok(fs) => {
-            *FILESYSTEM.lock() = Some(fs);
+    let mut dev = crate::drivers::block::DriveBlockDevice::new(drive);
+    let kind = crate::fs::vfs::probe_device(&mut dev).unwrap_or(crate::fs::vfs::FsKind::Simple);
+    match crate::fs::vfs::mount(drive, Some(kind), "/") {
+        Ok(()) => {
             *MOUNTED_DRIVE.lock() = Some(drive);
-            Ok(alloc::format!("Drive {} mounted. Root ready.", drive))
+            let detected = crate::fs::vfs::mount_kind().unwrap_or("unknown");
+            Ok(alloc::format!("Drive {} mounted ({}). Root ready.", drive, detected))
         }
-        Err(e) => Err(e),
+        Err(e) => Err(e.as_str()),
     }
 }
 
 /// One-line mount status for GUI labels. Never fails.
 pub fn gui_fs_status() -> alloc::string::String {
-    let guard = FILESYSTEM.lock();
-    if guard.is_none() {
+    if !crate::fs::vfs::is_mounted() {
         return alloc::string::String::from("Status: not mounted (open Drive: pick disk, Format, then Mount)");
     }
-    drop(guard);
-    let mut device = mounted_device();
-    let mut guard = FILESYSTEM.lock();
-    if let Some(ref mut fs) = *guard {
-        match fs.current_path(&mut device) {
-            Ok(p) => alloc::format!("Status: mounted (drive {}), cwd={}", mounted_drive(), p),
-            Err(_) => alloc::format!("Status: mounted (drive {})", mounted_drive()),
-        }
-    } else {
-        alloc::string::String::from("Status: not mounted")
-    }
+    alloc::format!(
+        "Status: {} mounted (drive {}), cwd={}",
+        crate::fs::vfs::mount_kind().unwrap_or("unknown"),
+        mounted_drive(),
+        crate::fs::vfs::cwd()
+    )
 }
 
 /// Disk + FS summary for the Drive app status label (all drives).
@@ -3529,15 +3728,16 @@ pub fn gui_disk_summary() -> alloc::string::String {
         }
     }
     if is_mounted() {
-        let mut device = mounted_device();
-        let mut guard = FILESYSTEM.lock();
-        if let Some(ref mut fs) = *guard {
-            let count = match fs.list_directory(&mut device, 0) {
-                Ok(v) => v.len(),
-                Err(_) => 0,
-            };
-            out.push_str(&alloc::format!("\nFS: SimplFS mounted, root entries: {}", count));
-        }
+        let count = crate::fs::vfs::with(|m| {
+            let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+            m.fs.list_dir(dev, "/").map(|v| v.len())
+        })
+        .unwrap_or(0);
+        out.push_str(&alloc::format!(
+            "\nFS: {} mounted, root entries: {}",
+            crate::fs::vfs::mount_kind().unwrap_or("unknown"),
+            count
+        ));
     } else {
         out.push_str("\nFS: not mounted");
     }
@@ -3552,34 +3752,16 @@ pub fn gui_list_dir(
     if !is_mounted() {
         return Err("Filesystem not mounted. Use Drive: Mount first.");
     }
-    let mut device = mounted_device();
-    let mut guard = FILESYSTEM.lock();
-    if let Some(ref mut fs) = *guard {
-        let target = if path.trim().is_empty() {
-            fs.current_directory()
-        } else {
-            match fs.resolve_file_or_dir(&mut device, path.trim()) {
-                Ok(ino) => {
-                    if !fs.is_dir(ino) {
-                        return Err("Not a directory");
-                    }
-                    ino
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        let entries = fs.list_directory(&mut device, target)?;
-        // Display path: requested path, or actual cwd if empty
-        let disp = if path.trim().is_empty() {
-            fs.current_path(&mut device)
-                .unwrap_or(alloc::string::String::from("/"))
-        } else {
-            alloc::string::String::from(path.trim())
-        };
-        Ok((disp, entries))
-    } else {
-        Err("Filesystem not mounted")
-    }
+    let target = abspath(path);
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        match m.fs.stat(dev, &target) {
+            Ok(s) if s.is_dir => Ok((target.clone(), m.fs.list_dir(dev, &target)?)),
+            Ok(_) => Err(crate::fs::FsError::NotDirectory),
+            Err(e) => Err(e),
+        }
+    })
+    .map_err(|e| e.as_str())
 }
 
 /// Read file for GUI preview (capped by caller via truncate).
@@ -3587,57 +3769,52 @@ pub fn gui_read_file(path: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
     if !is_mounted() {
         return Err("Filesystem not mounted");
     }
-    let mut device = mounted_device();
-    let mut guard = FILESYSTEM.lock();
-    if let Some(ref mut fs) = *guard {
-        fs.read_file(&mut device, path.trim())
-    } else {
-        Err("Filesystem not mounted")
-    }
+    let target = abspath(path.trim());
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.read_file(dev, &target)
+    })
+    .map_err(|e| e.as_str())
 }
 
-/// File size in bytes for GUI (metadata only, no buffer allocation â€” safe
+/// File size in bytes for GUI (metadata only, no buffer allocation — safe
 /// to call before attempting a big read).
 pub fn gui_file_size(path: &str) -> Result<u64, &'static str> {
     if !is_mounted() {
         return Err("Filesystem not mounted");
     }
-    let mut device = mounted_device();
-    let mut guard = FILESYSTEM.lock();
-    if let Some(ref mut fs) = *guard {
-        let ino = fs.resolve_file_or_dir(&mut device, path.trim())?;
-        fs.file_size(ino)
-    } else {
-        Err("Filesystem not mounted")
-    }
+    let target = abspath(path.trim());
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.file_size_at(dev, &target)
+    })
+    .map_err(|e| e.as_str())
 }
 
 /// Create file at GUI-resolved full path.
-pub fn gui_create_file(path: &str) -> Result<u32, &'static str> {
+pub fn gui_create_file(path: &str) -> Result<(), &'static str> {
     if !is_mounted() {
         return Err("Filesystem not mounted");
     }
-    let mut device = mounted_device();
-    let mut guard = FILESYSTEM.lock();
-    if let Some(ref mut fs) = *guard {
-        fs.create_file(&mut device, path.trim())
-    } else {
-        Err("Filesystem not mounted")
-    }
+    let target = abspath(path.trim());
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.create_file(dev, &target).map(|_| ()).map_err(|e| e)
+    })
+    .map_err(|e| e.as_str())
 }
 
 /// Create directory at GUI-resolved full path.
-pub fn gui_create_dir(path: &str) -> Result<u32, &'static str> {
+pub fn gui_create_dir(path: &str) -> Result<(), &'static str> {
     if !is_mounted() {
         return Err("Filesystem not mounted");
     }
-    let mut device = mounted_device();
-    let mut guard = FILESYSTEM.lock();
-    if let Some(ref mut fs) = *guard {
-        fs.create_directory(&mut device, path.trim())
-    } else {
-        Err("Filesystem not mounted")
-    }
+    let target = abspath(path.trim());
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        m.fs.create_dir(dev, &target)
+    })
+    .map_err(|e| e.as_str())
 }
 
 /// Delete file or (empty) directory at path. Tries file first, then dir.
@@ -3645,22 +3822,19 @@ pub fn gui_delete_path(path: &str) -> Result<(), &'static str> {
     if !is_mounted() {
         return Err("Filesystem not mounted");
     }
-    let mut device = mounted_device();
-    let mut guard = FILESYSTEM.lock();
-    if let Some(ref mut fs) = *guard {
-        // Determine type first
-        let ino = fs.resolve_file_or_dir(&mut device, path.trim())?;
-        if fs.is_dir(ino) {
-            if ino == 0 {
-                return Err("Cannot delete root");
-            }
-            fs.remove_directory(&mut device, path.trim())
-        } else {
-            fs.delete_file(&mut device, path.trim())
-        }
-    } else {
-        Err("Filesystem not mounted")
+    let target = abspath(path.trim());
+    if target == "/" {
+        return Err("Cannot delete root");
     }
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        match m.fs.stat(dev, &target) {
+            Ok(s) if s.is_dir => m.fs.remove_dir(dev, &target),
+            Ok(_) => m.fs.remove_file(dev, &target),
+            Err(e) => Err(e),
+        }
+    })
+    .map_err(|e| e.as_str())
 }
 
 /// Save Settings text to `/config/settings.cfg` (GUI version of `write`).
@@ -3674,22 +3848,22 @@ pub fn gui_save_settings(text: &str) -> Result<alloc::string::String, &'static s
         return Err("Settings too large");
     }
     let path = crate::desktop::wallpaper::SETTINGS_PATH;
-    let mut device = mounted_device();
-    let mut guard = FILESYSTEM.lock();
-    if let Some(ref mut fs) = *guard {
-        if fs.resolve_file_or_dir(&mut device, "/config").is_err() {
+    crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        if m.fs.stat(dev, "/config").is_err() {
             // Best-effort: ignore "already exists" races from double-clicks.
-            let _ = fs.create_directory(&mut device, "/config");
+            let _ = m.fs.create_dir(dev, "/config");
         }
-        if fs.resolve_file_or_dir(&mut device, path).is_err() {
-            fs.create_file(&mut device, path)
-                .map_err(|_| "Cannot create settings file")?;
+        if m.fs.stat(dev, path).is_err() {
+            m.fs
+                .create_file(dev, path)
+                .map(|_| ())
+                .map_err(|_| crate::fs::FsError::InvalidPath)?;
         }
-        fs.write_file(&mut device, path, text.as_bytes())?;
+        m.fs.write_file(dev, path, text.as_bytes())?;
         Ok(alloc::string::String::from("settings saved"))
-    } else {
-        Err("Filesystem not mounted")
-    }
+    })
+    .map_err(|e| e.as_str())
 }
 
 /// Shell edit command â€“ delegates to nano editor
@@ -3794,8 +3968,7 @@ fn cmd_appinfo(args: &str) {
         println!("Filesystem not mounted");
         return;
     }
-    let mut device = mounted_device();
-    if let Some(data) = read_file_contents(path, &mut device) {
+    if let Some(data) = read_file_contents(path) {
         println!("App '{}' ({} bytes)", path, data.len());
         if data.len() >= 4 && &data[0..4] == &[0x7F, b'E', b'L', b'F'] {
             println!("  Type: ELF (native) - not yet runnable, needs Phase 2");
@@ -4187,33 +4360,30 @@ fn common_prefix(mut candidates: Vec<&str>, prefix: &str) -> String {
 
 fn get_file_candidates(dir_part: &str, file_prefix: &str) -> Option<Vec<crate::fs::FileInfo>> {
     // Returns None if dir cannot be resolved (e.g., not a directory or not mounted)
-    let mut device = mounted_device();
-    let mut guard = FILESYSTEM.lock();
-    let fs = match guard.as_mut() {
-        Some(f) => f,
-        None => return None,
-    };
-
-    let dir_inode = if dir_part.is_empty() {
-        fs.current_directory()
+    if !crate::fs::vfs::is_mounted() {
+        return None;
+    }
+    // dir_part comes from the raw token; anchor it at the cwd like the shell does.
+    let dir_abs = if dir_part.is_empty() {
+        crate::fs::vfs::cwd()
+    } else if dir_part.starts_with('/') {
+        alloc::string::String::from(dir_part.trim_end_matches('/'))
     } else {
-        let trimmed = dir_part.trim_end_matches('/');
-        if trimmed.is_empty() {
-            // dir_part was "/" or "///"
-            0
-        } else {
-            match fs.resolve_path(&mut device, trimmed) {
-                Ok(ino) => ino,
-                Err(_) => return Some(Vec::new()), // dir does not exist -> no candidates, not error
-            }
+        abspath(dir_part)
+    };
+    let dir_abs = if dir_abs.is_empty() {
+        alloc::string::String::from("/")
+    } else {
+        dir_abs
+    };
+    let entries = crate::fs::vfs::with(|m| {
+        let dev: &mut dyn crate::drivers::block::BlockDevice = &mut m.device;
+        match m.fs.stat(dev, &dir_abs) {
+            Ok(s) if s.is_dir => m.fs.list_dir(dev, &dir_abs),
+            _ => Ok(Vec::new()),
         }
-    };
-
-    // fs.is_dir check is done inside list_directory, but we ensure dir_inode is dir
-    let entries = match fs.list_directory(&mut device, dir_inode) {
-        Ok(v) => v,
-        Err(_) => return Some(Vec::new()),
-    };
+    })
+    .unwrap_or_default();
     let mut filtered: Vec<crate::fs::FileInfo> = entries
         .into_iter()
         .filter(|fi| fi.name.starts_with(file_prefix))

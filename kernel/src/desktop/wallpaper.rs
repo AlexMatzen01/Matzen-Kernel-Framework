@@ -3,8 +3,9 @@
 //!
 //! Wallpaper + personalization backend for the desktop.
 //!
-//! - Supported files: `.png`, `.jpg`, `.jpeg` (magic-byte sniffed, not
-//!   just extension). `jpg` and `jpeg` are the same baseline-JPEG decoder.
+//! - Supported files: `.png`, `.jpg`, `.jpeg`, `.bmp`, `.gif`
+//!   (magic-byte sniffed, not just extension). `jpg` and `jpeg` are the
+//!   same baseline-JPEG decoder; GIF decodes the first frame only.
 //! - Modes: Solid, Fit (letterbox), Fill (cover+crop), Stretch,
 //!   Center (1:1), Tile. Landscape and portrait images share the same
 //!   aspect math (no separate code path; orientation() is informational).
@@ -102,6 +103,9 @@ pub struct WallpaperConfig {
     pub mode: WallpaperMode,
     pub bg: u32,
     pub accent: u32,
+    /// Cursor selection: bundled name (e.g. `mfk-default`) or FS path
+    /// (e.g. `/cursors/arrow.png`). Empty = default cursor.
+    pub cursor: String,
 }
 
 impl WallpaperConfig {
@@ -111,6 +115,7 @@ impl WallpaperConfig {
             mode: WallpaperMode::Solid,
             bg: 0x102a4e,
             accent: 0x00be5a,
+            cursor: String::new(),
         }
     }
 }
@@ -149,6 +154,8 @@ pub struct DecodedImage {
 pub enum ImageKind {
     Png,
     Jpeg,
+    Bmp,
+    Gif,
     Unknown,
 }
 
@@ -157,6 +164,10 @@ pub fn sniff_kind(bytes: &[u8]) -> ImageKind {
         ImageKind::Png
     } else if is_jpeg(bytes) {
         ImageKind::Jpeg
+    } else if is_bmp(bytes) {
+        ImageKind::Bmp
+    } else if is_gif(bytes) {
+        ImageKind::Gif
     } else {
         ImageKind::Unknown
     }
@@ -178,12 +189,35 @@ pub fn is_jpeg(bytes: &[u8]) -> bool {
     bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
 }
 
-/// Case-insensitive `.png` / `.jpg` / `.jpeg` check.
+pub fn is_bmp(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == b'B' && bytes[1] == b'M'
+}
+
+pub fn is_gif(bytes: &[u8]) -> bool {
+    bytes.len() >= 6
+        && bytes[0] == b'G'
+        && bytes[1] == b'I'
+        && bytes[2] == b'F'
+        && bytes[3] == b'8'
+        && (bytes[4] == b'7' || bytes[4] == b'9')
+        && bytes[5] == b'a'
+}
+
+/// Case-insensitive `.png` / `.jpg` / `.jpeg` / `.bmp` / `.gif` check.
 pub fn has_supported_extension(path: &str) -> bool {
     let p = path.trim();
     let lower = p.to_ascii_lowercase();
-    lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+    lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".bmp")
+        || lower.ends_with(".gif")
 }
+
+/// Cursor-sized images have tighter caps than wallpapers (cursors are tiny;
+/// this keeps a malicious cursor from eating the heap).
+pub const MAX_CURSOR_BYTES: usize = 512 * 1024;
+pub const MAX_CURSOR_DIM: u32 = 128;
 
 pub fn decode_auto(bytes: &[u8]) -> Result<DecodedImage, &'static str> {
     if bytes.len() > MAX_IMAGE_BYTES {
@@ -195,8 +229,32 @@ pub fn decode_auto(bytes: &[u8]) -> Result<DecodedImage, &'static str> {
     match sniff_kind(bytes) {
         ImageKind::Png => decode_png(bytes),
         ImageKind::Jpeg => decode_jpeg(bytes),
-        ImageKind::Unknown => Err("unsupported format (need PNG/JPG/JPEG)"),
+        ImageKind::Bmp => decode_bmp(bytes),
+        ImageKind::Gif => decode_gif(bytes),
+        ImageKind::Unknown => Err("unsupported format (need PNG/JPG/JPEG/BMP/GIF)"),
     }
+}
+
+/// Decode with cursor caps (smaller max size/dimensions). Used by the
+/// cursor picker so a huge wallpaper file can't be installed as a cursor.
+pub fn decode_cursor(bytes: &[u8]) -> Result<DecodedImage, &'static str> {
+    if bytes.len() > MAX_CURSOR_BYTES {
+        return Err("cursor too large (max 512 KiB)");
+    }
+    if bytes.is_empty() {
+        return Err("empty file");
+    }
+    let img = match sniff_kind(bytes) {
+        ImageKind::Png => decode_png(bytes),
+        ImageKind::Jpeg => decode_jpeg(bytes),
+        ImageKind::Bmp => decode_bmp(bytes),
+        ImageKind::Gif => decode_gif(bytes),
+        ImageKind::Unknown => Err("unsupported format (need PNG/JPG/JPEG/BMP/GIF)"),
+    }?;
+    if img.w == 0 || img.h == 0 || img.w > MAX_CURSOR_DIM || img.h > MAX_CURSOR_DIM {
+        return Err("cursor dimensions must be 1..128 px");
+    }
+    Ok(img)
 }
 
 // ──────────────────────────────────────────────
@@ -262,6 +320,11 @@ pub fn parse_settings(text: &str) -> WallpaperConfig {
                     cfg.accent = c;
                 }
             }
+            "cursor" | "cursor_name" | "mouse_cursor" => {
+                if v.len() <= 256 {
+                    cfg.cursor = String::from(v);
+                }
+            }
             _ => {}
         }
     }
@@ -271,11 +334,12 @@ pub fn parse_settings(text: &str) -> WallpaperConfig {
 
 pub fn format_settings(cfg: &WallpaperConfig) -> String {
     alloc::format!(
-        "# MFK personalization (generated)\nversion=1\nwallpaper_path={}\nmode={}\nbg={}\naccent={}\n",
+        "# MFK personalization (generated)\nversion=1\nwallpaper_path={}\nmode={}\nbg={}\naccent={}\ncursor={}\n",
         cfg.path,
         cfg.mode.as_str(),
         format_hex_color(cfg.bg),
         format_hex_color(cfg.accent),
+        cfg.cursor,
     )
 }
 
@@ -1835,6 +1899,627 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<DecodedImage, &'static str> {
 }
 
 // ──────────────────────────────────────────────
+// BMP (uncompressed + BITFIELDS, 1/4/8/16/24/32-bit)
+// ──────────────────────────────────────────────
+
+fn read_u16le(bytes: &[u8], pos: usize) -> Result<u16, &'static str> {
+    if pos + 2 > bytes.len() {
+        return Err("bmp: truncated file");
+    }
+    Ok((bytes[pos] as u16) | ((bytes[pos + 1] as u16) << 8))
+}
+
+fn read_u32le(bytes: &[u8], pos: usize) -> Result<u32, &'static str> {
+    if pos + 4 > bytes.len() {
+        return Err("bmp: truncated file");
+    }
+    Ok(
+        (bytes[pos] as u32)
+            | ((bytes[pos + 1] as u32) << 8)
+            | ((bytes[pos + 2] as u32) << 16)
+            | ((bytes[pos + 3] as u32) << 24),
+    )
+}
+
+fn read_i32le(bytes: &[u8], pos: usize) -> Result<i32, &'static str> {
+    Ok(read_u32le(bytes, pos)? as i32)
+}
+
+fn bmp_mask_shift(mask: u32) -> (u32, u32) {
+    if mask == 0 {
+        return (0, 0);
+    }
+    let mut shift = 0u32;
+    let mut m = mask;
+    while m & 1 == 0 {
+        m >>= 1;
+        shift += 1;
+    }
+    let mut bits = 0u32;
+    while m & 1 == 1 {
+        m >>= 1;
+        bits += 1;
+    }
+    (shift, bits)
+}
+
+fn bmp_scale_channel(v: u32, bits: u32) -> u8 {
+    if bits == 0 {
+        return 0;
+    }
+    if bits >= 8 {
+        (v >> (bits - 8)) as u8
+    } else {
+        ((v * 255) / ((1u32 << bits) - 1)) as u8
+    }
+}
+
+pub fn decode_bmp(bytes: &[u8]) -> Result<DecodedImage, &'static str> {
+    if !is_bmp(bytes) {
+        return Err("not a BMP file");
+    }
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err("image too large (max 4 MiB; resize below 1920x1080)");
+    }
+    if bytes.len() < 26 {
+        return Err("bmp: truncated header");
+    }
+    let data_off = read_u32le(bytes, 10)? as usize;
+    let dib_size = read_u32le(bytes, 14)? as usize;
+    if dib_size != 12 && dib_size < 40 {
+        return Err("bmp: unsupported DIB header");
+    }
+    if bytes.len() < 14 + dib_size {
+        return Err("bmp: truncated DIB header");
+    }
+
+    let (w, h_signed, planes, bpp, comp, colors_used): (u32, i32, u16, u16, u32, u32) =
+        if dib_size == 12 {
+            let w = read_u16le(bytes, 18)? as u32;
+            let h = read_u16le(bytes, 20)? as i32;
+            let planes = read_u16le(bytes, 22)?;
+            let bpp = read_u16le(bytes, 24)?;
+            (w, h, planes, bpp, 0, 0)
+        } else {
+            let w = read_i32le(bytes, 18)?;
+            let h = read_i32le(bytes, 22)?;
+            let planes = read_u16le(bytes, 26)?;
+            let bpp = read_u16le(bytes, 28)?;
+            let comp = read_u32le(bytes, 30)?;
+            let colors_used = read_u32le(bytes, 46).unwrap_or(0);
+            if w <= 0 {
+                return Err("bmp: bad dimensions");
+            }
+            (w as u32, h, planes, bpp, comp, colors_used)
+        };
+    if planes != 1 {
+        return Err("bmp: bad planes");
+    }
+    if w == 0 || w > MAX_IMAGE_DIM {
+        return Err("bmp: bad dimensions");
+    }
+    let top_down = h_signed < 0;
+    let h = h_signed.unsigned_abs();
+    if h == 0 || h > MAX_IMAGE_DIM {
+        return Err("bmp: bad dimensions");
+    }
+    if (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
+        return Err("bmp: image has too many pixels");
+    }
+    if comp != 0 && comp != 3 {
+        return Err("bmp: only uncompressed/BITFIELDS BMP supported");
+    }
+    if comp == 3 && !(bpp == 16 || bpp == 32) {
+        return Err("bmp: BITFIELDS needs 16/32-bit");
+    }
+    match bpp {
+        1 | 4 | 8 | 16 | 24 | 32 => {}
+        _ => return Err("bmp: unsupported bit depth (need 1/4/8/16/24/32)"),
+    }
+
+    // Palette (for <= 8bpp).
+    let pal_entry_size = if dib_size == 12 { 3usize } else { 4usize };
+    let pal_count: usize = if bpp <= 8 {
+        if colors_used != 0 {
+            colors_used.min(256) as usize
+        } else {
+            1usize << bpp
+        }
+    } else {
+        0
+    };
+    let pal_off = 14 + dib_size
+        + if dib_size >= 40 && comp == 3 && bpp >= 16 {
+            12
+        } else {
+            0
+        };
+    let mut palette = [(0u8, 0u8, 0u8); 256];
+    if pal_count > 0 {
+        if pal_off + pal_count * pal_entry_size > bytes.len() {
+            return Err("bmp: truncated palette");
+        }
+        for i in 0..pal_count {
+            let o = pal_off + i * pal_entry_size;
+            // BMP palette entries are B,G,R (+reserved).
+            palette[i] = (bytes[o + 2], bytes[o + 1], bytes[o]);
+        }
+    }
+
+    // BITFIELDS masks.
+    let (rm, gm, bm) = if dib_size >= 40 && comp == 3 {
+        (
+            read_u32le(bytes, 14 + 40)?,
+            read_u32le(bytes, 14 + 44)?,
+            read_u32le(bytes, 14 + 48)?,
+        )
+    } else if bpp == 16 {
+        (0x7C00u32, 0x03E0u32, 0x001Fu32)
+    } else if bpp == 32 {
+        (0x00FF0000u32, 0x0000FF00u32, 0x000000FFu32)
+    } else {
+        (0, 0, 0)
+    };
+
+    let bits_per_row = (w as usize)
+        .checked_mul(bpp as usize)
+        .ok_or("bmp: bad dimensions")?;
+    let stride = (bits_per_row + 31) / 32 * 4;
+    let data_len = stride.checked_mul(h as usize).ok_or("bmp: bad dimensions")?;
+    if data_off + data_len > bytes.len() {
+        return Err("bmp: truncated pixel data");
+    }
+    let len = rgba_len(w, h).ok_or("bmp: bad dimensions")?;
+    let mut rgba = Vec::new();
+    rgba.try_reserve_exact(len).map_err(|_| "bmp: out of memory")?;
+    rgba.resize(len, 0);
+
+    let (rs, rb) = bmp_mask_shift(rm);
+    let (gs, gb) = bmp_mask_shift(gm);
+    let (bs, bb) = bmp_mask_shift(bm);
+
+    for y in 0..h as usize {
+        let src_y = if top_down { y } else { h as usize - 1 - y };
+        let row_off = data_off + src_y * stride;
+        for x in 0..w as usize {
+            let (r, g, b, a) = match bpp {
+                1 => {
+                    let byte = bytes[row_off + x / 8];
+                    let bit = 7 - (x % 8) as u8;
+                    let idx = ((byte >> bit) & 1) as usize;
+                    if idx >= pal_count {
+                        return Err("bmp: bad palette index");
+                    }
+                    let (r, g, b) = palette[idx];
+                    (r, g, b, 255)
+                }
+                4 => {
+                    let byte = bytes[row_off + x / 2];
+                    let idx = if x % 2 == 0 {
+                        (byte >> 4) & 0x0F
+                    } else {
+                        byte & 0x0F
+                    } as usize;
+                    if idx >= pal_count {
+                        return Err("bmp: bad palette index");
+                    }
+                    let (r, g, b) = palette[idx];
+                    (r, g, b, 255)
+                }
+                8 => {
+                    let idx = bytes[row_off + x] as usize;
+                    if idx >= pal_count {
+                        return Err("bmp: bad palette index");
+                    }
+                    let (r, g, b) = palette[idx];
+                    (r, g, b, 255)
+                }
+                16 => {
+                    let o = row_off + x * 2;
+                    let v = (bytes[o] as u32) | ((bytes[o + 1] as u32) << 8);
+                    (
+                        bmp_scale_channel((v & rm) >> rs, rb),
+                        bmp_scale_channel((v & gm) >> gs, gb),
+                        bmp_scale_channel((v & bm) >> bs, bb),
+                        255,
+                    )
+                }
+                24 => {
+                    let o = row_off + x * 3;
+                    (bytes[o + 2], bytes[o + 1], bytes[o], 255)
+                }
+                32 => {
+                    let o = row_off + x * 4;
+                    if comp == 3 {
+                        let v = (bytes[o] as u32)
+                            | ((bytes[o + 1] as u32) << 8)
+                            | ((bytes[o + 2] as u32) << 16)
+                            | ((bytes[o + 3] as u32) << 24);
+                        (
+                            bmp_scale_channel((v & rm) >> rs, rb),
+                            bmp_scale_channel((v & gm) >> gs, gb),
+                            bmp_scale_channel((v & bm) >> bs, bb),
+                            255,
+                        )
+                    } else {
+                        // BI_RGB 32-bit: B,G,R,reserved (use reserved as
+                        // alpha when nonzero so XP-style cursors keep shape).
+                        let a = bytes[o + 3];
+                        (bytes[o + 2], bytes[o + 1], bytes[o], if a == 0 { 255 } else { a })
+                    }
+                }
+                _ => return Err("bmp: unsupported bit depth"),
+            };
+            let d = (y * w as usize + x) * 4;
+            rgba[d] = r;
+            rgba[d + 1] = g;
+            rgba[d + 2] = b;
+            rgba[d + 3] = a;
+        }
+    }
+    Ok(DecodedImage { rgba, w, h })
+}
+
+// ──────────────────────────────────────────────
+// GIF (first frame only; LZW, transparency, interlace)
+// ──────────────────────────────────────────────
+
+fn gif_read_u16le(bytes: &[u8], pos: usize) -> Result<u16, &'static str> {
+    if pos + 2 > bytes.len() {
+        return Err("gif: truncated file");
+    }
+    Ok((bytes[pos] as u16) | ((bytes[pos + 1] as u16) << 8))
+}
+
+fn gif_skip_sub_blocks(bytes: &[u8], pos: &mut usize) -> Result<(), &'static str> {
+    loop {
+        if *pos >= bytes.len() {
+            return Err("gif: truncated block");
+        }
+        let n = bytes[*pos] as usize;
+        *pos += 1;
+        if n == 0 {
+            return Ok(());
+        }
+        if *pos + n > bytes.len() {
+            return Err("gif: truncated block");
+        }
+        *pos += n;
+    }
+}
+
+fn gif_lzw_decode(
+    min_code_size: u8,
+    data: &[u8],
+    expect: usize,
+) -> Result<Vec<u8>, &'static str> {
+    if min_code_size > 8 {
+        return Err("gif: bad LZW code size");
+    }
+    if expect == 0 || expect > (MAX_IMAGE_PIXELS as usize) {
+        return Err("gif: bad dimensions");
+    }
+    let clear = 1u16 << min_code_size;
+    let eoi = clear + 1;
+    let mut code_size = (min_code_size + 1) as u32;
+    let mut next = eoi + 1;
+    // Prefix/suffix tables (12-bit max => 4096 entries). Roots (< clear)
+    // expand to themselves; entries >= eoi+1 chain via prefix.
+    let mut prefix = [0u16; 4096];
+    let mut suffix = [0u8; 4096];
+    for i in 0..clear as usize {
+        suffix[i] = i as u8;
+    }
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve(expect).map_err(|_| "gif: out of memory")?;
+    // LSB-first bit reader over `data`.
+    let mut di = 0usize;
+    let mut cur_datum: u32 = 0;
+    let mut cur_bits: u32 = 0;
+    macro_rules! read_code {
+        () => {{
+            while cur_bits < code_size {
+                if di >= data.len() {
+                    break;
+                }
+                cur_datum |= (data[di] as u32) << cur_bits;
+                di += 1;
+                cur_bits += 8;
+            }
+            if cur_bits < code_size {
+                None
+            } else {
+                let c = (cur_datum & ((1u32 << code_size) - 1)) as u16;
+                cur_datum >>= code_size;
+                cur_bits -= code_size;
+                Some(c)
+            }
+        }};
+    }
+    // Expand one code into bytes (appended to `tmp` in order).
+    let mut stack = [0u8; 4096];
+    let mut prev_code: Option<u16> = None;
+    loop {
+        let code = match read_code!() {
+            Some(c) => c,
+            None => break,
+        };
+        if code == clear {
+            code_size = (min_code_size + 1) as u32;
+            next = eoi + 1;
+            prev_code = None;
+            continue;
+        }
+        if code == eoi {
+            break;
+        }
+        // Resolve the byte string for `code`.
+        let mut tmp: Vec<u8> = Vec::new();
+        if code < next {
+            let mut c = code;
+            let mut top = 0usize;
+            while c >= clear + 2 {
+                if (c as usize) >= 4096 || c >= next {
+                    return Err("gif: bad LZW code");
+                }
+                stack[top] = suffix[c as usize];
+                top += 1;
+                c = prefix[c as usize];
+            }
+            if (c as usize) >= 4096 {
+                return Err("gif: bad LZW code");
+            }
+            stack[top] = suffix[c as usize];
+            top += 1;
+            for i in (0..top).rev() {
+                if out.len() + tmp.len() >= expect && tmp.len() >= top {
+                    break;
+                }
+                tmp.push(stack[i]);
+                if out.len() + tmp.len() >= expect + 4096 {
+                    break;
+                }
+            }
+        } else if code == next {
+            // KwKwK case: prev string + its first byte.
+            let prev = prev_code.ok_or("gif: bad LZW code")?;
+            let mut c = prev;
+            let mut top = 0usize;
+            while c >= clear + 2 {
+                if (c as usize) >= 4096 || c >= next {
+                    return Err("gif: bad LZW code");
+                }
+                stack[top] = suffix[c as usize];
+                top += 1;
+                c = prefix[c as usize];
+            }
+            stack[top] = suffix[c as usize];
+            top += 1;
+            for i in (0..top).rev() {
+                tmp.push(stack[i]);
+            }
+            if tmp.is_empty() {
+                return Err("gif: bad LZW code");
+            }
+            let first = tmp[0];
+            tmp.push(first);
+        } else {
+            return Err("gif: bad LZW code");
+        }
+        for &b in &tmp {
+            if out.len() >= expect {
+                break;
+            }
+            out.push(b);
+        }
+        if out.len() >= expect {
+            break;
+        }
+        // Table entry = prev string + first byte of current string.
+        if let Some(prev) = prev_code {
+            if next < 4096 && !tmp.is_empty() {
+                prefix[next as usize] = prev;
+                suffix[next as usize] = tmp[0];
+                next += 1;
+                if next == (1u16 << code_size) + 1 && code_size < 12 {
+                    code_size += 1;
+                }
+            }
+        }
+        prev_code = Some(code);
+        if next > 4096 {
+            return Err("gif: LZW table overflow");
+        }
+    }
+    if out.is_empty() {
+        return Err("gif: no image data");
+    }
+    out.truncate(expect);
+    Ok(out)
+}
+
+pub fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, &'static str> {
+    if !is_gif(bytes) {
+        return Err("not a GIF file");
+    }
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err("image too large (max 4 MiB; resize below 1920x1080)");
+    }
+    if bytes.len() < 13 {
+        return Err("gif: truncated header");
+    }
+    let sw = gif_read_u16le(bytes, 6)? as u32;
+    let sh = gif_read_u16le(bytes, 8)? as u32;
+    if sw == 0 || sh == 0 || sw > MAX_IMAGE_DIM || sh > MAX_IMAGE_DIM {
+        return Err("gif: bad dimensions");
+    }
+    if (sw as u64) * (sh as u64) > MAX_IMAGE_PIXELS {
+        return Err("gif: image has too many pixels");
+    }
+    let packed = bytes[10];
+    let mut pos = 13usize;
+    let mut global_pal: Vec<(u8, u8, u8)> = Vec::new();
+    if packed & 0x80 != 0 {
+        let n = 1usize << ((packed & 0x07) + 1);
+        if pos + n * 3 > bytes.len() {
+            return Err("gif: truncated palette");
+        }
+        for i in 0..n {
+            global_pal.push((bytes[pos + i * 3], bytes[pos + i * 3 + 1], bytes[pos + i * 3 + 2]));
+        }
+        pos += n * 3;
+    }
+
+    let mut transparent: Option<u8> = None;
+    loop {
+        if pos >= bytes.len() {
+            return Err("gif: no image data");
+        }
+        let sep = bytes[pos];
+        pos += 1;
+        match sep {
+            0x3B => return Err("gif: no image data"), // trailer before image
+            0x21 => {
+                // Extension.
+                if pos >= bytes.len() {
+                    return Err("gif: truncated extension");
+                }
+                let label = bytes[pos];
+                pos += 1;
+                if label == 0xF9 {
+                    // Graphic Control Extension.
+                    if pos >= bytes.len() {
+                        return Err("gif: truncated GCE");
+                    }
+                    let block_size = bytes[pos] as usize;
+                    pos += 1;
+                    if block_size < 4 || pos + block_size + 1 > bytes.len() {
+                        return Err("gif: truncated GCE");
+                    }
+                    let flags = bytes[pos];
+                    let trans_idx = bytes[pos + 3];
+                    if flags & 0x01 != 0 {
+                        transparent = Some(trans_idx);
+                    }
+                    pos += block_size + 1; // skip block + terminator
+                } else {
+                    gif_skip_sub_blocks(bytes, &mut pos)?;
+                }
+            }
+            0x2C => {
+                // Image descriptor (first frame wins).
+                if pos + 8 > bytes.len() {
+                    return Err("gif: truncated descriptor");
+                }
+                let iw = gif_read_u16le(bytes, pos + 4)? as u32;
+                let ih = gif_read_u16le(bytes, pos + 6)? as u32;
+                let ipacked = bytes[pos + 8];
+                pos += 9;
+                if iw == 0 || ih == 0 || iw > MAX_IMAGE_DIM || ih > MAX_IMAGE_DIM {
+                    return Err("gif: bad frame size");
+                }
+                if (iw as u64) * (ih as u64) > MAX_IMAGE_PIXELS {
+                    return Err("gif: image has too many pixels");
+                }
+                let interlaced = ipacked & 0x40 != 0;
+                let mut active = global_pal.clone();
+                if ipacked & 0x80 != 0 {
+                    let n = 1usize << ((ipacked & 0x07) + 1);
+                    if pos + n * 3 > bytes.len() {
+                        return Err("gif: truncated palette");
+                    }
+                    active.clear();
+                    for i in 0..n {
+                        active.push((
+                            bytes[pos + i * 3],
+                            bytes[pos + i * 3 + 1],
+                            bytes[pos + i * 3 + 2],
+                        ));
+                    }
+                    pos += n * 3;
+                }
+                if active.is_empty() {
+                    return Err("gif: missing palette");
+                }
+                if pos >= bytes.len() {
+                    return Err("gif: truncated LZW header");
+                }
+                let min_code = bytes[pos];
+                pos += 1;
+                // Collect sub-blocks.
+                let mut comp: Vec<u8> = Vec::new();
+                loop {
+                    if pos >= bytes.len() {
+                        return Err("gif: truncated image data");
+                    }
+                    let n = bytes[pos] as usize;
+                    pos += 1;
+                    if n == 0 {
+                        break;
+                    }
+                    if pos + n > bytes.len() {
+                        return Err("gif: truncated image data");
+                    }
+                    comp.extend_from_slice(&bytes[pos..pos + n]);
+                    pos += n;
+                    if comp.len() > MAX_IMAGE_BYTES {
+                        return Err("gif: compressed frame too large");
+                    }
+                }
+                let expect = (iw as usize) * (ih as usize);
+                let indices = gif_lzw_decode(min_code, &comp, expect)?;
+                if indices.len() < expect {
+                    return Err("gif: truncated pixels");
+                }
+                let len = rgba_len(iw, ih).ok_or("gif: bad dimensions")?;
+                let mut rgba = Vec::new();
+                rgba.try_reserve_exact(len).map_err(|_| "gif: out of memory")?;
+                rgba.resize(len, 0);
+                // Deinterlace (4-pass) when flagged: the stream fills rows
+                // 0,8,16.. then 4,12.. then 2,6,10,14.. then 1,3,5,7.., so
+                // output row y comes from the stream chunk at the *inverse*
+                // position (index of y in the pass order).
+                let mut stream_row_of: Vec<usize> = Vec::new();
+                if interlaced {
+                    stream_row_of.resize(ih as usize, 0);
+                    let mut k = 0usize;
+                    for (start, step) in [(0usize, 8usize), (4, 8), (2, 4), (1, 2)] {
+                        let mut r = start;
+                        while r < ih as usize {
+                            stream_row_of[r] = k;
+                            k += 1;
+                            r += step;
+                        }
+                    }
+                }
+                for y in 0..ih as usize {
+                    let sy = if interlaced {
+                        *stream_row_of.get(y).unwrap_or(&y)
+                    } else {
+                        y
+                    };
+                    for x in 0..iw as usize {
+                        let idx = indices[sy * iw as usize + x] as usize;
+                        let d = (y * iw as usize + x) * 4;
+                        if idx >= active.len() {
+                            rgba[d + 3] = 0;
+                            continue;
+                        }
+                        let (r, g, b) = active[idx];
+                        rgba[d] = r;
+                        rgba[d + 1] = g;
+                        rgba[d + 2] = b;
+                        rgba[d + 3] = if Some(idx as u8) == transparent { 0 } else { 255 };
+                    }
+                }
+                return Ok(DecodedImage { rgba, w: iw, h: ih });
+            }
+            _ => return Err("gif: bad block"),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
 // Scaling (nearest-neighbor; runs once per change)
 // ──────────────────────────────────────────────
 
@@ -2189,6 +2874,7 @@ pub fn current_config() -> WallpaperConfig {
         mode: st.mode,
         bg: st.bg,
         accent: st.accent,
+        cursor: crate::desktop::cursor::current_name(),
     }
 }
 
@@ -2225,7 +2911,10 @@ pub fn preview_rgba(max_w: u32, max_h: u32) -> Option<(Vec<u8>, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_auto, decode_jpeg, decode_png, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS};
+    use super::{
+        decode_auto, decode_bmp, decode_gif, decode_jpeg, decode_png, MAX_IMAGE_BYTES,
+        MAX_IMAGE_PIXELS,
+    };
 
     /// Minimal 1x1 grayscale PNG (stored deflate block; CRCs unchecked by
     /// the decoder, any 4 bytes do). Validates the happy path under the caps.
@@ -2282,6 +2971,110 @@ mod tests {
         assert!(decode_jpeg(&jpg).is_err());
         // The pixel cap fits a 1080p framebuffer budget.
         assert!(MAX_IMAGE_PIXELS <= 1920 * 1080);
+    }
+
+    #[test]
+    fn tiny_bmp_decodes() {
+        // 2x1 24-bit BMP, bottom-up: red, green.
+        let mut bmp = alloc::vec![0u8; 0];
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&[58, 0, 0, 0]); // file size
+        bmp.extend_from_slice(&[0, 0, 0, 0]); // reserved
+        bmp.extend_from_slice(&[54, 0, 0, 0]); // data offset
+        bmp.extend_from_slice(&[40, 0, 0, 0]); // DIB size
+        bmp.extend_from_slice(&[2, 0, 0, 0]); // w
+        bmp.extend_from_slice(&[1, 0, 0, 0]); // h (bottom-up)
+        bmp.extend_from_slice(&[1, 0]); // planes
+        bmp.extend_from_slice(&[24, 0]); // bpp
+        bmp.extend_from_slice(&[0, 0, 0, 0]); // BI_RGB
+        bmp.extend_from_slice(&[0, 0, 0, 0]); // image size
+        bmp.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // ppm
+        bmp.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // colors
+        // Row padded to 4: BGR BGR + 2 pad.
+        bmp.extend_from_slice(&[0, 0, 255, 0, 255, 0, 0, 0]);
+        let img = decode_auto(&bmp).unwrap();
+        assert_eq!((img.w, img.h), (2, 1));
+        assert_eq!(&img.rgba[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&img.rgba[4..8], &[0, 255, 0, 255]);
+        assert!(decode_bmp(&bmp).is_ok());
+        assert!(super::is_bmp(&bmp));
+    }
+
+    #[test]
+    fn tiny_gif_decodes() {
+        // 1x1 GIF89a, global palette [red], single pixel index 0.
+        let gif = alloc::vec![
+            b'G', b'I', b'F', b'8', b'9', b'a', // header
+            1, 0, 1, 0, // w, h
+            0x80, 0, 0, // GCT flag, 2 colors; bg; aspect
+            255, 0, 0, 0, 0, 0, // palette: red, black
+            0x2C, // image descriptor
+            0, 0, 0, 0, 1, 0, 1, 0, 0, // left,top,w,h,packed
+            1, // LZW min code size
+            1, 0x32, // 1-byte compressed stream (CLEAR, 0, EOI)
+            0,  // terminator
+            0x3B, // trailer
+        ];
+        assert!(super::is_gif(&gif));
+        let img = decode_gif(&gif).unwrap();
+        assert_eq!((img.w, img.h), (1, 1));
+        assert_eq!(&img.rgba[0..3], &[255, 0, 0]);
+        assert_eq!(img.rgba[3], 255);
+        let auto = decode_auto(&gif).unwrap();
+        assert_eq!((auto.w, auto.h), (1, 1));
+    }
+
+    /// 16x16 GIF87a, 64-color global palette, multi-sub-block LZW stream
+    /// (exercises table growth + code-size increases). Pixels generated by
+    /// Pillow (seed 7); spot-checked against its RGB output.
+    fn gradient_gif() -> alloc::vec::Vec<u8> {
+        alloc::vec![
+            71, 73, 70, 56, 55, 97, 16, 0, 16, 0, 133, 0, 0, 165, 77, 202, 24, 37, 48, 187, 29,
+            109, 19, 44, 222, 214, 35, 123, 46, 217, 30, 63, 114, 31, 203, 25, 113, 23, 68, 148,
+            214, 73, 60, 157, 92, 52, 96, 190, 49, 32, 30, 105, 254, 218, 160, 238, 232, 185, 153,
+            127, 92, 124, 41, 153, 253, 175, 229, 147, 37, 60, 214, 84, 175, 77, 250, 215, 20, 39,
+            160, 174, 179, 254, 233, 35, 47, 138, 242, 33, 31, 158, 228, 145, 197, 177, 11, 236,
+            181, 86, 59, 252, 30, 111, 147, 66, 126, 203, 200, 254, 41, 85, 229, 205, 142, 70, 220,
+            142, 212, 183, 194, 118, 77, 42, 90, 77, 118, 119, 6, 248, 93, 134, 144, 2, 74, 214,
+            189, 163, 64, 27, 233, 200, 203, 204, 201, 53, 246, 205, 31, 97, 34, 106, 225, 83, 56,
+            174, 26, 52, 0, 77, 51, 186, 13, 36, 106, 192, 76, 129, 177, 186, 242, 62, 59, 249,
+            238, 245, 247, 159, 43, 73, 52, 175, 135, 245, 82, 11, 105, 185, 75, 13, 152, 46, 133,
+            187, 85, 182, 114, 168, 114, 99, 122, 205, 116, 102, 252, 182, 14, 44, 0, 0, 0, 0, 16,
+            0, 16, 0, 64, 8, 178, 0, 1, 16, 64, 192, 0, 2, 5, 12, 28, 64, 144, 64, 193, 2, 6, 13,
+            28, 60, 8, 26, 68, 168, 144, 161, 67, 136, 2, 7, 22, 60, 152, 112, 97, 195, 135, 60, 0,
+            108, 164, 232, 241, 98, 200, 129, 2, 12, 40, 112, 32, 193, 130, 6, 15, 34, 76, 168,
+            112, 33, 195, 134, 14, 31, 42, 89, 186, 132, 41, 147, 166, 77, 31, 2, 86, 182, 124, 25,
+            115, 102, 205, 155, 41, 117, 18, 237, 121, 20, 168, 202, 0, 5, 18, 52, 136, 80, 33, 67,
+            135, 16, 37, 82, 180, 136, 81, 35, 71, 143, 1, 7, 22, 60, 152, 112, 97, 195, 135, 17,
+            39, 86, 188, 152, 113, 99, 199, 143, 168, 83, 171, 94, 205, 186, 181, 107, 143, 0, 97,
+            199, 150, 61, 155, 118, 109, 219, 31, 3, 164, 82, 181, 138, 85, 43, 87, 175, 80, 197,
+            146, 53, 139, 86, 45, 91, 183, 96, 227, 18, 166, 123, 248, 110, 84, 189, 140, 251, 62,
+            6, 28, 54, 32, 0, 59,
+        ]
+    }
+
+    fn gif_px(img: &super::DecodedImage, x: u32, y: u32) -> [u8; 4] {
+        let o = ((y * img.w + x) * 4) as usize;
+        [img.rgba[o], img.rgba[o + 1], img.rgba[o + 2], img.rgba[o + 3]]
+    }
+
+    #[test]
+    fn gif_gradient_decodes() {
+        let img = decode_gif(&gradient_gif()).unwrap();
+        assert_eq!((img.w, img.h), (16, 16));
+        assert_eq!(gif_px(&img, 0, 0), [165, 77, 202, 255]);
+        assert_eq!(gif_px(&img, 5, 3), [233, 35, 47, 255]);
+        assert_eq!(gif_px(&img, 15, 15), [96, 190, 49, 255]);
+        assert_eq!(gif_px(&img, 7, 9), [118, 119, 6, 255]);
+    }
+
+    #[test]
+    fn cursor_extras_sniff_and_reject() {
+        assert_eq!(super::sniff_kind(b"BMxxxx"), super::ImageKind::Bmp);
+        assert!(super::has_supported_extension("a.bmp"));
+        assert!(super::has_supported_extension("a.GIF"));
+        assert!(!super::has_supported_extension("a.webp"));
+        assert!(decode_auto(b"not an image").is_err());
     }
 
     #[test]

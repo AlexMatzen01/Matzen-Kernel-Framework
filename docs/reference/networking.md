@@ -790,8 +790,9 @@ name an open connection:
   which looked identical to a silent peer.
 - **UDP** had no identity at all: the caller picked a port at receive time and
   every reader scanned one shared queue.
-- `tls::TcpSocket` was the only owned-connection type, and it compiled only under
-  the non-default `net_tls` feature.
+- `tls::TcpSocket` was the only owned-connection type, and it compiles
+  only when the `net_tls` feature is enabled (on by default; `--no-tls`
+  selects the stub instead).
 
 ### Handles are index + generation
 
@@ -986,12 +987,36 @@ already here; what is missing is scheduling the renewal.
 
 ### HTTPS
 
-The `net_tls` feature does not currently compile for the `x86_64-mfk` target: the
-crypto crates fail in LLVM with `Do not know how to split the result of this
-operator`, because the target disables SSE2 and selects the `x86-softfloat` ABI.
-Certificate and hostname verification themselves are already handled by
-`embedded-tls`, which implements RFC 6125 SAN matching; what is missing is a
-toolchain that can build it, and therefore any runtime test of it.
+TLS 1.3 (`net_tls`) is enabled by default: `wget https://...` verifies
+certificates through `embedded-tls`, which implements RFC 6125 SAN
+matching (ISRG Root X1 baked in). Build with `./build.sh --no-tls`
+(or `--no-default-features --features usb` for direct cargo invocations)
+to omit it and fall back to the stub that reports "TLS is not enabled".
+
+Each connection retries every embedded trust anchor in order (a failed
+handshake consumes its socket, so each anchor gets a fresh connection;
+verification happens before any byte is requested, hence retrying never
+duplicates a download). Bundled roots (`kernel/src/net/tls.rs`,
+`TRUSTED_ROOTS`):
+
+- ISRG Root X1 — Let's Encrypt hosts (e.g. `raw.githubusercontent.com`).
+- Sectigo Public Server Authentication Root E46 — e.g. `github.com`.
+
+`tlsinfo` lists the anchors and the wall-clock state; `wget`/`speedtest`
+refuse HTTPS early with `wall clock not set` when the RTC time is missing
+instead of failing opaquely mid-handshake.
+
+Known soft-float notes for the `x86_64-mfk` target: the kernel target
+disables SSE2 and selects the `x86-softfloat` ABI, so every crypto crate
+with an x86 SIMD backend is forced to its portable implementation —
+`sha2` v0.11 via `--cfg sha2_backend="soft"`, the transitive `sha2` v0.10
+via the `force-soft` cargo feature, `aes` 0.8 via `--cfg aes_force_soft`,
+`polyval` 0.6 via `--cfg polyval_force_soft` (see `.cargo/config.toml`
+and `kernel/Cargo.toml`). ghash delegates to polyval and ppv-lite86
+already picks its generic backend on `-sse2` targets, so both are covered.
+If a build still fails in LLVM with `Do not know how to split the result
+of this operator`, rebuild with `--no-tls` and report which crate failed
+so it can be addressed (bump or patch in a soft backend).
 
 ## Next Steps
 

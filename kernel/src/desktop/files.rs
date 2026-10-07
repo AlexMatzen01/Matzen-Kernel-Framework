@@ -393,6 +393,18 @@ pub fn open_selected(scene: &mut Scene, app: &mut ExplorerApp) {
         refresh_explorer(scene, app);
     } else {
         let full = join_path(&app.cur_path, &fi.name);
+        // Images open in the Viewer (queued; desktop loop opens it).
+        if crate::desktop::viewer::is_image_path(&fi.name)
+            || crate::desktop::viewer::is_image_path(&full)
+        {
+            crate::desktop::viewer::set_pending_image(&full);
+            app.status = alloc::format!("Opening '{}' in Viewer...", fi.name);
+            render_explorer_labels(scene, app);
+            if let Some(win) = scene.windows.get(&app.window) {
+                scene.mark_dirty(win.bounds);
+            }
+            return;
+        }
         match crate::shell::gui_read_file(&full) {
             Ok(data) => {
                 let n = data.len().min(PREVIEW_MAX);

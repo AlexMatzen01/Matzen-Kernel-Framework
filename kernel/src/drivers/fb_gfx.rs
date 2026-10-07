@@ -668,6 +668,162 @@ pub fn framebuffer_text_size() -> Option<(usize, usize)> {
     crate::drivers::fb::text_size()
 }
 
+/// Split a 0xRRGGBB color into components.
+#[inline]
+pub fn split_rgb(c: u32) -> (u8, u8, u8) {
+    (((c >> 16) & 0xFF) as u8, ((c >> 8) & 0xFF) as u8, (c & 0xFF) as u8)
+}
+
+/// Blend `fg` over `bg` with 0..255 alpha (integer only, no float).
+#[inline]
+pub fn blend_u32(fg: u32, bg: u32, alpha: u8) -> u32 {
+    let a = alpha as u32;
+    let ia = 255 - a;
+    let r = (((fg >> 16) & 0xFF) * a + ((bg >> 16) & 0xFF) * ia) / 255;
+    let g = (((fg >> 8) & 0xFF) * a + ((bg >> 8) & 0xFF) * ia) / 255;
+    let b = ((fg & 0xFF) * a + (bg & 0xFF) * ia) / 255;
+    (r << 16) | (g << 8) | b
+}
+
+/// Row-by-row filled rounded rect. `radius` is clamped to half size.
+/// Cost is O(h) rect fills, safe for titlebars/buttons/windows.
+pub fn fill_rounded_rect_px(x: usize, y: usize, w: usize, h: usize, radius: usize, color: u32) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let (r, g, b) = split_rgb(color);
+    let rad = radius.min(w / 2).min(h / 2);
+    if rad == 0 {
+        fill_rect_px(x, y, w, h, r, g, b);
+        return;
+    }
+    // Middle band (full width).
+    if h > rad * 2 {
+        fill_rect_px(x, y + rad, w, h - rad * 2, r, g, b);
+    }
+    // Top and bottom bands with per-row corner insets (circle test).
+    for row in 0..rad {
+        // dy from circle center: rad-1-row .. rad-1 ; use integer circle.
+        let dy = (rad as i32 - 1 - row as i32).abs() as usize;
+        // dx = rad - floor(sqrt(rad^2 - dy^2)); isqrt via integer loop (rad<=16 typical).
+        let mut inset = rad;
+        let rad2 = rad * rad;
+        let dy2 = dy * dy;
+        if rad2 > dy2 {
+            let mut dx: usize = 0;
+            while dx * dx < rad2 - dy2 {
+                dx += 1;
+            }
+            // dx = ceil(sqrt(...)); inset = rad - dx
+            inset = rad.saturating_sub(dx);
+        }
+        let rw = w.saturating_sub(inset * 2);
+        let rx = x.saturating_add(inset);
+        if rw > 0 {
+            fill_rect_px(rx, y + row, rw, 1, r, g, b);
+            if h > row {
+                fill_rect_px(rx, y + h - 1 - row, rw, 1, r, g, b);
+            }
+        }
+    }
+    // Fill the side strips between the corner rows and middle band edges.
+    // Top strip rows [0..rad] already painted; rows [rad..h-rad] painted.
+    // Left/right full-height edges inside corners:
+    if w > 0 {
+        // Left + right columns for the corner band height already covered by
+        // the inset rows above; nothing extra needed. Middle band covers rest.
+    }
+}
+
+/// Vertical gradient fill (top -> bottom), integer lerp per row.
+pub fn fill_gradient_px(
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    top: u32,
+    bottom: u32,
+    radius: usize,
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let (tr, tg, tb) = split_rgb(top);
+    let (br, bg_, bb) = split_rgb(bottom);
+    let rad = radius.min(w / 2).min(h / 2);
+    for row in 0..h {
+        let t = if h <= 1 { 0 } else { (row * 255 / (h - 1)) as u32 };
+        let it = 255 - t;
+        let r = ((tr as u32 * it + br as u32 * t) / 255) as u8;
+        let g = ((tg as u32 * it + bg_ as u32 * t) / 255) as u8;
+        let b = ((tb as u32 * it + bb as u32 * t) / 255) as u8;
+        if rad == 0 {
+            fill_rect_px(x, y + row, w, 1, r, g, b);
+        } else if row < rad || row >= h - rad {
+            let band_row = if row < rad { row } else { h - 1 - row };
+            let dy = (rad as i32 - 1 - band_row as i32).abs() as usize;
+            let mut inset = rad;
+            let rad2 = rad * rad;
+            let dy2 = dy * dy;
+            if rad2 > dy2 {
+                let mut dx: usize = 0;
+                while dx * dx < rad2 - dy2 {
+                    dx += 1;
+                }
+                inset = rad.saturating_sub(dx);
+            }
+            let rw = w.saturating_sub(inset * 2);
+            if rw > 0 {
+                fill_rect_px(x + inset, y + row, rw, 1, r, g, b);
+            }
+        } else {
+            fill_rect_px(x, y + row, w, 1, r, g, b);
+        }
+    }
+}
+
+/// Soft drop shadow: two stacked rounded layers under the window.
+/// Outer = faint large halo, inner = tighter dark edge. Both clipped.
+pub fn shadow_rounded_px(x: usize, y: usize, w: usize, h: usize, radius: usize) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    // Offset down/right like a light source from top-left.
+    let ox = 0usize;
+    let oy = 4usize;
+    let blur = 8usize;
+    // Outer halo.
+    let (hx, hy, hw, hh) = (
+        x.saturating_add(ox).saturating_sub(blur / 2),
+        y.saturating_add(oy).saturating_sub(blur / 2),
+        w.saturating_add(blur),
+        h.saturating_add(blur),
+    );
+    fill_rounded_rect_px(hx, hy, hw, hh, radius + blur / 2, 0x05070A);
+    // Inner tight shadow hugging the window.
+    fill_rounded_rect_px(
+        x.saturating_add(ox),
+        y.saturating_add(oy),
+        w,
+        h,
+        radius,
+        0x0A0E13,
+    );
+}
+
+/// 1px glass highlight along the top-inner edge of a rounded rect.
+pub fn glass_top_line_px(x: usize, y: usize, w: usize, radius: usize, color: u32) {
+    if w == 0 {
+        return;
+    }
+    let (r, g, b) = split_rgb(color);
+    let inset = radius.min(w / 2);
+    let rw = w.saturating_sub(inset * 2);
+    if rw > 0 {
+        fill_rect_px(x + inset, y, rw, 1, r, g, b);
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

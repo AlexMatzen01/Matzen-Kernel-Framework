@@ -13,9 +13,9 @@ name = "mfk-kernel"
 path = "src/main.rs"
 
 [features]
-default = ["usb"]
+default = ["usb", "net_tls"]
 usb = []
-net_tls = ["dep:embedded-tls", "dep:rand_chacha", "dep:rand_core"]
+net_tls = ["dep:embedded-tls", "dep:rand_chacha", "dep:rand_core", "dep:sha2_010"]
 
 [dependencies]
 bootloader_api = "0.11"
@@ -27,6 +27,14 @@ embedded-io = { version = "0.7", default-features = false }
 embedded-tls = { version = "0.19", default-features = false, features = ["rustpki"], optional = true }
 rand_chacha = { version = "0.3", default-features = false, optional = true }
 rand_core = { version = "0.6", default-features = false, optional = true }
+# Not used directly in code: exists only to enable `force-soft` on the
+# transitive sha2 v0.10 (via embedded-tls) through feature unification, so it
+# avoids the x86 SIMD paths LLVM cannot lower on the +soft-float/-sse kernel
+# target ("Do not know how to split the result of this operator!").
+# Feature unification is additive, so this only *adds* force-soft. (sha2 v0.11,
+# via lzma-rust2, is instead forced to its portable backend with
+# `--cfg sha2_backend="soft"` — see .cargo/config.toml.)
+sha2_010 = { package = "sha2", version = "0.10", default-features = false, features = ["force-soft"], optional = true }
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 lzma-rust2 = { version = "0.21", default-features = false, features = ["xz", "encoder", "lzip"] }
 libbz2-rs-sys = { version = "0.2", default-features = false, features = ["rust-allocator"] }

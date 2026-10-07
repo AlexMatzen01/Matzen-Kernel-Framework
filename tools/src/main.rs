@@ -143,6 +143,10 @@ fn main() {
 
     let no_run = args.iter().any(|a| a == "--no-run");
     let force = args.iter().any(|a| a == "--force");
+    // Skip creating the UEFI ISO (`--no-iso`). Everything except Hyper-V
+    // DVD boot runs from the raw .img files, so the ISO is optional.
+    // Hyper-V DVD boot fails with a clear error when the ISO is missing.
+    let no_iso = args.iter().any(|a| a == "--no-iso");
     // Hyper-V options (Windows only, UEFI only).
     let hyperv_switch: Option<String> = args
         .iter()
@@ -408,16 +412,30 @@ fn main() {
     // Create the UEFI ISO (El Torito, for Hyper-V Gen2 DVD boot).
     //
     // BIOS is legacy here and intentionally gets no ISO.
+    // Skipped with --no-iso (Hyper-V DVD boot then needs the ISO
+    // to already exist, otherwise it exits with a clear error).
     // ------------------------------------------------------------
 
     let iso_path = format!("{}-uefi.iso", args[1]);
 
-    println!("Creating UEFI ISO image...");
-    match uefi_iso::create_uefi_iso(Path::new(&uefi_path), Path::new(&iso_path)) {
-        Ok(_) => println!("Created UEFI ISO image: {}", iso_path),
-        Err(e) => {
-            eprintln!("Failed to create UEFI ISO image: {}", e);
+    if no_iso {
+        println!("Skipping UEFI ISO creation (--no-iso).");
+        if hypervisor == "hyperv" && hyperv_boot == "dvd" && !Path::new(&iso_path).exists() {
+            eprintln!(
+                "ERROR: Hyper-V DVD boot needs the UEFI ISO but it is missing: {}",
+                iso_path
+            );
+            eprintln!("Drop --no-iso to create it, or use --hyperv-boot=disk.");
             std::process::exit(1);
+        }
+    } else {
+        println!("Creating UEFI ISO image...");
+        match uefi_iso::create_uefi_iso(Path::new(&uefi_path), Path::new(&iso_path)) {
+            Ok(_) => println!("Created UEFI ISO image: {}", iso_path),
+            Err(e) => {
+                eprintln!("Failed to create UEFI ISO image: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 
@@ -521,7 +539,11 @@ fn main() {
     println!("  Hypervisor: {}", hypervisor);
     println!("  Firmware:   {}", firmware.name());
     println!("  Boot image: {}", boot_image);
-    println!("  UEFI ISO:   {}", iso_path);
+    if no_iso && !Path::new(&iso_path).exists() {
+        println!("  UEFI ISO:   (skipped)");
+    } else {
+        println!("  UEFI ISO:   {}", iso_path);
+    }
     if hypervisor == "hyperv" {
         println!("  HV boot:    {}", hyperv_boot);
         println!(
@@ -2419,6 +2441,8 @@ fn print_usage(program: &str) {
     eprintln!("  --uefi                   Use UEFI firmware");
 
     eprintln!("  --no-run                 Only create disk images");
+
+    eprintln!("  --no-iso                 Skip UEFI ISO creation (Hyper-V DVD boot needs it)");
 
     eprintln!("  --force                  Force rebuild VDI/VM");
 

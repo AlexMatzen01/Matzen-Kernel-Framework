@@ -5,6 +5,7 @@
   "ovmf_code": "OVMF/OVMF_CODE_4M.fd",
   "keyboard": "xhci",
   "bundle_apps": false,
+  "no_iso": true,
   "data_disk_size": "10M",
   "doom": false,
   "doom_wad": "target/doom1.wad",
@@ -28,11 +29,21 @@
   "extras": [
     {
       "path": "target/extra-disk.img",
-      "size": "4G",
+      "size": "64M",
       "boot": false,
       "bus": "auto"
+    },
+    {
+      "path": "target/extra-disk2.img",
+      "size": "69M",
+      "boot": false,
+      "bus": "auto"
+    },
+    {
+      "path": "target/extra-disk3.img",
+      "size": "64M",
+      "boot": false,
+      "bus": "virtio"
     }
-  ],
-  "_doom_host": "",
-  "_doom_guest": ""
+  ]
 }

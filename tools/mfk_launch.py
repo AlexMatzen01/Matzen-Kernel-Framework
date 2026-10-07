@@ -39,6 +39,7 @@ DEFAULTS = {
     "ovmf_code": "OVMF/OVMF_CODE_4M.fd",
     "keyboard": "ps2",          # ps2 | ehci | xhci | uhci | ohci (QEMU only)
     "bundle_apps": False,
+    "no_iso": False,          # skip UEFI ISO creation (runner --no-iso)
     "data_disk_size": "10M",
     "doom": False,                # fully automated Doom setup (WAD disk + attach)
     "doom_wad": "target/doom1.wad",      # shareware WAD cache (auto-downloaded)
@@ -281,6 +282,8 @@ def load_config() -> dict:
         cfg["keyboard"] = str(cfg["keyboard"]).lower()
     if cfg.get("hypervisor") == "hyperv":
         cfg["firmware"] = "uefi"  # Hyper-V Generation 2 is UEFI-only
+    # Normalize the ISO flag (old configs lack it).
+    cfg["no_iso"] = bool(cfg.get("no_iso", False))
     norm = []
     for e in cfg.get("extras", []):
         if isinstance(e, dict) and e.get("path"):
@@ -349,6 +352,9 @@ def to_runner_args(cfg: dict) -> list[str]:
         args.append("--qemu" if hv == "qemu" else "--vbox")
     # Hyper-V Generation 2 is UEFI-only.
     args.append("--uefi" if (cfg.get("firmware") == "uefi" or hv == "hyperv") else "--bios")
+    # ISO creation: skipped with --no-iso (Hyper-V DVD boot needs it).
+    if cfg.get("no_iso"):
+        args.append("--no-iso")
     if hv == "hyperv":
         # Hyper-V Gen2 options (host-side parity; QEMU devices don't apply).
         boot = str(cfg.get("hyperv_boot", "dvd") or "dvd").lower()
@@ -437,6 +443,7 @@ def show_config(cfg: dict) -> None:
         t.add_row("ovmf_status", ovmf_status(cfg))
         t.add_row("keyboard", cfg["keyboard"])
         t.add_row("bundle_apps", str(cfg["bundle_apps"]))
+        t.add_row("no_iso", "ON (skip ISO)" if cfg.get("no_iso") else "OFF")
         t.add_row("data_disk_size", cfg["data_disk_size"])
         t.add_row("vnc", "ON" if cfg["vnc"] else "OFF")
         t.add_row("vnc_port", str(cfg["vnc_port"]))
@@ -475,7 +482,7 @@ def show_config(cfg: dict) -> None:
     else:
         out("== MFK launch config ==")
         for k in ("kernel", "hypervisor", "firmware", "ovmf_code", "ovmf_status", "keyboard",
-                  "bundle_apps", "data_disk_size", "vnc", "vnc_port", "web_ui", "web_ui_port",
+                  "bundle_apps", "no_iso", "data_disk_size", "vnc", "vnc_port", "web_ui", "web_ui_port",
                   "gpu_passthrough", "gpu_audio", "gpu_rom", "gpu_status",
                   "hyperv_switch", "hyperv_mem", "hyperv_cpus", "hyperv_boot",
                   "hyperv_vhdx", "hyperv_com", "doom", "doom_wad", "doom_disk", "doom_guest"):
@@ -802,6 +809,7 @@ def menu_loop(cfg: dict) -> bool:
         "Add extra drive",
         "Edit extra drive",
         "Remove extra drive",
+        "Skip ISO build",
         "Launch",
         "Save & quit",
         "Quit",
@@ -830,6 +838,9 @@ def menu_loop(cfg: dict) -> bool:
         out(
             f"[bold]Bundle apps:[/bold] {'ON' if cfg['bundle_apps'] else 'OFF'}    "
             f"[bold]Data disk:[/bold] {cfg['data_disk_size']}"
+        )
+        out(
+            f"[bold]ISO:[/bold] {'SKIP' if cfg.get('no_iso') else 'BUILD'}"
         )
         out(
             f"[bold]VNC:[/bold] {'ON' if cfg['vnc'] else 'OFF'}    "
@@ -889,14 +900,16 @@ def menu_loop(cfg: dict) -> bool:
                 value = f" : {cfg.get('doom_commercial', '') or '-'}"
             elif i == 17:
                 value = f" : {cfg.get('doom_disk_size', '')}"
+            elif i == 21:
+                value = f" : {'ON' if cfg.get('no_iso') else 'OFF'}"
             else:
                 value = ""
 
-            if i == 21:
+            if i == 22:
                 prefix_text = "▶ "
-            elif i == 22:
-                prefix_text = "💾 "
             elif i == 23:
+                prefix_text = "💾 "
+            elif i == 24:
                 prefix_text = "✕ "
             else:
                 prefix_text = "  "
@@ -958,6 +971,11 @@ def menu_loop(cfg: dict) -> bool:
             save_config(cfg)
             continue
 
+        if selected == 21 and key in ("space", "a", "d"):
+            cfg["no_iso"] = not cfg.get("no_iso", False)
+            save_config(cfg)
+            continue
+
         if selected == 14 and key in ("space", "a", "d"):
             cfg["doom"] = not cfg.get("doom")
             if cfg["doom"]:
@@ -986,7 +1004,7 @@ def menu_loop(cfg: dict) -> bool:
             save_config(cfg)
             continue
 
-        if key == "enter" or (selected == 3 and key == "space"):
+        if key == "enter" or (selected in (3, 21) and key == "space"):
             if selected == 0:
                 cfg["hypervisor"] = choose_from_list(
                     "Hypervisor", ("qemu", "vbox", "hyperv"), cfg["hypervisor"]
@@ -1154,6 +1172,10 @@ def menu_loop(cfg: dict) -> bool:
                 remove_extra_menu(cfg)
 
             elif selected == 21:
+                cfg["no_iso"] = not cfg.get("no_iso", False)
+                save_config(cfg)
+
+            elif selected == 22:
                 if cfg.get("doom") and not cfg.get("_doom_host"):
                     host = resolve_doom_wad(cfg)
                     cfg["_doom_host"] = host
@@ -1161,7 +1183,7 @@ def menu_loop(cfg: dict) -> bool:
                 save_config(cfg)
                 return True
 
-            elif selected == 22:
+            elif selected == 23:
                 save_config(cfg)
                 clear_screen()
                 out(f"[green]Saved to {CONFIG_PATH}[/green]")
@@ -1169,7 +1191,7 @@ def menu_loop(cfg: dict) -> bool:
                 out("Press any key to continue...")
                 read_key()
 
-            elif selected == 23:
+            elif selected == 24:
                 return False
 
 

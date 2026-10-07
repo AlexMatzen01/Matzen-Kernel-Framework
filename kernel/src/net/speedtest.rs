@@ -375,25 +375,6 @@ fn ping_once(
     res
 }
 
-fn tls_stream<'a>(
-    host: &'a str,
-    ip: [u8; 4],
-    port: u16,
-    root: &'a [u8],
-    read_storage: &'a mut Vec<u8>,
-    write_storage: &'a mut Vec<u8>,
-) -> Result<super::tls::TlsStream<'a>, &'static str> {
-    super::tls::TlsStream::connect(
-        host,
-        ip,
-        port,
-        root,
-        read_storage.as_mut_slice(),
-        write_storage.as_mut_slice(),
-    )
-    .map_err(|_| "TLS handshake or certificate verification failed")
-}
-
 fn ping_tls_once(
     host: &str,
     base: &str,
@@ -403,13 +384,42 @@ fn ping_tls_once(
 ) -> Result<u64, &'static str> {
     let path = alloc::format!("{}{}?r={}", base, PING_FILE, bust);
     let mut root_storage = Vec::new();
+    // Largest embedded anchor DER is ~1.4 KiB (ISRG Root X1).
     root_storage.resize(2048, 0);
-    let root = super::tls::load_default_root(&mut root_storage)?;
     let mut read_storage = Vec::new();
     read_storage.resize(16_640, 0);
     let mut write_storage = Vec::new();
     write_storage.resize(16_640, 0);
-    let mut stream = tls_stream(host, ip, port, root, &mut read_storage, &mut write_storage)?;
+    // A failed handshake consumes its socket and TLS buffers, so each trust
+    // anchor gets a fresh connection (verified before any byte is sent).
+    let mut stream = 'anchors: loop {
+        for anchor in 0..super::tls::TRUSTED_ROOTS.len() {
+            let root = super::tls::load_anchor(&mut root_storage, anchor)?;
+            match super::tls::TlsStream::connect(
+                host,
+                ip,
+                port,
+                root,
+                &mut read_storage,
+                &mut write_storage,
+            ) {
+                Ok(stream) => break 'anchors stream,
+                Err(error)
+                    if super::tls::is_cert_failure(&error)
+                        && anchor + 1 < super::tls::TRUSTED_ROOTS.len() =>
+                {
+                    crate::net_log!(
+                        "TLS: anchor '{}' rejected ({:?}), trying next",
+                        super::tls::TRUSTED_ROOTS[anchor].0,
+                        error
+                    );
+                    continue;
+                }
+                Err(error) => return Err(super::tls::tls_error_message(&error)),
+            }
+        }
+        unreachable!("TRUSTED_ROOTS is never empty");
+    };
     stream
         .write_all(&build_get(host, &path))
         .map_err(|_| "TLS request failed")?;
@@ -576,13 +586,42 @@ fn download_tls_once(
         cache_buster(0xD1)
     );
     let mut root_storage = Vec::new();
+    // Largest embedded anchor DER is ~1.4 KiB (ISRG Root X1).
     root_storage.resize(2048, 0);
-    let root = super::tls::load_default_root(&mut root_storage)?;
     let mut read_storage = Vec::new();
     read_storage.resize(16_640, 0);
     let mut write_storage = Vec::new();
     write_storage.resize(16_640, 0);
-    let mut stream = tls_stream(host, ip, port, root, &mut read_storage, &mut write_storage)?;
+    // A failed handshake consumes its socket and TLS buffers, so each trust
+    // anchor gets a fresh connection (verified before any byte is sent).
+    let mut stream = 'anchors: loop {
+        for anchor in 0..super::tls::TRUSTED_ROOTS.len() {
+            let root = super::tls::load_anchor(&mut root_storage, anchor)?;
+            match super::tls::TlsStream::connect(
+                host,
+                ip,
+                port,
+                root,
+                &mut read_storage,
+                &mut write_storage,
+            ) {
+                Ok(stream) => break 'anchors stream,
+                Err(error)
+                    if super::tls::is_cert_failure(&error)
+                        && anchor + 1 < super::tls::TRUSTED_ROOTS.len() =>
+                {
+                    crate::net_log!(
+                        "TLS: anchor '{}' rejected ({:?}), trying next",
+                        super::tls::TRUSTED_ROOTS[anchor].0,
+                        error
+                    );
+                    continue;
+                }
+                Err(error) => return Err(super::tls::tls_error_message(&error)),
+            }
+        }
+        unreachable!("TRUSTED_ROOTS is never empty");
+    };
     stream
         .write_all(&build_get(host, &path))
         .map_err(|_| "TLS request failed")?;
@@ -725,13 +764,42 @@ fn upload_tls_once(
 ) -> Result<(u64, u64), &'static str> {
     let path = alloc::format!("{}{}?r={}", base, UL_FILE, cache_buster(0x51));
     let mut root_storage = Vec::new();
+    // Largest embedded anchor DER is ~1.4 KiB (ISRG Root X1).
     root_storage.resize(2048, 0);
-    let root = super::tls::load_default_root(&mut root_storage)?;
     let mut read_storage = Vec::new();
     read_storage.resize(16_640, 0);
     let mut write_storage = Vec::new();
     write_storage.resize(16_640, 0);
-    let mut stream = tls_stream(host, ip, port, root, &mut read_storage, &mut write_storage)?;
+    // A failed handshake consumes its socket and TLS buffers, so each trust
+    // anchor gets a fresh connection (verified before any byte is sent).
+    let mut stream = 'anchors: loop {
+        for anchor in 0..super::tls::TRUSTED_ROOTS.len() {
+            let root = super::tls::load_anchor(&mut root_storage, anchor)?;
+            match super::tls::TlsStream::connect(
+                host,
+                ip,
+                port,
+                root,
+                &mut read_storage,
+                &mut write_storage,
+            ) {
+                Ok(stream) => break 'anchors stream,
+                Err(error)
+                    if super::tls::is_cert_failure(&error)
+                        && anchor + 1 < super::tls::TRUSTED_ROOTS.len() =>
+                {
+                    crate::net_log!(
+                        "TLS: anchor '{}' rejected ({:?}), trying next",
+                        super::tls::TRUSTED_ROOTS[anchor].0,
+                        error
+                    );
+                    continue;
+                }
+                Err(error) => return Err(super::tls::tls_error_message(&error)),
+            }
+        }
+        unreachable!("TRUSTED_ROOTS is never empty");
+    };
     let hdr = build_post_headers(host, &path, UPLOAD_BYTES);
     let start = now_ms();
     stream.write_all(&hdr).map_err(|_| "TLS request failed")?;
@@ -806,7 +874,7 @@ pub fn cmd_run(args: &str) {
     if args == "--help" || args == "-h" || args == "help" {
         crate::println!("Usage: speedtest [-d|--debug] [server]");
         crate::println!("  Runs latency + download + upload against a LibreSpeed");
-        crate::println!("  LibreSpeed backend over HTTP (HTTPS requires net_tls build feature).");
+        crate::println!("  LibreSpeed backend over HTTP (HTTPS via TLS 1.3, on by default).");
         crate::println!("  server: <host>[:port][/base/], e.g.:");
         crate::println!("    speedtest");
         crate::println!("    speedtest fra.speedtest.clouvider.net");
@@ -863,6 +931,10 @@ pub fn cmd_run(args: &str) {
             return;
         }
     };
+    if secure && !crate::time::is_initialized() {
+        crate::println!("Speedtest failed: wall clock not set (TLS certificate checks need RTC time)");
+        return;
+    }
 
     // ── Latency ──
     crate::println!("Latency: {}x GET {}empty.php ...", PING_SAMPLES, base);

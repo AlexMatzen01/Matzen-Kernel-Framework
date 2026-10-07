@@ -11,7 +11,9 @@
 //! - Theme system with colors, fonts, metrics
 //! - Window management (drag, focus, close, z-order)
 
+mod anim;
 mod compositor;
+pub(crate) mod cursor;
 mod cursor_data;
 pub(crate) mod doom;
 pub(crate) mod drives;
@@ -19,11 +21,11 @@ pub(crate) mod files;
 mod scene;
 pub(crate) mod settings;
 mod theme;
+pub(crate) mod viewer;
 pub(crate) mod wallpaper;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use cursor_data::{CURSOR_H, CURSOR_HOTSPOT_X, CURSOR_HOTSPOT_Y, CURSOR_RGBA, CURSOR_W};
 
 use crate::drivers::keyboard::Key;
 use crate::drivers::{keyboard, mouse, vga};
@@ -286,6 +288,27 @@ pub(crate) fn refresh_terminal_editor() {
     crate::drivers::fb_gfx::set_draw_clip(None);
 }
 
+/// First image under /wallpapers (or /) for the View launcher when no
+/// pending path is queued. Returns the full FS path, if any.
+fn viewer_browse_first_image() -> Option<String> {
+    for dir in [
+        crate::desktop::wallpaper::WALLPAPER_DIR,
+        "/",
+    ] {
+        let (_, entries) = crate::shell::gui_list_dir(dir).ok()?;
+        for fi in &entries {
+            if !fi.is_directory && viewer::is_image_path(&fi.name) {
+                if dir == "/" {
+                    return Some(alloc::format!("/{}", fi.name));
+                } else {
+                    return Some(alloc::format!("{}/{}", dir, fi.name));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn color_rgb(color: vga::Color) -> (u8, u8, u8) {
     match color {
         vga::Color::Black => (0, 0, 0),
@@ -339,6 +362,7 @@ pub fn run() {
     let mut drive_app: Option<drives::DriveApp> = None;
     let mut settings_app: Option<settings::SettingsApp> = None;
     let mut doom_app: Option<doom::DoomApp> = None;
+    let mut viewer_app: Option<viewer::ViewerApp> = None;
     let about_win_id = scene.create_window(
         alloc::string::String::from("About MFK"),
         scene::Rect::new(220, 130, 400, 300),
@@ -351,7 +375,7 @@ pub fn run() {
         let label_id = crate::desktop::scene::WidgetId::new();
         let label_bounds = scene::Rect::new(20, 40, 360, 200);
         let mut label = crate::desktop::scene::Widget::label(label_bounds,
-            alloc::string::String::from("Matzen Kernel Framework v0.1.0\n\nTaskbar: Shell | Files | Drive\n| Settings | Doom\nFiles: browse, Enter opens, type name\nfor New File/Dir, click selects.\nDrives: pick disk (Up/Down, 1-8),\nFormat (2-click) + Mount + Install.\nSettings: wallpaper PNG/JPG + Fit/\nFill/Stretch/Center/Tile + colors.\nDoom: needs WAD disk mounted\n(mount drive, Doom launcher).\n\nDrag windows by titlebar.\nPress Esc to exit."),
+            alloc::string::String::from("Matzen Kernel Framework v0.1.0\n\nTaskbar: Shell | Files | Drive\n| Settings | Doom | View\nFiles: browse, Enter opens, type name\nfor New File/Dir, click selects.\nDouble-click / Enter on PNG/JPG/BMP/\nGIF/QOI opens the Viewer.\nViewer: +/- zoom, F fit, 0 100%,\narrows drag-pan, N/P next/prev.\nDrives: pick disk (Up/Down, 1-8),\nFormat (2-click) + Mount + Install.\nSettings: wallpaper PNG/JPG/BMP/GIF + Fit/\nFill/Stretch/Center/Tile + colors + cursor.\nDoom: needs WAD disk mounted\n(mount drive, Doom launcher).\n\nDrag windows by titlebar.\nPress Esc to exit."),
             theme);
         label.id = label_id;
         scene.widgets.insert(label_id, label);
@@ -378,10 +402,13 @@ pub fn run() {
     crate::drivers::mouse::set_position(sw / 2, sh / 2);
     while crate::drivers::mouse::read_event().is_some() {}
 
-    // Focus the terminal initially, as the former shell demo did.
+    // Boot fade + open animations for the initial windows.
+    crate::desktop::anim::boot_begin();
     if let Some(app) = &shell_app {
         scene.focus_window(app.window);
+        crate::desktop::anim::start_open(&mut scene, app.window);
     }
+    crate::desktop::anim::start_open(&mut scene, about_win_id);
 
     // Restore persisted personalization (solid fallback when the FS is
     // not mounted or no settings were saved yet).
@@ -393,6 +420,7 @@ pub fn run() {
         match doom::create_doom_app(&mut scene, sw, sh, &wad) {
             Ok(app) => {
                 scene.focus_window(app.window);
+                crate::desktop::anim::start_open(&mut scene, app.window);
                 crate::serial_println!("[desktop] Doom auto-opened ({})", wad);
                 doom_app = Some(app);
             }
@@ -400,6 +428,29 @@ pub fn run() {
                 crate::serial_println!("[desktop] Doom: {}", e);
                 if let Some(shell) = shell_app.as_mut() {
                     shell.output.push_str("Doom: ");
+                    shell.output.push_str(&e);
+                    shell.output.push('\n');
+                    refresh_shell_app(&mut scene, shell);
+                }
+            }
+        }
+    }
+
+    // `view <path>` queues an image and enters here: open the viewer
+    // immediately so the shell command works without a mouse click.
+    // The pending slot is consumed (take) so a stale path cannot reopen.
+    if let Some(path) = viewer::take_pending_image() {
+        match viewer::create_viewer_app(&mut scene, sw, sh, &path) {
+            Ok(app) => {
+                scene.focus_window(app.window);
+                crate::desktop::anim::start_open(&mut scene, app.window);
+                crate::serial_println!("[desktop] Viewer auto-opened ({})", path);
+                viewer_app = Some(app);
+            }
+            Err(e) => {
+                crate::serial_println!("[desktop] Viewer: {}", e);
+                if let Some(shell) = shell_app.as_mut() {
+                    shell.output.push_str("Viewer: ");
                     shell.output.push_str(&e);
                     shell.output.push('\n');
                     refresh_shell_app(&mut scene, shell);
@@ -471,47 +522,62 @@ pub fn run() {
             // Mouse down
             if scene.shell_launcher_rect().contains_point(mx, my) {
                 if let Some(app) = &shell_app {
-                    scene.restore_window(app.window);
+                    let lr = scene.shell_launcher_rect();
+                    let wid = app.window;
+                    crate::desktop::anim::start_restore(&mut scene, wid, lr);
                 } else {
                     let app = create_shell_app(&mut scene, sw, sh);
                     scene.focus_window(app.window);
+                    crate::desktop::anim::start_open(&mut scene, app.window);
                     shell_app = Some(app);
                 }
             } else if scene.files_launcher_rect().contains_point(mx, my) {
                 if let Some(app) = &explorer_app {
-                    scene.restore_window(app.window);
+                    let lr = scene.files_launcher_rect();
+                    let wid = app.window;
+                    crate::desktop::anim::start_restore(&mut scene, wid, lr);
                 } else {
                     let app = files::create_explorer_app(&mut scene, sw, sh);
                     scene.focus_window(app.window);
+                    crate::desktop::anim::start_open(&mut scene, app.window);
                     crate::serial_println!("[desktop] Files opened");
                     explorer_app = Some(app);
                 }
             } else if scene.drive_launcher_rect().contains_point(mx, my) {
                 if let Some(app) = &drive_app {
-                    scene.restore_window(app.window);
+                    let lr = scene.drive_launcher_rect();
+                    let wid = app.window;
+                    crate::desktop::anim::start_restore(&mut scene, wid, lr);
                 } else {
                     let app = drives::create_drive_app(&mut scene, sw, sh);
                     scene.focus_window(app.window);
+                    crate::desktop::anim::start_open(&mut scene, app.window);
                     crate::serial_println!("[desktop] Drives opened");
                     drive_app = Some(app);
                 }
             } else if scene.settings_launcher_rect().contains_point(mx, my) {
                 if let Some(app) = &settings_app {
-                    scene.restore_window(app.window);
+                    let lr = scene.settings_launcher_rect();
+                    let wid = app.window;
+                    crate::desktop::anim::start_restore(&mut scene, wid, lr);
                 } else {
                     let app = settings::create_settings_app(&mut scene, sw, sh);
                     scene.focus_window(app.window);
+                    crate::desktop::anim::start_open(&mut scene, app.window);
                     crate::serial_println!("[desktop] Settings opened");
                     settings_app = Some(app);
                 }
             } else if scene.doom_launcher_rect().contains_point(mx, my) {
                 if let Some(app) = &doom_app {
-                    scene.restore_window(app.window);
+                    let lr = scene.doom_launcher_rect();
+                    let wid = app.window;
+                    crate::desktop::anim::start_restore(&mut scene, wid, lr);
                 } else {
                     let wad = doom::take_launch_wad();
                     match doom::create_doom_app(&mut scene, sw, sh, &wad) {
                         Ok(app) => {
                             scene.focus_window(app.window);
+                            crate::desktop::anim::start_open(&mut scene, app.window);
                             crate::serial_println!("[desktop] Doom opened");
                             doom_app = Some(app);
                         }
@@ -521,6 +587,59 @@ pub fn run() {
                                 shell.output.push_str("Doom: ");
                                 shell.output.push_str(&e);
                                 shell.output.push_str("\n(mount the WAD disk, or run 'doom <path>')\n");
+                                refresh_shell_app(&mut scene, shell);
+                            }
+                        }
+                    }
+                }
+            } else if scene.viewer_launcher_rect().contains_point(mx, my) {
+                if let Some(app) = &viewer_app {
+                    let lr = scene.viewer_launcher_rect();
+                    let wid = app.window;
+                    crate::desktop::anim::start_restore(&mut scene, wid, lr);
+                } else if let Some(path) = viewer::take_pending_image() {
+                    match viewer::create_viewer_app(&mut scene, sw, sh, &path) {
+                        Ok(app) => {
+                            scene.focus_window(app.window);
+                            crate::desktop::anim::start_open(&mut scene, app.window);
+                            crate::serial_println!("[desktop] Viewer opened ({})", path);
+                            viewer_app = Some(app);
+                        }
+                        Err(e) => {
+                            crate::serial_println!("[desktop] Viewer: {}", e);
+                            if let Some(shell) = shell_app.as_mut() {
+                                shell.output.push_str("Viewer: ");
+                                shell.output.push_str(&e);
+                                shell.output.push('\n');
+                                refresh_shell_app(&mut scene, shell);
+                            }
+                        }
+                    }
+                } else {
+                    // No pending image: browse /wallpapers for the first
+                    // image so the launcher always does something useful.
+                    let pick = viewer_browse_first_image();
+                    match pick {
+                        Some(path) => match viewer::create_viewer_app(&mut scene, sw, sh, &path) {
+                            Ok(app) => {
+                                scene.focus_window(app.window);
+                                crate::desktop::anim::start_open(&mut scene, app.window);
+                                crate::serial_println!("[desktop] Viewer opened ({})", path);
+                                viewer_app = Some(app);
+                            }
+                            Err(e) => {
+                                crate::serial_println!("[desktop] Viewer: {}", e);
+                                if let Some(shell) = shell_app.as_mut() {
+                                    shell.output.push_str("Viewer: ");
+                                    shell.output.push_str(&e);
+                                    shell.output.push_str("\n(copy a PNG/JPG/BMP/GIF/QOI to /wallpapers, or run 'view <path>')\n");
+                                    refresh_shell_app(&mut scene, shell);
+                                }
+                            }
+                        },
+                        None => {
+                            if let Some(shell) = shell_app.as_mut() {
+                                shell.output.push_str("Viewer: no image found (copy one to /wallpapers, or run 'view <path>')\n");
                                 refresh_shell_app(&mut scene, shell);
                             }
                         }
@@ -562,6 +681,14 @@ pub fn run() {
                         }
                     }
                 }
+                if !handled {
+                    if let Some(app) = viewer_app.as_mut() {
+                        if app.window == win_id && viewer::viewer_owns_button(app, btn_id) {
+                            viewer::viewer_button(&mut scene, app, btn_id);
+                            handled = true;
+                        }
+                    }
+                }
                 if let Some(win) = scene.windows.get(&win_id) {
                     let bounds = win.bounds;
                     scene.mark_dirty(bounds);
@@ -578,7 +705,22 @@ pub fn run() {
                         let maximize_btn = win.maximize_button_rect(&scene.theme);
                         let minimize_btn = win.minimize_button_rect(&scene.theme);
                         if minimize_btn.contains_point(mx, my) {
-                            scene.minimize_window(win_id);
+                            // Slide toward this window's taskbar launcher.
+                            let launcher =
+                                if shell_app.as_ref().map(|a| a.window) == Some(win_id) {
+                                    scene.shell_launcher_rect()
+                                } else if explorer_app.as_ref().map(|a| a.window) == Some(win_id) {
+                                    scene.files_launcher_rect()
+                                } else if drive_app.as_ref().map(|a| a.window) == Some(win_id) {
+                                    scene.drive_launcher_rect()
+                                } else if settings_app.as_ref().map(|a| a.window) == Some(win_id) {
+                                    scene.settings_launcher_rect()
+                                } else if viewer_app.as_ref().map(|a| a.window) == Some(win_id) {
+                                    scene.viewer_launcher_rect()
+                                } else {
+                                    scene.doom_launcher_rect()
+                                };
+                            crate::desktop::anim::start_minimize(&mut scene, win_id, launcher);
                         } else if maximize_btn.contains_point(mx, my) {
                             scene.toggle_maximize(win_id);
                             if let Some(app) = &shell_app {
@@ -601,6 +743,11 @@ pub fn run() {
                                     settings::resize_settings_content(&mut scene, app);
                                 }
                             }
+                            if let Some(app) = viewer_app.as_mut() {
+                                if app.window == win_id {
+                                    viewer::resize_viewer_rebuild(&mut scene, app);
+                                }
+                            }
                             if let Some(app) = &doom_app {
                                 if app.window == win_id {
                                     doom::resize_doom_content(&mut scene, app);
@@ -613,21 +760,29 @@ pub fn run() {
                                     doom::close_doom(app);
                                 }
                             }
-                            scene.destroy_window(win_id);
-                            if shell_app.as_ref().map(|app| app.window) == Some(win_id) {
-                                shell_app = None;
-                            }
-                            if explorer_app.as_ref().map(|app| app.window) == Some(win_id) {
-                                explorer_app = None;
-                            }
-                            if drive_app.as_ref().map(|app| app.window) == Some(win_id) {
-                                drive_app = None;
-                            }
-                            if doom_app.as_ref().map(|app| app.window) == Some(win_id) {
-                                doom_app = None;
-                            }
-                            if settings_app.as_ref().map(|app| app.window) == Some(win_id) {
-                                settings_app = None;
+                            // Animated close keeps a shrinking ghost; the
+                            // tick() destroys it and app slots are reaped below.
+                            if !crate::desktop::anim::start_close(&mut scene, win_id) {
+                                crate::desktop::anim::cancel(win_id);
+                                scene.destroy_window(win_id);
+                                if shell_app.as_ref().map(|app| app.window) == Some(win_id) {
+                                    shell_app = None;
+                                }
+                                if explorer_app.as_ref().map(|app| app.window) == Some(win_id) {
+                                    explorer_app = None;
+                                }
+                                if drive_app.as_ref().map(|app| app.window) == Some(win_id) {
+                                    drive_app = None;
+                                }
+                                if doom_app.as_ref().map(|app| app.window) == Some(win_id) {
+                                    doom_app = None;
+                                }
+                                if settings_app.as_ref().map(|app| app.window) == Some(win_id) {
+                                    settings_app = None;
+                                }
+                                if viewer_app.as_ref().map(|app| app.window) == Some(win_id) {
+                                    viewer_app = None;
+                                }
                             }
                         } else {
                             // Start drag
@@ -733,6 +888,11 @@ pub fn run() {
                                 settings::resize_settings_content(&mut scene, app);
                             }
                         }
+                        if let Some(app) = viewer_app.as_mut() {
+                            if app.window == win_id {
+                                viewer::resize_viewer_rebuild(&mut scene, app);
+                            }
+                        }
                         if let Some(app) = &doom_app {
                             if app.window == win_id {
                                 doom::resize_doom_content(&mut scene, app);
@@ -824,6 +984,10 @@ pub fn run() {
                 .as_ref()
                 .map(|a| Some(a.window) == focused)
                 .unwrap_or(false);
+            let is_viewer = viewer_app
+                .as_ref()
+                .map(|a| Some(a.window) == focused)
+                .unwrap_or(false);
             let is_doom = doom_app
                 .as_ref()
                 .map(|a| Some(a.window) == focused)
@@ -867,6 +1031,10 @@ pub fn run() {
                         if let Some(app) = settings_app.as_mut() {
                             settings::settings_key(&mut scene, app, ev.key, sw, sh);
                         }
+                    } else if is_viewer {
+                        if let Some(app) = viewer_app.as_mut() {
+                            viewer::viewer_key(&mut scene, app, ev.key);
+                        }
                     }
                 }
                 crate::drivers::keyboard::Key::Backspace => {
@@ -885,6 +1053,10 @@ pub fn run() {
                     } else if is_settings {
                         if let Some(app) = settings_app.as_mut() {
                             settings::settings_key(&mut scene, app, ev.key, sw, sh);
+                        }
+                    } else if is_viewer {
+                        if let Some(app) = viewer_app.as_mut() {
+                            viewer::viewer_key(&mut scene, app, ev.key);
                         }
                     }
                 }
@@ -906,6 +1078,10 @@ pub fn run() {
                     } else if is_settings {
                         if let Some(app) = settings_app.as_mut() {
                             settings::settings_key(&mut scene, app, ev.key, sw, sh);
+                        }
+                    } else if is_viewer {
+                        if let Some(app) = viewer_app.as_mut() {
+                            viewer::viewer_key(&mut scene, app, ev.key);
                         }
                     }
                 }
@@ -953,9 +1129,87 @@ pub fn run() {
                             let tick = crate::shell::get_tick_count();
                             drives::drive_key(&mut scene, app, ev.key, tick);
                         }
+                    } else if is_viewer {
+                        if let Some(app) = viewer_app.as_mut() {
+                            viewer::viewer_key(&mut scene, app, ev.key);
+                        }
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Files double-click / Open on an image queues a viewer path:
+        // open (or focus) the Viewer here, outside the button borrow.
+        if let Some(path) = viewer::take_pending_image() {
+            if let Some(app) = &viewer_app {
+                let wid = app.window;
+                scene.focus_window(wid);
+                // Reuse the open window: load the new image into it.
+                let lr = scene.viewer_launcher_rect();
+                if let Some(app) = viewer_app.as_mut() {
+                    if viewer::open_image(&mut scene, app, &path).is_ok() {
+                        crate::desktop::anim::start_restore(&mut scene, wid, lr);
+                    }
+                }
+            } else {
+                match viewer::create_viewer_app(&mut scene, sw, sh, &path) {
+                    Ok(app) => {
+                        scene.focus_window(app.window);
+                        crate::desktop::anim::start_open(&mut scene, app.window);
+                        crate::serial_println!("[desktop] Viewer opened ({})", path);
+                        viewer_app = Some(app);
+                    }
+                    Err(e) => {
+                        crate::serial_println!("[desktop] Viewer: {}", e);
+                        if let Some(shell) = shell_app.as_mut() {
+                            shell.output.push_str("Viewer: ");
+                            shell.output.push_str(&e);
+                            shell.output.push('\n');
+                            refresh_shell_app(&mut scene, shell);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drag-pan inside the viewer image: left-held motion pans the
+        // zoomed image (titlebar drags and resizes take precedence).
+        {
+            static mut LAST_PAN: (i32, i32, bool) = (0, 0, false);
+            let dragging_chrome = unsafe { DRAG_WINDOW.is_some() }
+                || unsafe {
+                    RESIZE_WINDOW
+                        .map(|_| true)
+                        .unwrap_or(false)
+                };
+            if left && !dragging_chrome {
+                if let Some(app) = viewer_app.as_mut() {
+                    let inside = viewer::viewer_image_rect(&scene, app)
+                        .map(|r| r.contains_point(mx, my))
+                        .unwrap_or(false);
+                    let (lx, ly, was) = unsafe { LAST_PAN };
+                    if inside {
+                        if was {
+                            let dx = mx - lx;
+                            let dy = my - ly;
+                            if dx != 0 || dy != 0 {
+                                viewer::viewer_drag_pan(&mut scene, app, dx, dy);
+                            }
+                        }
+                        unsafe {
+                            LAST_PAN = (mx, my, true);
+                        }
+                    } else {
+                        unsafe {
+                            LAST_PAN = (mx, my, false);
+                        }
+                    }
+                }
+            } else {
+                unsafe {
+                    LAST_PAN = (mx, my, false);
+                }
             }
         }
 
@@ -981,8 +1235,58 @@ pub fn run() {
             }
         }
 
+        // Advance open/close/minimize tweens (marks old+new dirty).
+        // Reap app slots whose ghost windows just finished closing.
+        let _anim_active = crate::desktop::anim::tick(&mut scene);
+        if let Some(app) = &shell_app {
+            if scene.windows.get(&app.window).is_none() {
+                crate::desktop::anim::cancel(app.window);
+                shell_app = None;
+            }
+        }
+        if let Some(app) = &explorer_app {
+            if scene.windows.get(&app.window).is_none() {
+                crate::desktop::anim::cancel(app.window);
+                explorer_app = None;
+            }
+        }
+        if let Some(app) = &drive_app {
+            if scene.windows.get(&app.window).is_none() {
+                crate::desktop::anim::cancel(app.window);
+                drive_app = None;
+            }
+        }
+        if let Some(app) = &settings_app {
+            if scene.windows.get(&app.window).is_none() {
+                crate::desktop::anim::cancel(app.window);
+                settings_app = None;
+            }
+        }
+        if let Some(app) = &doom_app {
+            if scene.windows.get(&app.window).is_none() {
+                crate::desktop::anim::cancel(app.window);
+                doom_app = None;
+            }
+        }
+        if let Some(app) = &viewer_app {
+            if scene.windows.get(&app.window).is_none() {
+                crate::desktop::anim::cancel(app.window);
+                viewer_app = None;
+            }
+        }
+
         // Render frame
         compositor.render(&mut scene, mx, my, true);
+
+        // Boot wipe-up reveal (cheap stepped fill + single present).
+        let boot_a = crate::desktop::anim::boot_overlay_alpha();
+        if boot_a > 0 {
+            let h = (sh as u32 * boot_a as u32 / 255) as usize;
+            if h > 0 {
+                crate::drivers::fb_gfx::fill_rect_px(0, 0, sw, h, 0, 0, 0);
+                crate::drivers::fb_gfx::present(&[(0, 0, sw, h)]);
+            }
+        }
 
         // Small delay to prevent 100% CPU (~60 FPS)
         crate::drivers::pit::sleep_ms(16);
@@ -998,13 +1302,19 @@ pub fn run() {
 
 /// Dirty rect covering the cursor bitmap at its hotspot-relative origin.
 /// Clip negative left/top edges here; `mark_dirty` clips right/bottom.
+///
+/// Sized from the maximum cursor dimension (not the current bitmap): the
+/// selection can change size at runtime, and the old (larger) bitmap must
+/// still be fully repainted. Hotspot is unknown here, so the rect spans the
+/// max extent in every direction (at most ~128px — one extra tile repaint).
 fn cursor_cell(x: i32, y: i32) -> crate::desktop::scene::Rect {
-    let left = x - crate::desktop::cursor_data::CURSOR_HOTSPOT_X as i32;
-    let top = y - crate::desktop::cursor_data::CURSOR_HOTSPOT_Y as i32;
+    let m = crate::desktop::cursor::max_bundled_dim() as i32;
+    let left = x - m;
+    let top = y - m;
     let ox = left.max(0);
     let oy = top.max(0);
-    let right = (left + crate::desktop::cursor_data::CURSOR_W as i32).max(ox);
-    let bottom = (top + crate::desktop::cursor_data::CURSOR_H as i32).max(oy);
+    let right = (x + m).max(ox);
+    let bottom = (y + m).max(oy);
     crate::desktop::scene::Rect::new(ox, oy, (right - ox) as u32, (bottom - oy) as u32)
 }
 

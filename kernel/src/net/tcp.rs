@@ -471,6 +471,7 @@ pub fn send_data(local_port: u16, data: &[u8]) -> Result<(), &'static str> {
     if data.is_empty() {
         return Ok(());
     }
+    crate::net_log!("TCP: send_data port {} ({} bytes)", local_port, data.len());
     let deadline = now_ms() + SEND_TIMEOUT_MS;
     loop {
         let mut replies = Vec::new();
@@ -504,6 +505,12 @@ pub fn send_data(local_port: u16, data: &[u8]) -> Result<(), &'static str> {
             // Pump with the lock released: it re-enters this module.
             crate::net::http::pump();
             continue;
+        }
+        if replies.is_empty() {
+            crate::net_log!(
+                "TCP: send_data port {} buffered, 0 segments flushed (awaiting window/ACK)",
+                local_port
+            );
         }
         dispatch(&mut replies);
         return Ok(());
@@ -1087,6 +1094,7 @@ pub fn tick() {
 
             if resend > 0 {
                 TCP_STATS.lock().segments_retransmitted += resend;
+                crate::net_log!("TCP: port {} retransmitting {} segment(s)", port, resend);
             }
 
             if conn.state == TcpState::TimeWait

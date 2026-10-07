@@ -1,9 +1,29 @@
 //! No-TLS build adapter. The HTTP clients still compile and report a clear
 //! error for HTTPS URLs; enable the `net_tls` Cargo feature to include the
 //! certificate-verifying TLS 1.3 implementation.
+//!
+//! This module mirrors the anchor/error API of `tls.rs` so callers need no
+//! `#[cfg]` at the call site: with one dummy anchor whose loader always
+//! fails, the retry loop degrades to the single "not enabled" error.
 
 use core::marker::PhantomData;
 use embedded_io::{Error, ErrorKind, ErrorType, Read, Write};
+
+/// Trust-anchor table mirror: one entry so the caller retry loop runs once
+/// and reports "not enabled" through the normal path.
+pub const TRUSTED_ROOTS: &[(&str, &str)] = &[("none (TLS disabled)", "")];
+
+pub fn load_anchor(_out: &mut [u8], _index: usize) -> Result<&[u8], &'static str> {
+    Err("TLS is not enabled in this kernel build (enable net_tls)")
+}
+
+pub fn is_cert_failure(_: &TlsUnavailable) -> bool {
+    false
+}
+
+pub fn tls_error_message(_: &TlsUnavailable) -> &'static str {
+    "TLS is not enabled in this kernel build (enable net_tls)"
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct TlsUnavailable;
@@ -21,10 +41,6 @@ impl core::fmt::Display for TlsUnavailable {
 }
 
 impl core::error::Error for TlsUnavailable {}
-
-pub fn load_default_root(_out: &mut [u8]) -> Result<&[u8], &'static str> {
-    Err("TLS is not enabled in this kernel build (enable net_tls)")
-}
 
 pub struct TlsStream<'a> {
     _lifetime: PhantomData<&'a mut [u8]>,

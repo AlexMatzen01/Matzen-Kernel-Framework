@@ -30,8 +30,7 @@ pub fn run(path: &str, args: &[&str]) -> Result<i32, &'static str> {
     if !crate::shell::is_mounted() {
         return Err("Filesystem not mounted. Use 'mount' first.");
     }
-    let mut device = crate::shell::mounted_device();
-    let data = crate::shell::read_file_contents(path, &mut device)
+    let data = crate::shell::read_file_contents(path)
         .ok_or("Failed to read file (not found or not mounted)")?;
 
     if data.is_empty() {
@@ -120,18 +119,17 @@ fn is_probably_text(data: &[u8]) -> bool {
 
 /// Helper for shell `mkapp` to create example files on FS
 pub fn create_example_app(name: &str, kind: &str) -> Result<(), &'static str> {
-    let mut device = crate::shell::mounted_device();
     if !crate::shell::is_mounted() {
         return Err("Filesystem not mounted");
     }
     let kind_lc = to_lowercase(kind.trim());
     match kind_lc.as_str() {
-        "hello" | "" => create_hello_script(name, &mut device),
-        "hello-mfke" | "mfke" | "bytecode" => create_hello_mfke(name, &mut device),
-        "counter" => create_counter_mfke(name, &mut device),
-        "calc" => create_calc_script(name, &mut device),
-        "filedemo" => create_filedemo_script(name, &mut device),
-        "loop" => create_loop_mfke(name, &mut device),
+        "hello" | "" => create_hello_script(name),
+        "hello-mfke" | "mfke" | "bytecode" => create_hello_mfke(name),
+        "counter" => create_counter_mfke(name),
+        "calc" => create_calc_script(name),
+        "filedemo" => create_filedemo_script(name),
+        "loop" => create_loop_mfke(name),
         _ => Err("Unknown app kind. Try: hello, hello-mfke, counter, calc, filedemo, loop"),
     }
 }
@@ -146,7 +144,6 @@ fn to_lowercase(s: &str) -> String {
 
 fn create_hello_script(
     name: &str,
-    device: &mut dyn crate::drivers::block::BlockDevice,
 ) -> Result<(), &'static str> {
     let content = r#"# MFK script app - hello
 echo === Hello from MFK App: $0 ===
@@ -159,14 +156,13 @@ echo Uptime:
 uptime
 echo App finished. Exit code 0.
 "#;
-    crate::shell::write_file_contents(name, content.as_bytes(), device)?;
+    crate::shell::write_file_contents(name, content.as_bytes())?;
     crate::println!("Created script app '{}' ({} bytes)", name, content.len());
     Ok(())
 }
 
 fn create_calc_script(
     name: &str,
-    device: &mut dyn crate::drivers::block::BlockDevice,
 ) -> Result<(), &'static str> {
     let content = r#"# Calculator demo
 echo Calculator demo
@@ -176,13 +172,12 @@ calc 6 * 7
 calc 20 / 4
 echo Done
 "#;
-    crate::shell::write_file_contents(name, content.as_bytes(), device)?;
+    crate::shell::write_file_contents(name, content.as_bytes())?;
     Ok(())
 }
 
 fn create_filedemo_script(
     name: &str,
-    device: &mut dyn crate::drivers::block::BlockDevice,
 ) -> Result<(), &'static str> {
     let content = r#"# File demo - creates and reads a file
 echo Creating demo file...
@@ -192,13 +187,12 @@ echo Listing /tmp:
 ls /tmp
 echo Done
 "#;
-    crate::shell::write_file_contents(name, content.as_bytes(), device)?;
+    crate::shell::write_file_contents(name, content.as_bytes())?;
     Ok(())
 }
 
 fn create_hello_mfke(
     name: &str,
-    device: &mut dyn crate::drivers::block::BlockDevice,
 ) -> Result<(), &'static str> {
     // Bytecode: print "Hello from MFKE bytecode!\n", print int 42, halt
     let mut bc = Vec::new();
@@ -220,7 +214,7 @@ fn create_hello_mfke(
     bc.push(loader::opcode::PRINT_NL);
     bc.push(loader::opcode::HALT);
     let file = loader::build_mfke(&bc);
-    crate::shell::write_file_contents(name, &file, device)?;
+    crate::shell::write_file_contents(name, &file)?;
     crate::println!(
         "Created MFKE bytecode app '{}' ({} bytes, bytecode {} bytes)",
         name,
@@ -232,7 +226,6 @@ fn create_hello_mfke(
 
 fn create_counter_mfke(
     name: &str,
-    device: &mut dyn crate::drivers::block::BlockDevice,
 ) -> Result<(), &'static str> {
     // Loop: counter 0..5 print
     // Pseudocode:
@@ -284,14 +277,13 @@ fn create_counter_mfke(
     bc[jmp_pos + 1..jmp_pos + 3].copy_from_slice(&jmp_offset.to_le_bytes());
 
     let file = loader::build_mfke(&bc);
-    crate::shell::write_file_contents(name, &file, device)?;
+    crate::shell::write_file_contents(name, &file)?;
     crate::println!("Created counter MFKE app '{}' ({} bytes)", name, file.len());
     Ok(())
 }
 
 fn create_loop_mfke(
     name: &str,
-    device: &mut dyn crate::drivers::block::BlockDevice,
 ) -> Result<(), &'static str> {
     // Infinite-ish loop that yields and checks tick
     // PUSH 0, loop: DUP PRINT_INT, SLEEP 500, PUSH 1 ADD, DUP PUSH 10 LT JZ end, JMP loop
@@ -326,7 +318,7 @@ fn create_loop_mfke(
         .copy_from_slice(&((loop_start as isize - jmp_next as isize) as i16).to_le_bytes());
 
     let file = loader::build_mfke(&bc);
-    crate::shell::write_file_contents(name, &file, device)?;
+    crate::shell::write_file_contents(name, &file)?;
     Ok(())
 }
 
@@ -349,7 +341,6 @@ pub fn write_hex_file(path: &str, hex: &str) -> Result<usize, &'static str> {
         bytes.push((hv << 4) | lv);
     }
     let len = bytes.len();
-    let mut device = crate::shell::mounted_device();
-    crate::shell::write_file_contents(path, &bytes, &mut device)?;
+    crate::shell::write_file_contents(path, &bytes)?;
     Ok(len)
 }

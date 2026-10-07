@@ -111,8 +111,11 @@ impl Compositor {
             }
 
             // Cursor is the topmost layer and is clipped to the damage area.
+            // Bounds use the max cursor dimension: the bitmap is
+            // user-selectable (bundled or /cursors file, up to 128px).
             if cursor_visible {
-                let cursor = Rect::new(cursor_x, cursor_y, 32, 32);
+                let m = crate::desktop::cursor::max_bundled_dim() as i32;
+                let cursor = Rect::new(cursor_x - m, cursor_y - m, (m * 2) as u32, (m * 2) as u32);
                 if region.intersects(&cursor) {
                     self.render_cursor(cursor_x, cursor_y);
                 }
@@ -146,10 +149,9 @@ impl Compositor {
         fb_gfx::fill_rect_px(x as usize, y as usize, w as usize, h as usize, r, g, b);
     }
 
-    /// Wallpaper background: image cache when a wallpaper is set (Fit /
-    /// Fill / Stretch / Center / Tile pre-rendered by `wallpaper.rs`),
-    /// otherwise the classic theme gradient. The image path is a single
-    /// clipped blit; `fb_gfx` restricts it to the dirty rect.
+    /// Wallpaper background: image cache when a wallpaper is set, otherwise
+    /// a modern dark gradient (bg -> black) plus a bottom scrim so the
+    /// glass taskbar stays readable. Image path returns early (single blit).
     fn paint_wallpaper(&self, x: u32, y: u32, w: u32, h: u32, theme: &Theme) {
         if crate::desktop::wallpaper::paint_cached_fullscreen(self.screen_w, self.screen_h) {
             return;
@@ -166,9 +168,23 @@ impl Compositor {
                 (top & 0xFF) as u8,
             ),
         );
+        // Bottom scrim: 90px gradient from bg to near-black for taskbar legibility.
+        let sh = self.screen_h as usize;
+        let scrim_h = 90usize.min(sh);
+        let scrim_y = sh.saturating_sub(scrim_h);
+        let ry0 = (y as usize).max(scrim_y);
+        let ry1 = (y as usize + h as usize).min(sh);
+        for row in ry0..ry1 {
+            let t = ((row - scrim_y) * 255 / scrim_h.max(1)) as u8;
+            // Blend bg -> black@55% progressively.
+            let a = (t as u32 * 140 / 255) as u8;
+            let c = fb_gfx::blend_u32(0x000000, top, a);
+            let (r, g, b) = fb_gfx::split_rgb(c);
+            fb_gfx::fill_rect_px(x as usize, row, w as usize, 1, r, g, b);
+        }
     }
 
-    /// Bottom taskbar: dark strip, accent top line, window buttons.
+    /// Bottom taskbar: glass strip, accent top line, pill launchers.
     fn render_taskbar(&self, scene: &Scene) {
         let sw = self.screen_w as usize;
         let sh = self.screen_h as usize;
@@ -177,48 +193,70 @@ impl Compositor {
             return;
         }
         let y0 = sh - tb_h;
-        // Dark strip + accent line.
-        self.fill_rect(0, y0, sw, tb_h, 0x101418);
+        // Glass strip (gradient) + accent line + top glass highlight.
+        fb_gfx::fill_gradient_px(
+            0,
+            y0,
+            sw,
+            tb_h,
+            scene.theme.colors.taskbar_bg,
+            0x05070A,
+            0,
+        );
         let accent = scene.theme.colors.accent;
         self.fill_rect(0, y0, sw, 2, accent);
+        fb_gfx::glass_top_line_px(
+            0,
+            y0 + 2,
+            sw,
+            0,
+            fb_gfx::blend_u32(0xFFFFFF, scene.theme.colors.taskbar_bg, 28),
+        );
 
         let clip = Some((0, y0, sw, tb_h));
-        // Start label.
+        // Start orb: accent pill with "MFK".
+        fb_gfx::fill_rounded_rect_px(10, y0 + 6, 52, tb_h - 12, 8, accent);
         self.draw_text(
-            12,
+            18,
             y0 + (tb_h.saturating_sub(16)) / 2,
             "MFK",
             0xFFFFFF,
             14,
             clip,
         );
-        // Launchers: Shell | Files | Drive | Settings | Doom
+        // Launchers: pill buttons, focused launcher glows accent.
         let launchers = [
             (scene.shell_launcher_rect(), "Shell"),
             (scene.files_launcher_rect(), "Files"),
             (scene.drive_launcher_rect(), "Drive"),
             (scene.settings_launcher_rect(), "Settings"),
             (scene.doom_launcher_rect(), "Doom"),
+            (scene.viewer_launcher_rect(), "View"),
         ];
         for (launcher, name) in launchers {
-            self.fill_rect(
-                launcher.x as usize,
-                launcher.y as usize,
-                launcher.w as usize,
-                launcher.h as usize,
-                0x30363B,
-            );
-            self.draw_rect_outline(
-                launcher.x as usize,
-                launcher.y as usize,
-                launcher.w as usize,
-                launcher.h as usize,
-                scene.theme.colors.accent,
-                1,
-            );
+            let lx = launcher.x.max(0) as usize;
+            let ly = launcher.y.max(0) as usize;
+            let lw = launcher.w as usize;
+            let lh = launcher.h as usize;
+            let focused_title = scene
+                .focused_window
+                .and_then(|id| scene.windows.get(&id))
+                .map(|w| w.title.as_str().contains(name))
+                .unwrap_or(false);
+            let bg = if focused_title {
+                fb_gfx::blend_u32(accent, 0x1D2632, 120)
+            } else {
+                0x1D2632
+            };
+            fb_gfx::fill_rounded_rect_px(lx, ly, lw, lh, 8, bg);
+            if focused_title {
+                // Accent underline dot for the active app.
+                let (r, g, b) = fb_gfx::split_rgb(accent);
+                fb_gfx::fill_rect_px(lx + lw / 2 - 8, ly + lh - 3, 16, 2, r, g, b);
+            }
             self.draw_text(
-                launcher.x as usize + 10,
-                launcher.y as usize + (launcher.h as usize).saturating_sub(16) / 2,
+                lx + 10,
+                ly + lh.saturating_sub(16) / 2,
                 name,
                 0xFFFFFF,
                 12,
@@ -226,7 +264,7 @@ impl Compositor {
             );
         }
         // Focused/active window titles as task buttons.
-        let last_launcher = scene.doom_launcher_rect();
+        let last_launcher = scene.viewer_launcher_rect();
         let mut tx = last_launcher.x as usize + last_launcher.w as usize + 12;
         for &win_id in scene.windows_z_order() {
             if let Some(win) = scene.windows.get(&win_id) {
@@ -263,85 +301,77 @@ impl Compositor {
         );
     }
 
-    /// Render a window and all its widgets.
+    /// Render a window: drop shadow, rounded body, gradient titlebar,
+    /// glass highlight, pill controls.
     fn render_window(&self, scene: &Scene, window: &Window) {
         let theme = &scene.theme;
+        let rad = theme.metrics.panel_radius as usize;
+        let wx = window.bounds.x.max(0) as usize;
+        let wy = window.bounds.y.max(0) as usize;
+        let ww = window.bounds.w as usize;
+        let wh = window.bounds.h as usize;
+        if ww == 0 || wh == 0 {
+            return;
+        }
 
-        // Window background
-        self.fill_rect(
-            window.bounds.x as usize,
-            window.bounds.y as usize,
-            window.bounds.w as usize,
-            window.bounds.h as usize,
-            window.style.bg_color,
-        );
+        // Soft shadow first (paints under the window; clipped to damage).
+        fb_gfx::shadow_rounded_px(wx, wy, ww, wh, rad);
 
-        // Window border
-        if window.style.border_width > 0 {
-            let bw = window.style.border_width as usize;
-            let bc = window.style.border_color;
-            let x = window.bounds.x as usize;
-            let y = window.bounds.y as usize;
-            let w = window.bounds.w as usize;
-            let h = window.bounds.h as usize;
+        // Window body.
+        fb_gfx::fill_rounded_rect_px(wx, wy, ww, wh, rad, theme.colors.panel_bg);
 
-            // Top
+        // Subtle border via inset outline (rounded corners keep 1px).
+        {
+            let (r, g, b) = fb_gfx::split_rgb(theme.colors.panel_border);
+            // Top/bottom/left/right 1px lines inside the rounded shape.
+            fb_gfx::fill_rect_px(wx + rad, wy, ww.saturating_sub(rad * 2), 1, r, g, b);
             fb_gfx::fill_rect_px(
-                x,
-                y,
-                w,
-                bw,
-                ((bc >> 16) & 0xFF) as u8,
-                ((bc >> 8) & 0xFF) as u8,
-                (bc & 0xFF) as u8,
+                wx + rad,
+                wy + wh - 1,
+                ww.saturating_sub(rad * 2),
+                1,
+                r,
+                g,
+                b,
             );
-            // Bottom
+            fb_gfx::fill_rect_px(wx, wy + rad, 1, wh.saturating_sub(rad * 2), r, g, b);
             fb_gfx::fill_rect_px(
-                x,
-                y + h - bw,
-                w,
-                bw,
-                ((bc >> 16) & 0xFF) as u8,
-                ((bc >> 8) & 0xFF) as u8,
-                (bc & 0xFF) as u8,
-            );
-            // Left
-            fb_gfx::fill_rect_px(
-                x,
-                y,
-                bw,
-                h,
-                ((bc >> 16) & 0xFF) as u8,
-                ((bc >> 8) & 0xFF) as u8,
-                (bc & 0xFF) as u8,
-            );
-            // Right
-            fb_gfx::fill_rect_px(
-                x + w - bw,
-                y,
-                bw,
-                h,
-                ((bc >> 16) & 0xFF) as u8,
-                ((bc >> 8) & 0xFF) as u8,
-                (bc & 0xFF) as u8,
+                wx + ww - 1,
+                wy + rad,
+                1,
+                wh.saturating_sub(rad * 2),
+                r,
+                g,
+                b,
             );
         }
 
-        // Titlebar (contrasting strip so windows read as windows).
+        // Titlebar gradient.
         let tb_h = scene.theme.metrics.titlebar_height as usize;
-        let tb_color = if window.focused {
-            scene.theme.colors.title_active
+        let (tb_top, tb_bot) = if window.focused {
+            (
+                scene.theme.colors.title_active_top,
+                scene.theme.colors.title_active,
+            )
         } else {
-            scene.theme.colors.title_inactive
+            (
+                scene.theme.colors.title_inactive_top,
+                scene.theme.colors.title_inactive,
+            )
         };
-
-        self.fill_rect(
-            window.bounds.x as usize,
-            window.bounds.y as usize,
-            window.bounds.w as usize,
-            tb_h,
-            tb_color,
+        fb_gfx::fill_gradient_px(wx, wy, ww, tb_h, tb_top, tb_bot, rad);
+        // Glass highlight + focused accent underline.
+        fb_gfx::glass_top_line_px(
+            wx,
+            wy + 1,
+            ww,
+            rad,
+            fb_gfx::blend_u32(0xFFFFFF, tb_top, 36),
         );
+        if window.focused {
+            let (r, g, b) = fb_gfx::split_rgb(scene.theme.colors.accent_glow);
+            fb_gfx::fill_rect_px(wx + rad, wy + tb_h - 2, ww.saturating_sub(rad * 2), 2, r, g, b);
+        }
 
         // Title text, truncated with ellipsis when too long for the bar.
         let minimize_rect = window.minimize_button_rect(&scene.theme);
@@ -365,41 +395,51 @@ impl Compositor {
             Some(title_clip),
         );
 
-        // Minimize, maximize/restore, and close controls.
-        self.fill_rect(
-            minimize_rect.x as usize,
-            minimize_rect.y as usize,
+        // Pill controls: minimize / maximize / close.
+        let pill_r = 7usize;
+        fb_gfx::fill_rounded_rect_px(
+            minimize_rect.x.max(0) as usize,
+            minimize_rect.y.max(0) as usize,
             minimize_rect.w as usize,
             minimize_rect.h as usize,
-            0x394047,
+            pill_r,
+            0x2A3441,
         );
         self.fill_rect(
-            minimize_rect.x as usize + 5,
+            minimize_rect.x as usize + 7,
             minimize_rect.y as usize + minimize_rect.h as usize / 2,
-            minimize_rect.w as usize - 10,
+            minimize_rect.w as usize - 14,
             2,
             0xFFFFFF,
         );
 
-        self.fill_rect(
-            maximize_rect.x as usize,
-            maximize_rect.y as usize,
+        fb_gfx::fill_rounded_rect_px(
+            maximize_rect.x.max(0) as usize,
+            maximize_rect.y.max(0) as usize,
             maximize_rect.w as usize,
             maximize_rect.h as usize,
-            0x394047,
+            pill_r,
+            0x2A3441,
         );
-        let mx = maximize_rect.x as usize + 6;
-        let my = maximize_rect.y as usize + 6;
-        let mw = maximize_rect.w as usize - 12;
-        let mh = maximize_rect.h as usize - 12;
-        self.draw_rect_outline(mx, my, mw, mh, 0xFFFFFF, 1);
+        let mx = maximize_rect.x as usize + 8;
+        let my = maximize_rect.y as usize + 8;
+        let mw = (maximize_rect.w as usize).saturating_sub(16);
+        let mh = (maximize_rect.h as usize).saturating_sub(16);
+        self.draw_rect_outline(mx, my, mw.max(2), mh.max(2), 0xFFFFFF, 1);
 
-        let cb_x = close_rect.x as usize;
-        let cb_y = close_rect.y as usize;
+        let cb_x = close_rect.x.max(0) as usize;
+        let cb_y = close_rect.y.max(0) as usize;
         let cb_w = close_rect.w as usize;
         let cb_h = close_rect.h as usize;
 
-        self.fill_rect(cb_x, cb_y, cb_w, cb_h, 0xC63434); // Red close button
+        fb_gfx::fill_rounded_rect_px(cb_x, cb_y, cb_w, cb_h, pill_r, 0xD64949);
+        fb_gfx::glass_top_line_px(
+            cb_x,
+            cb_y,
+            cb_w,
+            pill_r,
+            fb_gfx::blend_u32(0xFFFFFF, 0xD64949, 70),
+        );
         self.draw_text(
             cb_x + cb_w / 2 - 4,
             cb_y + (cb_h.saturating_sub(16)) / 2,
@@ -523,24 +563,41 @@ impl Compositor {
             }
 
             WidgetKind::Button => {
-                let bg = match widget.state {
-                    WidgetState::Pressed => widget.style.bg_color, // Use press color
-                    WidgetState::Hover => theme.colors.button_hover,
-                    _ => widget.style.bg_color,
+                let (bg, top) = match widget.state {
+                    WidgetState::Pressed => (
+                        theme.colors.button_press,
+                        theme.colors.button_press,
+                    ),
+                    WidgetState::Hover => (
+                        theme.colors.button_hover,
+                        fb_gfx::blend_u32(0xFFFFFF, theme.colors.button_hover, 30),
+                    ),
+                    _ => (
+                        widget.style.bg_color,
+                        fb_gfx::blend_u32(0xFFFFFF, widget.style.bg_color, 22),
+                    ),
                 };
-                self.fill_rect(x, y, w, h, bg);
-                if widget.style.border_width > 0 {
-                    self.draw_rect_outline(
-                        x,
-                        y,
-                        w,
-                        h,
-                        widget.style.border_color,
-                        widget.style.border_width as usize,
+                let rad = widget.style.radius as usize;
+                // Pill with vertical sheen + hover glow underline.
+                fb_gfx::fill_gradient_px(x, y, w, h, top, bg, rad);
+                fb_gfx::glass_top_line_px(
+                    x,
+                    y,
+                    w,
+                    rad,
+                    fb_gfx::blend_u32(0xFFFFFF, top, 50),
+                );
+                if widget.state == WidgetState::Hover {
+                    let (r, g, b) = fb_gfx::split_rgb(theme.colors.accent_glow);
+                    fb_gfx::fill_rect_px(
+                        x + rad.min(w / 2),
+                        y + h.saturating_sub(2),
+                        w.saturating_sub(rad.min(w / 2) * 2),
+                        1,
+                        r,
+                        g,
+                        b,
                     );
-                }
-                if widget.style.radius > 0 {
-                    self.draw_rounded_rect(x, y, w, h, widget.style.radius as usize, bg);
                 }
 
                 // Button text (centered, clipped to the button).
@@ -723,19 +780,19 @@ impl Compositor {
         fb_gfx::draw_text_bb(x, y, text, (r, g, b), clip);
     }
 
-    /// Render the mouse cursor.
+    /// Render the mouse cursor (currently selected bundled or custom one).
     fn render_cursor(&self, x: i32, y: i32) {
         // `x,y` are the pointer hotspot coordinates from the guest input
         // device; the bitmap origin is offset from its declared tip hotspot.
-        let cx = x - crate::desktop::cursor_data::CURSOR_HOTSPOT_X as i32;
-        let cy = y - crate::desktop::cursor_data::CURSOR_HOTSPOT_Y as i32;
-        crate::drivers::fb_gfx::blit_rgba_signed(
-            cx,
-            cy,
-            crate::desktop::cursor_data::CURSOR_W,
-            crate::desktop::cursor_data::CURSOR_H,
-            &crate::desktop::cursor_data::CURSOR_RGBA,
-        );
+        crate::desktop::cursor::with_current(|w, h, hx, hy, rgba| {
+            crate::drivers::fb_gfx::blit_rgba_signed(
+                x - hx as i32,
+                y - hy as i32,
+                w,
+                h,
+                rgba,
+            );
+        });
     }
 }
 

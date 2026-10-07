@@ -392,8 +392,7 @@ pub fn run(args: &str) {
                             new_status = Some((String::from("Filesystem not mounted"), true));
                             status_error = true;
                         } else {
-                            let mut dev = crate::shell::mounted_device();
-                            if let Some(data) = crate::shell::read_file_contents(&fname, &mut dev) {
+                            if let Some(data) = crate::shell::read_file_contents(&fname) {
                                 // Split into lines and insert at cursor
                                 let mut extra: Vec<Vec<u8>> = Vec::new();
                                 let mut cur: Vec<u8> = Vec::new();

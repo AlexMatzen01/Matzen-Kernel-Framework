@@ -41,6 +41,18 @@ if [[ ! -f "$TARGET_SPEC" ]]; then
     exit 1
 fi
 
+# TLS 1.3 (`net_tls`) is in the kernel's default features. Pass --no-tls to
+# build without it (falls back to tls_stub; HTTPS reports "not enabled").
+# --tls is accepted explicitly and is a no-op. These flags are consumed here
+# and NOT forwarded to cargo. NOTE: --release/--debug are only read from $1.
+KERNEL_FEATURE_STR=""
+for arg in "$@"; do
+    case "$arg" in
+        --no-tls) KERNEL_FEATURE_STR="--no-default-features --features usb" ;;
+        --tls) KERNEL_FEATURE_STR="" ;;
+    esac
+done
+
 if ! command -v cargo >/dev/null 2>&1; then
     echo "ERROR: cargo not found. Run ./install.sh first." >&2
     exit 1
@@ -49,14 +61,25 @@ fi
 # Step 1: Build the kernel
 # Note: -Zjson-target-spec was removed in cargo 1.91+ (stabilized); plain --target with path now works.
 # We use -Zbuild-std only. If old cargo needs json flag, retry automatically.
+# sha2 v0.11+ (via lzma-rust2 for XZ) defaults to x86 SIMD backends that LLVM
+# cannot lower on our +soft-float/-sse target ("Do not know how to split the
+# result of this operator!"). Force the portable backend. Mirrors
+# .cargo/config.toml so direct `cargo build` invocations work too; appending
+# here keeps it working even if the user overrides config rustflags.
+# `aes_force_soft` / `polyval_force_soft` do the same for the TLS stack
+# (aes 0.8, polyval 0.6; ghash delegates to polyval). sha2 v0.10 gets
+# `force-soft` via feature unification (kernel/Cargo.toml).
+export RUSTFLAGS="${RUSTFLAGS:-} --cfg sha2_backend=\"soft\" --cfg aes_force_soft --cfg polyval_force_soft"
 echo "[1/2] Building kernel ($BUILD_MODE)..."
 KERNEL_BUILD_CMD=("$CARGO_CMD" build -p mfk-kernel --target "$TARGET_SPEC" -Zbuild-std=core,alloc "-Zbuild-std-features=compiler-builtins-mem")
 if [[ -n "$BUILD_FLAG" ]]; then KERNEL_BUILD_CMD+=("$BUILD_FLAG"); fi
+# shellcheck disable=SC2206: intentional word-splitting of stored feature flags
+if [[ -n "$KERNEL_FEATURE_STR" ]]; then KERNEL_BUILD_CMD+=($KERNEL_FEATURE_STR); fi
 echo "  ${KERNEL_BUILD_CMD[*]}"
 if ! "${KERNEL_BUILD_CMD[@]}"; then
     # Fallback for very old cargo that still needs -Zjson-target-spec
     echo "  Retrying with -Zjson-target-spec for older cargo..." >&2
-    if ! $CARGO_CMD build -p mfk-kernel --target "$TARGET_SPEC" -Zjson-target-spec -Zbuild-std=core,alloc "-Zbuild-std-features=compiler-builtins-mem" $BUILD_FLAG; then
+    if ! $CARGO_CMD build -p mfk-kernel --target "$TARGET_SPEC" -Zjson-target-spec -Zbuild-std=core,alloc "-Zbuild-std-features=compiler-builtins-mem" $BUILD_FLAG $KERNEL_FEATURE_STR; then
         echo "" >&2
         echo "ERROR: Kernel build failed" >&2
         echo "Hints:" >&2
